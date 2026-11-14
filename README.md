@@ -1,4 +1,4 @@
-# NOVA OS Native 0.3.1
+# NOVA OS Native 0.3.2
 
 **NOVA Native** is a portable Windows desktop environment built in Rust with `egui/eframe`. It is a normal native Windows application, not a replacement for Windows and not yet a bootable USB operating system.
 
@@ -49,6 +49,8 @@ Or in PowerShell:
 .\scripts\build-portable.ps1
 ```
 
+The source archive does not currently include `Cargo.lock`. Cargo creates a lockfile during the first CI build, but the runner does not automatically commit it back to the repository. For reproducible future builds, retain and commit the generated `Cargo.lock` after a successful build.
+
 The build script creates:
 
 ```text
@@ -64,15 +66,15 @@ release/
 │   │   ├── Settings/
 │   │   └── Logs/
 │   └── Backup/
-├── NOVA-OS-Native-v0.3.1-USB.zip
-└── NOVA-OS-Native-v0.3.1-USB.zip.sha256
+├── NOVA-OS-Native-v0.3.2-USB.zip
+└── NOVA-OS-Native-v0.3.2-USB.zip.sha256
 ```
 
 Copy the whole `NOVA-Portable` folder to the USB. Do not copy only `NOVA.exe`, because portable mode and saved data require the sidecar files/folders.
 
 ## Build without installing Rust on your own computer
 
-This repository includes `.github/workflows/windows-build.yml`. Upload the source repository to GitHub, open **Actions → Build NOVA Native for Windows → Run workflow**, and download the generated artifact. GitHub's Windows runner runs unit tests, builds the EXE and creates the USB ZIP. The computer that runs NOVA still needs no developer tools. Follow [BUILD_WITH_GITHUB.md](BUILD_WITH_GITHUB.md) for step-by-step instructions.
+This repository includes `.github/workflows/windows-build.yml`. Upload the source repository to GitHub, open **Actions → Build NOVA Native for Windows → Run workflow**, and download the generated artifact. GitHub's Windows runner runs unit tests, builds the EXE and uploads the prepared USB folder as a downloadable ZIP artifact. The computer that runs NOVA still needs no developer tools. Follow [BUILD_WITH_GITHUB.md](BUILD_WITH_GITHUB.md) for step-by-step instructions.
 
 ## Wi-Fi commands
 
@@ -89,13 +91,13 @@ wifi select "Home WiFi"
 
 Both `wifi ...` and `/wifi ...` are accepted. SSIDs containing spaces must be quoted. `password` input in Wi-Fi setup mode and the direct `wifi connect` input are masked in the terminal UI.
 
-The initial implementation supports open networks and WPA2-Personal (AES). WPA3-only, Enterprise/802.1X, captive portal login, hidden-network setup, and advanced adapter selection are not implemented. A scan result does not guarantee the adapter can connect.
+The initial implementation supports open networks and WPA2-Personal (AES), using printable ASCII passphrases or a 64-character hexadecimal key. WPA3-only, Enterprise/802.1X, captive portal login, hidden-network setup, and advanced adapter selection are not implemented. A scan result does not guarantee the adapter can connect.
 
 **Credential detail:** NOVA does not save Wi-Fi passwords in its own Data folder, settings or terminal history. To import a Windows WLAN profile via `netsh`, a temporary XML file containing the password is written in the current user's TEMP folder and NOVA attempts to delete it immediately after Windows imports it. Abrupt termination or power loss can leave the plaintext XML behind in TEMP; this release does not apply a custom Windows file ACL. Windows then stores/manages its WLAN profile. NOVA records only the SSID names of profiles it created, so `password delete` can refuse to delete profiles it does not manage. The Windows profile itself may persist after the USB is removed until it is deleted.
 
 ## CMD safety
 
-The Terminal is a real Windows command shell, not a sandbox. It runs as the currently signed-in Windows user and is not automatically elevated. Commands such as `del`, `format`, `diskpart`, `shutdown`, and scripts can affect the actual computer. Run only commands you understand. Each command is a one-shot process; working directory is preserved, but interactive shells and environment-variable changes do not persist. A command is stopped after 30 seconds and its process tree is terminated; captured output is limited to approximately 1 MiB.
+The Terminal is a real Windows command shell, not a sandbox. It runs as the currently signed-in Windows user and is not automatically elevated. Commands such as `del`, `format`, `diskpart`, `shutdown`, and scripts can affect the actual computer. Run only commands you understand. Each command is a one-shot process; working directory is preserved, but interactive shells and environment-variable changes do not persist. NOVA requests process-tree termination after 30 seconds and also attempts to stop `cmd.exe` directly. Output readers use a bounded drain period so an inherited pipe cannot freeze the NOVA UI indefinitely; a surviving descendant may still leave a detached reader until its pipe handle closes. Captured output is limited to 1 MiB per stream, with truncation reported.
 
 ## Portability and performance notes
 

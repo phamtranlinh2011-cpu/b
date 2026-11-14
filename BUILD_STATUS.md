@@ -1,29 +1,29 @@
-# NOVA Native 0.3.1 — build status
+# NOVA Native 0.3.2 — build status
 
 ## Delivered in this source package
-- Replaced Tauri/Svelte/WebView2 architecture with Rust + eframe/egui native GUI.
-- Added native desktop shell, launcher, taskbar, Files, Editor, Settings, Calculator and System Monitor.
-- Added Windows CMD terminal with working-directory state, 30-second timeout and process-tree termination.
-- Added `wifi`, `/wifi`, `wifi -h`, `wifi connect`, `wifi select`, `password`, `password delete`, and `exit` flows.
-- Added portable data path using `portable.flag` and `Data/` beside NOVA.exe.
-- Added Windows local packager and GitHub Actions workflow to run unit tests, create the Windows EXE and package the USB ZIP.
-- Deferred System Monitor process enumeration until the monitor window is opened to reduce startup work.
-- Added a Windows message box for portable-data initialization failures in GUI release builds.
-- Added `BUILD_WITH_GITHUB.md` for a cloud Windows build without installing Rust on the user's own PC.
-- Configured static MSVC CRT and a size-optimized release profile.
+- Rust native GUI using eframe/egui and the Glow renderer.
+- Portable data path using `portable.flag` and `Data/` beside NOVA.exe.
+- Built-in Files, Editor, Calculator, Settings, System Monitor and Windows CMD terminal.
+- Wi-Fi scan/profile/connect/delete commands using `netsh wlan`.
+- Windows GitHub Actions workflow at `.github/workflows/windows-build.yml`.
+- Static MSVC C runtime configuration restored in `.cargo/config.toml`.
 
-## 0.3.1 bug-fix changes
-- Files canonicalizes the user-data root, current directory and selected entries before listing/navigation/opening; folder creation also revalidates its parent.
-- Settings persistence errors are shown in the app status bar.
-- Wi-Fi temporary XML cleanup now uses a scope guard and is attempted on every normal return path; cleanup happens immediately after `netsh` import. The file still has no custom Windows DACL, so abrupt termination may leave plaintext XML in TEMP.
-- Added unit tests for canonical path containment and temporary-profile cleanup.
+## 0.3.2 fixes
+- Fixed the three compile errors reported by the Windows runner: `sysinfo::System::new()` is handled as a `Result`, egui style mutation uses `Context::all_styles_mut`, and Terminal password masking is computed before mutably borrowing the input field.
+- Replaced deprecated `Ui::id()` with `Ui::scope_id()`.
+- System Monitor now degrades gracefully if `sysinfo` initialization fails instead of panicking during app startup.
+- Files validates Windows-invalid/reserved names; Editor creates missing directories one component at a time and canonicalizes each component before writing.
+- Corrupt/unreadable Wi-Fi manifest files now produce an error and fail closed. A failed manifest write after importing a WLAN profile triggers a best-effort profile rollback.
+- Temporary WLAN profile files are created with exclusive `create_new` and collision retries; cleanup remains best-effort on normal exit only.
+- CMD polling errors now trigger process termination attempts; output pipe draining is bounded to avoid an indefinite UI hang; reader-thread panics are surfaced; truncated command output is reported.
+- Calculator formatting no longer rounds small finite values to zero.
+- Added tests for path validation, nested directory creation, manifest corruption, WLAN temp cleanup, SSID/password validation and calculator formatting.
 
-## Not yet verified
-- Rust compilation and unit tests: not run in this container (Rust/Cargo are unavailable). Static source/config checks only; GitHub Actions must run them.
-- Windows EXE: not compiled here; a real Windows runner is required.
-- Wi-Fi operations: not tested against a physical wireless adapter/router.
-- Cold-start/RAM/CPU benchmarks: not measured.
-- OpenGL compatibility: requires validation on target PCs.
+## Validation status
+- ZIP integrity, TOML parsing, YAML structure and source-level checks can be run in this environment.
+- Rust compiler/Cargo are not installed in this container, so `cargo test`, `cargo build`, rustfmt and clippy have not been run here.
+- The supplied repository did not include `Cargo.lock`; Cargo will resolve compatible transitive dependency versions during each clean CI run. Commit the generated lockfile after the first successful Windows build if repeatable dependency resolution is required.
+- Windows CMD process-tree behavior, actual `netsh wlan` operations, graphics compatibility and USB persistence still require real Windows testing.
 
 ## Important
-This is a source-code milestone, not a precompiled EXE release. The workflow `.github/workflows/windows-build.yml` can compile the EXE on GitHub's Windows runner after the project is pushed to a repository. The resulting target package should not require Rust, Cargo, Node.js, npm or WebView2.
+This is source code, not a precompiled EXE. GitHub Actions must pass on a Windows runner before treating the package as build-verified. NOVA is a Windows desktop environment, not a separate OS kernel or bootable Live USB.

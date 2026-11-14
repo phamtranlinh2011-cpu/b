@@ -1,4 +1,4 @@
-NOVA OS NATIVE 0.3.1 — USB PORTABLE EDITION
+NOVA OS NATIVE 0.3.2 — USB PORTABLE EDITION
 
 BAT DAU
 1. Giu NOVA.exe, portable.flag va thu muc Data/ cung nam trong mot thu muc.
@@ -30,6 +30,6 @@ BAO MAT
 GIOI HAN
 - Day la desktop environment portable chay tren Windows, khong phai kernel OS rieng hay Live USB boot doc lap.
 - Wi-Fi can WLAN AutoConfig service va driver Wi-Fi hoat dong.
-- Ho tro Wi-Fi mo va WPA2-Personal (AES) trong ban dau; chua co Enterprise/802.1X va captive portal.
+- Ho tro Wi-Fi mo va WPA2-Personal (AES), mat khau ASCII in duoc hoac khoa hex 64 ky tu; chua co Enterprise/802.1X va captive portal.
 - Yeu cau Windows 10/11 x64 va driver do hoa tuong thich.
 - Windows co the hien SmartScreen/antivirus warning voi EXE chua ky so. Hay xac minh nguon truoc khi cho phep chay.

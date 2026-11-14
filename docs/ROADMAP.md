@@ -1,18 +1,25 @@
 # NOVA Native roadmap
 
-## 0.3.1 — Native foundation (current source milestone)
+## 0.3.1 — Native foundation (previous source milestone)
 - Rust native GUI, no WebView or Node runtime at execution time.
 - Portable data folder and settings.
 - Built-in Files, Editor, Calculator, Settings, Monitor.
 - CMD terminal and Wi-Fi command flow.
 - Windows ZIP packaging scripts and CI workflow.
 
-## 0.3.1 — Windows integration hardening
-- Replace temporary Wi-Fi XML file with direct WLAN API calls.
+## 0.3.2 — Windows build and safety fixes (current)
+- Fix Windows build errors reported by the MSVC runner.
+- Harden Files/Editor path handling and portable Windows filename validation.
+- Fail closed on corrupt Wi-Fi profile manifests and improve temporary XML cleanup.
+- Improve CMD output/timeout diagnostics and calculator precision.
+- Add unit tests for path validation, Wi-Fi parsing/profile helpers and calculator formatting.
+
+## 0.3.3 — Windows integration hardening
+- Replace temporary Wi-Fi XML file with direct WLAN API calls or a securely ACL-restricted temporary file.
 - More robust SSID parsing for non-English Windows locales.
 - Better CMD encoding handling for OEM code pages.
-- Explicit read-only USB behavior and safe-eject warning.
-- Add tests for path traversal, profile lifecycle, and process timeout.
+- Windows Job Object process-tree management and bounded pipe-drain behavior.
+- Profile lifecycle, timeout and USB persistence integration tests on real Windows hardware.
 
 ## 0.4.0 — Desktop polish
 - Independent app viewports / improved window manager.

@@ -42,7 +42,7 @@ Copy-Item (Join-Path $ProjectRoot 'portable.flag') $PackageRoot
 Copy-Item (Join-Path $ProjectRoot 'README_PORTABLE.txt') $PackageRoot
 
 Write-Host '[5/5] Creating ZIP and SHA256...' -ForegroundColor Cyan
-$ZipPath = Join-Path $ReleaseDirectory 'NOVA-OS-Native-v0.3.1-USB.zip'
+$ZipPath = Join-Path $ReleaseDirectory 'NOVA-OS-Native-v0.3.2-USB.zip'
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
 Compress-Archive -Path (Join-Path $PackageRoot '*') -DestinationPath $ZipPath -CompressionLevel Optimal
 $Checksum = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()

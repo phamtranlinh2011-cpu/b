@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ======================================================
-echo   NOVA OS 0.3.1 - Native Windows EXE + USB Packager
+echo   NOVA OS 0.3.2 - Native Windows EXE + USB Packager
 echo ======================================================
 echo.
 echo This script is for BUILDING NOVA on a developer machine.

@@ -1,4 +1,4 @@
-use crate::storage::{canonical_user_path, safe_user_path, AppPaths, Settings};
+use crate::storage::{canonical_user_path, create_user_directories, safe_user_path, AppPaths, Settings};
 use crate::terminal::TerminalState;
 use eframe::egui::{self, Color32, FontId, RichText, TextEdit};
 use std::fs;
@@ -26,15 +26,23 @@ pub struct NovaApp {
     calc_right: String,
     calc_operator: String,
     calc_result: String,
-    monitor: System,
+    monitor: Option<System>,
+    monitor_error: Option<String>,
     last_monitor_refresh: Instant,
     status_message: String,
 }
 
 impl NovaApp {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths) -> Self {
-        let settings = paths.load_settings();
+        let (settings, settings_warning) = match paths.load_settings() {
+            Ok(settings) => (settings, None),
+            Err(error) => (Settings::default(), Some(format!("Settings could not be loaded; defaults are active: {error}"))),
+        };
         let portable = paths.portable;
+        let (monitor, monitor_error) = match System::new() {
+            Ok(system) => (Some(system), None),
+            Err(error) => (None, Some(format!("System Monitor unavailable: {error:?}"))),
+        };
         let app = Self {
             terminal: TerminalState::new(&paths),
             files_dir: paths.user_dir.clone(),
@@ -55,13 +63,16 @@ impl NovaApp {
             calc_right: "3".to_owned(),
             calc_operator: "+".to_owned(),
             calc_result: "15".to_owned(),
-            monitor: System::new(),
+            monitor,
+            monitor_error,
             last_monitor_refresh: Instant::now() - Duration::from_secs(2),
-            status_message: if portable {
-                "Portable mode active — data is stored beside NOVA.exe".to_owned()
-            } else {
-                "Local mode active — user data is stored in LocalAppData".to_owned()
-            },
+            status_message: settings_warning.unwrap_or_else(|| {
+                if portable {
+                    "Portable mode active — data is stored beside NOVA.exe".to_owned()
+                } else {
+                    "Local mode active — user data is stored in LocalAppData".to_owned()
+                }
+            }),
         };
         app.apply_theme(&cc.egui_ctx);
         app
@@ -84,7 +95,7 @@ impl NovaApp {
         }
         visuals.selection.bg_fill = Color32::from_rgb(77, 105, 190);
         ctx.set_visuals(visuals);
-        ctx.style_mut(|style| {
+        ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = egui::vec2(10.0, 8.0);
             style.spacing.button_padding = egui::vec2(12.0, 8.0);
             style.visuals.window_corner_radius = egui::CornerRadius::same(14);
@@ -131,7 +142,7 @@ impl NovaApp {
                     ui.label(RichText::new(description).small().color(Color32::from_rgb(180, 194, 217)));
                 });
             });
-        if ui.interact(button.response.rect, ui.id().with(app), egui::Sense::click()).clicked() {
+        if ui.interact(button.response.rect, ui.scope_id().with(app), egui::Sense::click()).clicked() {
             self.open_app(app);
         }
         ui.add_space(8.0);
@@ -183,10 +194,11 @@ impl NovaApp {
                 ui.horizontal(|ui| {
                     let prompt = self.terminal.prompt();
                     ui.label(RichText::new(prompt).monospace().color(Color32::from_rgb(117, 203, 172)));
+                    let hide_input = self.terminal.password_entry();
                     let response = ui.add(
                         TextEdit::singleline(&mut self.terminal.input)
                             .font(FontId::monospace(13.0))
-                            .password(self.terminal.password_entry())
+                            .password(hide_input)
                             .hint_text("Enter command…")
                             .desired_width(f32::INFINITY),
                     );
@@ -271,17 +283,20 @@ impl NovaApp {
         }
         if create_folder {
             let name = self.files_new_folder.trim().to_owned();
-            if !name.is_empty() && !name.contains('/') && !name.contains('\\') && name != "." && name != ".." {
+            if !name.is_empty() && !name.contains('/') && !name.contains('\\') {
+                let validated_name = safe_user_path(&self.paths.user_dir, &name);
                 let safe_parent = canonical_user_path(&self.paths.user_dir, &self.files_dir);
-                match safe_parent {
-                    Ok(parent) => match fs::create_dir(parent.join(&name)) {
+                match (validated_name, safe_parent) {
+                    (Ok(_), Ok(parent)) => match fs::create_dir(parent.join(&name)) {
                         Ok(()) => {
                             self.files_new_folder.clear();
                             self.status_message = format!("Created folder: {name}");
                         }
                         Err(error) => self.status_message = format!("Create folder failed: {error}"),
                     },
-                    Err(error) => self.status_message = format!("Create folder blocked: {error}"),
+                    (Err(error), _) | (_, Err(error)) => {
+                        self.status_message = format!("Create folder blocked: {error}")
+                    }
                 }
             }
         }
@@ -303,8 +318,10 @@ impl NovaApp {
             Ok(meta) if meta.len() <= 2 * 1024 * 1024 => match fs::read_to_string(&canonical_file) {
                 Ok(text) => {
                     self.editor_text = text;
-                    self.editor_path = canonical_file
-                        .strip_prefix(&self.paths.user_dir)
+                    let canonical_root = self.paths.user_dir.canonicalize().ok();
+                    self.editor_path = canonical_root
+                        .as_deref()
+                        .and_then(|root| canonical_file.strip_prefix(root).ok())
                         .unwrap_or(&canonical_file)
                         .to_string_lossy()
                         .to_string();
@@ -340,31 +357,20 @@ impl NovaApp {
                 ui.label(RichText::new(&self.editor_status).small().weak());
             });
         if save {
+            if self.editor_text.len() > 2 * 1024 * 1024 {
+                self.editor_status = "Files larger than 2 MiB cannot be saved in the built-in editor.".to_owned();
+                return;
+            }
             match safe_user_path(&self.paths.user_dir, &self.editor_path) {
                 Ok(path) => {
                     let parent = path
                         .parent()
                         .filter(|folder| !folder.as_os_str().is_empty())
                         .unwrap_or(&self.paths.user_dir);
-                    if let Err(error) = fs::create_dir_all(parent) {
-                        self.editor_status = format!("Cannot create folder: {error}");
-                        return;
-                    }
-                    let canonical_root = match self.paths.user_dir.canonicalize() {
-                        Ok(root) => root,
+                    let canonical_parent = match create_user_directories(&self.paths.user_dir, parent) {
+                        Ok(folder) => folder,
                         Err(error) => {
-                            self.editor_status = format!("Cannot resolve NOVA data folder: {error}");
-                            return;
-                        }
-                    };
-                    let canonical_parent = match parent.canonicalize() {
-                        Ok(folder) if folder.starts_with(&canonical_root) => folder,
-                        Ok(_) => {
-                            self.editor_status = "Saving outside the NOVA data folder is blocked.".to_owned();
-                            return;
-                        }
-                        Err(error) => {
-                            self.editor_status = format!("Cannot resolve target folder: {error}");
+                            self.editor_status = format!("Cannot create or resolve target folder: {error}");
                             return;
                         }
                     };
@@ -373,16 +379,28 @@ impl NovaApp {
                         return;
                     };
                     let safe_target = canonical_parent.join(file_name);
-                    if safe_target.exists() {
-                        match safe_target.canonicalize() {
-                            Ok(existing) if existing.starts_with(&canonical_root) => {}
-                            _ => {
-                                self.editor_status = "Saving through an external link is blocked.".to_owned();
+                    match fs::symlink_metadata(&safe_target) {
+                        Ok(metadata) if metadata.file_type().is_symlink() => {
+                            self.editor_status = "Saving through a symbolic link is blocked.".to_owned();
+                            return;
+                        }
+                        Ok(metadata) if metadata.is_dir() => {
+                            self.editor_status = "The target path is a directory, not a file.".to_owned();
+                            return;
+                        }
+                        Ok(_) => {
+                            if let Err(error) = canonical_user_path(&self.paths.user_dir, &safe_target) {
+                                self.editor_status = format!("Saving outside NOVA data is blocked: {error}");
                                 return;
                             }
                         }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            self.editor_status = format!("Cannot inspect target file: {error}");
+                            return;
+                        }
                     }
-                    match fs::write(safe_target, &self.editor_text) {
+                    match fs::write(&safe_target, &self.editor_text) {
                         Ok(()) => self.editor_status = "Saved to NOVA USB data".to_owned(),
                         Err(error) => self.editor_status = format!("Save failed: {error}"),
                     }
@@ -467,25 +485,40 @@ impl NovaApp {
         if !self.monitor_open {
             return;
         }
-        if self.last_monitor_refresh.elapsed() >= Duration::from_secs(1) {
-            self.monitor.refresh_all();
-            self.last_monitor_refresh = Instant::now();
-        }
+
+        let metrics = if let Some(monitor) = self.monitor.as_mut() {
+            if self.last_monitor_refresh.elapsed() >= Duration::from_secs(1) {
+                monitor.refresh_all();
+                self.last_monitor_refresh = Instant::now();
+            }
+            let cpu = monitor.global_cpu_usage();
+            let used = monitor.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+            let total = monitor.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
+            let processes = monitor.processes().len();
+            Some((cpu, used, total, processes))
+        } else {
+            None
+        };
+        let monitor_error = self.monitor_error.clone();
+
         egui::Window::new("NOVA System Monitor")
             .open(&mut self.monitor_open)
             .default_size([430.0, 300.0])
             .show(ctx, |ui| {
-                let cpu = self.monitor.global_cpu_usage();
-                let used = self.monitor.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-                let total = self.monitor.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-                let processes = self.monitor.processes().len();
-                ui.label(format!("CPU usage: {cpu:.1}%"));
-                ui.add(egui::ProgressBar::new((cpu / 100.0).clamp(0.0, 1.0)).show_percentage());
-                ui.add_space(8.0);
-                ui.label(format!("Memory: {used:.2} / {total:.2} GB"));
-                ui.add(egui::ProgressBar::new(if total > 0.0 { (used / total) as f32 } else { 0.0 }).show_percentage());
-                ui.add_space(8.0);
-                ui.label(format!("Processes: {processes}"));
+                if let Some((cpu, used, total, processes)) = metrics {
+                    ui.label(format!("CPU usage: {cpu:.1}%"));
+                    ui.add(egui::ProgressBar::new((cpu / 100.0).clamp(0.0, 1.0)).show_percentage());
+                    ui.add_space(8.0);
+                    ui.label(format!("Memory: {used:.2} / {total:.2} GB"));
+                    ui.add(egui::ProgressBar::new(if total > 0.0 { (used / total) as f32 } else { 0.0 }).show_percentage());
+                    ui.add_space(8.0);
+                    ui.label(format!("Processes: {processes}"));
+                } else {
+                    ui.colored_label(
+                        Color32::LIGHT_RED,
+                        monitor_error.as_deref().unwrap_or("System information is unavailable on this device."),
+                    );
+                }
                 ui.separator();
                 ui.label(RichText::new("Metrics are provided by the Windows host; NOVA is a desktop environment, not a separate kernel.").small().weak());
             });
@@ -506,7 +539,7 @@ impl eframe::App for NovaApp {
                 ui.separator();
                 ui.label(RichText::new("NATIVE DESKTOP").small().weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("NOVA 0.3.1").small().weak());
+                    ui.label(RichText::new("NOVA 0.3.2").small().weak());
                     ui.separator();
                     let mode = if self.paths.portable { "USB PORTABLE" } else { "LOCAL MODE" };
                     ui.label(RichText::new(mode).small().color(Color32::from_rgb(105, 207, 170)));
@@ -616,13 +649,29 @@ impl eframe::App for NovaApp {
 }
 
 fn format_number(value: f64) -> String {
-    if value.is_finite() {
-        if value.fract() == 0.0 {
-            format!("{value:.0}")
-        } else {
-            format!("{value:.8}").trim_end_matches('0').trim_end_matches('.').to_owned()
-        }
-    } else {
-        "Result is not finite".to_owned()
+    if !value.is_finite() {
+        return "Result is not finite".to_owned();
+    }
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    value.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_number;
+
+    #[test]
+    fn calculator_format_does_not_round_small_values_to_zero() {
+        assert_eq!(format_number(0.000000001), "0.000000001");
+        assert_eq!(format_number(15.0), "15");
+        assert_eq!(format_number(-0.0), "0");
+    }
+
+    #[test]
+    fn calculator_rejects_non_finite_results() {
+        assert_eq!(format_number(f64::INFINITY), "Result is not finite");
+        assert_eq!(format_number(f64::NAN), "Result is not finite");
     }
 }

@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 
 const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const OUTPUT_DRAIN_KILL_GRACE: Duration = Duration::from_millis(750);
 
 #[derive(Debug)]
 pub struct TerminalState {
@@ -25,7 +29,7 @@ impl TerminalState {
             cwd: paths.user_dir.clone(),
             wifi_mode: None,
         };
-        state.line("NOVA OS Native Terminal 0.3.1");
+        state.line("NOVA OS Native Terminal 0.3.2");
         state.line("Type help for commands. Wi-Fi: wifi -h");
         state.line(format!("Working directory: {}", state.cwd.display()));
         state.line("");
@@ -367,19 +371,50 @@ fn run_cmd(command: &str, cwd: &std::path::Path) -> io::Result<String> {
 
     let deadline = Instant::now() + COMMAND_TIMEOUT;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(error) => {
+                kill_process_tree(pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
         }
         if Instant::now() >= deadline {
             kill_process_tree(pid);
+            // Also attempt to stop cmd.exe itself if taskkill could not reach it.
+            let _ = child.kill();
             let _ = child.wait();
             break None;
         }
         thread::sleep(Duration::from_millis(80));
     };
 
-    let stdout = out_reader.join().unwrap_or_else(|_| Ok(Vec::new()))?;
-    let stderr = err_reader.join().unwrap_or_else(|_| Ok(Vec::new()))?;
+    // A descendant may inherit CMD's output handles and keep a pipe open after
+    // cmd.exe exits. Never block the NOVA UI forever waiting for EOF.
+    let mut readers_finished = wait_for_readers(&out_reader, &err_reader, OUTPUT_DRAIN_TIMEOUT);
+    if !readers_finished {
+        kill_process_tree(pid);
+        readers_finished = wait_for_readers(&out_reader, &err_reader, OUTPUT_DRAIN_KILL_GRACE);
+    }
+
+    let (stdout, stdout_truncated) = if out_reader.is_finished() {
+        out_reader
+            .join()
+            .map_err(|_| io::Error::other("NOVA stdout reader thread panicked"))??
+    } else {
+        drop(out_reader); // Detach an unresponsive reader rather than freezing the UI.
+        (Vec::new(), false)
+    };
+    let (stderr, stderr_truncated) = if err_reader.is_finished() {
+        err_reader
+            .join()
+            .map_err(|_| io::Error::other("NOVA stderr reader thread panicked"))??
+    } else {
+        drop(err_reader);
+        (Vec::new(), false)
+    };
     let mut output = String::from_utf8_lossy(&stdout).to_string();
     let error_text = String::from_utf8_lossy(&stderr);
     if !error_text.trim().is_empty() {
@@ -388,8 +423,14 @@ fn run_cmd(command: &str, cwd: &std::path::Path) -> io::Result<String> {
         }
         output.push_str(error_text.trim_end());
     }
+    if stdout_truncated || stderr_truncated {
+        output.push_str("\n[NOVA] Output was truncated at 1 MiB per stream.");
+    }
+    if !readers_finished {
+        output.push_str("\n[NOVA] Output collection stopped after the drain timeout; a descendant may still hold a pipe open.");
+    }
     if status.is_none() {
-        output.push_str("\n[NOVA] Command timed out after 30 seconds. Process tree was stopped.");
+        output.push_str("\n[NOVA] Command timed out after 30 seconds. NOVA requested process-tree termination.");
     } else if output.is_empty() {
         if let Some(status) = status {
             if !status.success() {
@@ -401,10 +442,27 @@ fn run_cmd(command: &str, cwd: &std::path::Path) -> io::Result<String> {
 }
 
 #[cfg(windows)]
-fn read_limited<R: Read>(reader: R) -> io::Result<Vec<u8>> {
+fn wait_for_readers(
+    stdout: &thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
+    stderr: &thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while (!stdout.is_finished() || !stderr.is_finished()) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    stdout.is_finished() && stderr.is_finished()
+}
+
+#[cfg(windows)]
+fn read_limited<R: Read>(reader: R) -> io::Result<(Vec<u8>, bool)> {
     let mut bytes = Vec::new();
-    reader.take(MAX_OUTPUT_BYTES).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    reader.take(MAX_OUTPUT_BYTES + 1).read_to_end(&mut bytes)?;
+    let truncated = bytes.len() as u64 > MAX_OUTPUT_BYTES;
+    if truncated {
+        bytes.truncate(MAX_OUTPUT_BYTES as usize);
+    }
+    Ok((bytes, truncated))
 }
 
 #[cfg(windows)]
