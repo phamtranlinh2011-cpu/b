@@ -14,22 +14,28 @@ if (-not $IsWindows -and $env:OS -ne 'Windows_NT') {
 Require-Command 'cargo'
 Require-Command 'rustc'
 
-Write-Host '[1/5] Checking Rust toolchain...' -ForegroundColor Cyan
+Write-Host '[1/6] Checking Rust toolchain...' -ForegroundColor Cyan
 rustc --version
 cargo --version
 
-Write-Host '[2/5] Running NOVA unit tests...' -ForegroundColor Cyan
-cargo test --target x86_64-pc-windows-msvc
+Write-Host '[2/6] Preparing reproducible dependency lockfile...' -ForegroundColor Cyan
+if (-not (Test-Path (Join-Path $ProjectRoot 'Cargo.lock'))) {
+    cargo generate-lockfile
+    if ($LASTEXITCODE -ne 0) { throw 'cargo generate-lockfile failed.' }
+}
+
+Write-Host '[3/6] Running NOVA unit tests...' -ForegroundColor Cyan
+cargo test --locked --target x86_64-pc-windows-msvc
 if ($LASTEXITCODE -ne 0) { throw 'cargo test failed.' }
 
-Write-Host '[3/5] Building NOVA Native (x86_64-pc-windows-msvc)...' -ForegroundColor Cyan
-cargo build --release --target x86_64-pc-windows-msvc
+Write-Host '[4/6] Building NOVA Native (x86_64-pc-windows-msvc)...' -ForegroundColor Cyan
+cargo build --locked --release --target x86_64-pc-windows-msvc
 if ($LASTEXITCODE -ne 0) { throw 'cargo build failed.' }
 
 $BuiltExe = Join-Path $ProjectRoot 'target\x86_64-pc-windows-msvc\release\NOVA.exe'
 if (-not (Test-Path $BuiltExe)) { throw "Expected executable not found: $BuiltExe" }
 
-Write-Host '[4/5] Preparing the portable USB folder...' -ForegroundColor Cyan
+Write-Host '[5/6] Preparing the portable USB folder...' -ForegroundColor Cyan
 $ReleaseDirectory = Join-Path $ProjectRoot 'release'
 $PackageRoot = Join-Path $ReleaseDirectory 'NOVA-Portable'
 if (Test-Path $PackageRoot) { Remove-Item $PackageRoot -Recurse -Force }
@@ -41,8 +47,8 @@ Copy-Item $BuiltExe (Join-Path $PackageRoot 'NOVA.exe')
 Copy-Item (Join-Path $ProjectRoot 'portable.flag') $PackageRoot
 Copy-Item (Join-Path $ProjectRoot 'README_PORTABLE.txt') $PackageRoot
 
-Write-Host '[5/5] Creating ZIP and SHA256...' -ForegroundColor Cyan
-$ZipPath = Join-Path $ReleaseDirectory 'NOVA-OS-Native-v0.3.2-USB.zip'
+Write-Host '[6/6] Creating ZIP and SHA256...' -ForegroundColor Cyan
+$ZipPath = Join-Path $ReleaseDirectory 'NOVA-OS-Native-v0.3.5-USB.zip'
 if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
 Compress-Archive -Path (Join-Path $PackageRoot '*') -DestinationPath $ZipPath -CompressionLevel Optimal
 $Checksum = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()

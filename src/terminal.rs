@@ -1,17 +1,56 @@
 use crate::storage::AppPaths;
 use crate::wifi;
-use std::io::{self, Read};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::io;
+use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::process::Command;
+use std::time::Duration;
 
-const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
+#[cfg(windows)]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(windows)]
-const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(windows)]
-const OUTPUT_DRAIN_KILL_GRACE: Duration = Duration::from_millis(750);
+const MAX_OUTPUT_HISTORY_LINES: usize = 1500;
+const MAX_OUTPUT_HISTORY_BYTES: usize = 4 * 1024 * 1024;
+
+/// A potentially slow terminal operation. The UI sends this to a worker thread
+/// so CMD and Windows WLAN operations never block the egui event loop.
+pub enum TerminalTask {
+    Command { command: String, cwd: PathBuf },
+    WifiScan,
+    WifiConnect { paths: AppPaths, ssid: String, password: Option<String> },
+    WifiDelete { paths: AppPaths, ssid: String },
+}
+
+impl TerminalTask {
+    pub fn run(self) -> String {
+        match self {
+            Self::Command { command, cwd } => match run_cmd(&command, &cwd) {
+                Ok(output) if output.is_empty() => String::new(),
+                Ok(output) => output,
+                Err(error) => format!("Error: {error}"),
+            },
+            Self::WifiScan => match wifi::scan_networks() {
+                Ok(networks) if networks.is_empty() => "No visible Wi-Fi networks were returned by Windows WLAN.".to_owned(),
+                Ok(networks) => {
+                    let mut lines = vec!["Nearby Wi-Fi networks:".to_owned()];
+                    for (index, network) in networks.iter().enumerate() {
+                        lines.push(format!("  {}. {}", index + 1, network));
+                    }
+                    lines.push("Use: wifi select \"SSID\"  |  wifi connect \"SSID\" [password]".to_owned());
+                    lines.join("\n")
+                }
+                Err(error) => format!("Wi-Fi scan failed: {error}"),
+            },
+            Self::WifiConnect { paths, ssid, password } => match wifi::connect(&paths, &ssid, password.as_deref()) {
+                Ok(message) => message,
+                Err(error) => format!("Wi-Fi connection failed: {error}"),
+            },
+            Self::WifiDelete { paths, ssid } => match wifi::delete_profile(&paths, &ssid) {
+                Ok(message) => message,
+                Err(error) => format!("Wi-Fi profile deletion failed: {error}"),
+            },
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct TerminalState {
@@ -29,7 +68,7 @@ impl TerminalState {
             cwd: paths.user_dir.clone(),
             wifi_mode: None,
         };
-        state.line("NOVA OS Native Terminal 0.3.2");
+        state.line("NOVA OS Native Terminal 0.3.5");
         state.line("Type help for commands. Wi-Fi: wifi -h");
         state.line(format!("Working directory: {}", state.cwd.display()));
         state.line("");
@@ -44,24 +83,34 @@ impl TerminalState {
     }
 
     pub fn password_entry(&self) -> bool {
+        fn starts_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+            value.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        }
+        let input = self.input.trim_start();
         self.wifi_mode.is_some()
-            || self
-                .input
-                .trim_start()
-                .to_ascii_lowercase()
-                .starts_with("wifi connect ")
-            || self
-                .input
-                .trim_start()
-                .to_ascii_lowercase()
-                .starts_with("/wifi connect ")
+            || starts_ascii_case_insensitive(input, "wifi connect ")
+            || starts_ascii_case_insensitive(input, "/wifi connect ")
     }
 
     pub fn line(&mut self, text: impl Into<String>) {
-        self.output.push(text.into());
-        if self.output.len() > 1500 {
-            let excess = self.output.len() - 1500;
-            self.output.drain(0..excess);
+        let mut text = text.into();
+        const TRUNCATION_PREFIX: &str = "[NOVA] Beginning of oversized output omitted\n";
+        if text.len() > MAX_OUTPUT_HISTORY_BYTES {
+            let mut start = text.len() - (MAX_OUTPUT_HISTORY_BYTES - TRUNCATION_PREFIX.len());
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            text = format!("{TRUNCATION_PREFIX}{}", &text[start..]);
+        }
+
+        self.output.push(text);
+        let mut total_bytes: usize = self.output.iter().map(String::len).sum();
+        while self.output.len() > MAX_OUTPUT_HISTORY_LINES || total_bytes > MAX_OUTPUT_HISTORY_BYTES {
+            if self.output.is_empty() {
+                break;
+            }
+            let removed = self.output.remove(0);
+            total_bytes = total_bytes.saturating_sub(removed.len());
         }
     }
 
@@ -69,21 +118,22 @@ impl TerminalState {
         self.output.clear();
     }
 
-    pub fn submit(&mut self, paths: &AppPaths, raw: &str) {
+    /// Process fast NOVA built-ins immediately and return slow Windows work
+    /// for the background worker. Wi-Fi passwords are deliberately not echoed.
+    pub fn submit(&mut self, paths: &AppPaths, raw: &str) -> Option<TerminalTask> {
         let line = raw.trim();
         if line.is_empty() {
-            return;
+            return None;
         }
 
         if let Some(ssid) = self.wifi_mode.clone() {
-            self.submit_wifi_session(paths, &ssid, line);
-            return;
+            return self.submit_wifi_session(paths, &ssid, line);
         }
 
         let lower = line.to_ascii_lowercase();
         if lower == "cls" || lower == "clear" {
             self.clear();
-            return;
+            return None;
         }
         if lower == "nova" || lower == "nova -h" || lower == "nova /?" {
             self.line("NOVA Terminal commands:");
@@ -94,16 +144,16 @@ impl TerminalState {
             self.line("  wifi select \"SSID\"");
             self.line("Windows CMD commands are passed to cmd.exe. Type help for Windows command help.");
             self.line("Warning: CMD commands run as your Windows user and can change the real computer.");
-            return;
+            return None;
         }
         if lower == "exit" {
             self.line("Close the Terminal window to leave NOVA Terminal.");
-            return;
+            return None;
         }
 
         if lower == "cd" || lower.starts_with("cd ") || lower.starts_with("chdir ") || lower == "cd.." || lower == "cd\\" {
             self.change_directory(line);
-            return;
+            return None;
         }
 
         if lower == "wifi" || lower.starts_with("wifi ") || lower == "/wifi" || lower.starts_with("/wifi ") {
@@ -111,24 +161,14 @@ impl TerminalState {
                 Ok(args) => args,
                 Err(error) => {
                     self.line(format!("Wi-Fi command syntax error: {error}"));
-                    return;
+                    return None;
                 }
             };
-            self.submit_wifi_command(paths, &args);
-            return;
+            return self.submit_wifi_command(paths, &args);
         }
 
         self.line(format!("{} {line}", self.cwd.display()));
-        match run_cmd(line, &self.cwd) {
-            Ok(output) => {
-                if !output.trim().is_empty() {
-                    for line in output.lines() {
-                        self.line(line.to_owned());
-                    }
-                }
-            }
-            Err(error) => self.line(format!("Error: {error}")),
-        }
+        Some(TerminalTask::Command { command: line.to_owned(), cwd: self.cwd.clone() })
     }
 
     fn change_directory(&mut self, line: &str) {
@@ -165,19 +205,16 @@ impl TerminalState {
             return;
         }
         parts.remove(0);
-        if parts.first().is_some_and(|v| v.eq_ignore_ascii_case("/d")) {
+        if parts.first().is_some_and(|value| value.eq_ignore_ascii_case("/d")) {
             parts.remove(0);
         }
         if parts.is_empty() {
             self.line(self.cwd.display().to_string());
             return;
         }
+
         let target = PathBuf::from(parts.join(" "));
-        let candidate = if target.is_absolute() {
-            target
-        } else {
-            self.cwd.join(target)
-        };
+        let candidate = if target.is_absolute() { target } else { self.cwd.join(target) };
         if candidate.is_dir() {
             match candidate.canonicalize() {
                 Ok(path) => self.cwd = path,
@@ -188,23 +225,11 @@ impl TerminalState {
         }
     }
 
-    fn submit_wifi_command(&mut self, paths: &AppPaths, args: &[String]) {
-        // `wifi` and `/wifi` share the same option parser; only the prefix differs.
+    fn submit_wifi_command(&mut self, paths: &AppPaths, args: &[String]) -> Option<TerminalTask> {
         let options: Vec<String> = args.iter().skip(1).cloned().collect();
-        let option = options.first().map(|s| s.to_ascii_lowercase());
-
+        let option = options.first().map(|value| value.to_ascii_lowercase());
         match option.as_deref() {
-            None => match wifi::scan_networks() {
-                Ok(networks) if networks.is_empty() => self.line("No visible Wi-Fi networks were returned by Windows WLAN."),
-                Ok(networks) => {
-                    self.line("Nearby Wi-Fi networks:");
-                    for (index, network) in networks.iter().enumerate() {
-                        self.line(format!("  {}. {}", index + 1, network));
-                    }
-                    self.line("Use: wifi select \"SSID\"  |  wifi connect \"SSID\" [password]");
-                }
-                Err(error) => self.line(format!("Wi-Fi scan failed: {error}")),
-            },
+            None => Some(TerminalTask::WifiScan),
             Some("-h") | Some("--help") | Some("help") => {
                 self.line("NOVA Wi-Fi commands:");
                 self.line("  wifi                         List nearby Wi-Fi networks");
@@ -216,95 +241,93 @@ impl TerminalState {
                 self.line("  password delete             Delete only the NOVA-managed profile");
                 self.line("  exit                         Return to CMD");
                 self.line("WPA2-Personal supported; enterprise/802.1X and captive portals are not configured.");
+                None
             }
             Some("select") => {
                 if options.len() < 2 {
                     self.line("Usage: wifi select \"SSID\"");
-                    return;
+                    return None;
                 }
                 let ssid = options[1..].join(" ");
                 if let Err(error) = wifi::validate_ssid(&ssid) {
                     self.line(format!("Wi-Fi: {error}"));
-                    return;
+                    return None;
                 }
                 self.wifi_mode = Some(ssid.clone());
                 self.line(format!("Selected network: {ssid}"));
                 self.line("Enter password <password> to configure/connect, password delete to remove the NOVA profile, or exit.");
+                None
             }
             Some("connect") => {
                 if options.len() < 2 {
                     self.line("Usage: wifi connect \"SSID\" [password]");
-                    return;
+                    return None;
                 }
-                let ssid = options[1].clone();
-                let password = options.get(2).map(String::as_str);
                 if options.len() > 3 {
                     self.line("Too many arguments. Quote the SSID and password if they contain spaces.");
-                    return;
+                    return None;
                 }
-                match wifi::connect(paths, &ssid, password) {
-                    Ok(message) => self.line(message),
-                    Err(error) => self.line(format!("Wi-Fi connection failed: {error}")),
-                }
+                let ssid = options[1].clone();
+                let password = options.get(2).cloned();
+                Some(TerminalTask::WifiConnect { paths: paths.clone(), ssid, password })
             }
-            Some(other) => self.line(format!("Unknown Wi-Fi option: {other}. Type wifi -h.")),
+            Some(other) => {
+                self.line(format!("Unknown Wi-Fi option: {other}. Type wifi -h."));
+                None
+            }
         }
     }
 
-    fn submit_wifi_session(&mut self, paths: &AppPaths, ssid: &str, line: &str) {
+    fn submit_wifi_session(&mut self, paths: &AppPaths, ssid: &str, line: &str) -> Option<TerminalTask> {
         let parts = match parse_words(line) {
             Ok(parts) => parts,
             Err(error) => {
                 self.line(format!("Wi-Fi: {error}"));
-                return;
+                return None;
             }
         };
-        let Some(command) = parts.first().map(|s| s.to_ascii_lowercase()) else {
-            return;
+        let Some(command) = parts.first().map(|value| value.to_ascii_lowercase()) else {
+            return None;
         };
         match command.as_str() {
             "exit" => {
                 self.wifi_mode = None;
                 self.line("Returned to Windows CMD mode.");
+                None
             }
             "password" => {
                 if parts.get(1).is_some_and(|value| value.eq_ignore_ascii_case("delete")) {
                     if parts.len() != 2 {
                         self.line("Usage: password delete");
-                        return;
+                        return None;
                     }
-                    match wifi::delete_profile(paths, ssid) {
-                        Ok(message) => self.line(message),
-                        Err(error) => self.line(format!("Wi-Fi profile deletion failed: {error}")),
-                    }
+                    Some(TerminalTask::WifiDelete { paths: paths.clone(), ssid: ssid.to_owned() })
                 } else {
                     if parts.len() < 2 {
                         self.line("Usage: password <password>");
-                        return;
+                        return None;
                     }
                     let password = parts[1..].join(" ");
-                    match wifi::connect(paths, ssid, Some(&password)) {
-                        Ok(message) => self.line(message),
-                        Err(error) => self.line(format!("Wi-Fi setup failed: {error}")),
-                    }
+                    Some(TerminalTask::WifiConnect { paths: paths.clone(), ssid: ssid.to_owned(), password: Some(password) })
                 }
             }
             "connect" => {
                 if parts.len() != 1 {
                     self.line("For a secured network, use password <password>. For an open network, type connect.");
-                    return;
+                    return None;
                 }
-                match wifi::connect(paths, ssid, None) {
-                    Ok(message) => self.line(message),
-                    Err(error) => self.line(format!("Wi-Fi connection failed: {error}")),
-                }
+                Some(TerminalTask::WifiConnect { paths: paths.clone(), ssid: ssid.to_owned(), password: None })
             }
             "help" | "-h" => {
                 self.line("password <password> — configure the selected network and connect");
                 self.line("password delete — remove the NOVA-managed WLAN profile");
                 self.line("exit — return to CMD");
+                None
             }
-            other => self.line(format!("Unknown Wi-Fi setup command: {other}. Type help.")),
+            other => {
+                self.line(format!("Unknown Wi-Fi setup command: {other}. Type help."));
+                None
+            }
         }
     }
 }
@@ -354,134 +377,22 @@ pub fn parse_words(input: &str) -> Result<Vec<String>, String> {
 }
 
 #[cfg(windows)]
-fn run_cmd(command: &str, cwd: &std::path::Path) -> io::Result<String> {
-    let mut child = Command::new("cmd.exe")
-        .args(["/D", "/S", "/C", command])
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    let pid = child.id();
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let out_reader = thread::spawn(move || read_limited(stdout));
-    let err_reader = thread::spawn(move || read_limited(stderr));
-
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {}
-            Err(error) => {
-                kill_process_tree(pid);
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        }
-        if Instant::now() >= deadline {
-            kill_process_tree(pid);
-            // Also attempt to stop cmd.exe itself if taskkill could not reach it.
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        thread::sleep(Duration::from_millis(80));
-    };
-
-    // A descendant may inherit CMD's output handles and keep a pipe open after
-    // cmd.exe exits. Never block the NOVA UI forever waiting for EOF.
-    let mut readers_finished = wait_for_readers(&out_reader, &err_reader, OUTPUT_DRAIN_TIMEOUT);
-    if !readers_finished {
-        kill_process_tree(pid);
-        readers_finished = wait_for_readers(&out_reader, &err_reader, OUTPUT_DRAIN_KILL_GRACE);
-    }
-
-    let (stdout, stdout_truncated) = if out_reader.is_finished() {
-        out_reader
-            .join()
-            .map_err(|_| io::Error::other("NOVA stdout reader thread panicked"))??
-    } else {
-        drop(out_reader); // Detach an unresponsive reader rather than freezing the UI.
-        (Vec::new(), false)
-    };
-    let (stderr, stderr_truncated) = if err_reader.is_finished() {
-        err_reader
-            .join()
-            .map_err(|_| io::Error::other("NOVA stderr reader thread panicked"))??
-    } else {
-        drop(err_reader);
-        (Vec::new(), false)
-    };
-    let mut output = String::from_utf8_lossy(&stdout).to_string();
-    let error_text = String::from_utf8_lossy(&stderr);
-    if !error_text.trim().is_empty() {
-        if !output.is_empty() {
-            output.push('\n');
-        }
-        output.push_str(error_text.trim_end());
-    }
-    if stdout_truncated || stderr_truncated {
-        output.push_str("\n[NOVA] Output was truncated at 1 MiB per stream.");
-    }
-    if !readers_finished {
-        output.push_str("\n[NOVA] Output collection stopped after the drain timeout; a descendant may still hold a pipe open.");
-    }
-    if status.is_none() {
-        output.push_str("\n[NOVA] Command timed out after 30 seconds. NOVA requested process-tree termination.");
-    } else if output.is_empty() {
-        if let Some(status) = status {
-            if !status.success() {
-                output = format!("Command exited with code {}.", status.code().unwrap_or(-1));
-            }
-        }
-    }
-    Ok(output)
-}
-
-#[cfg(windows)]
-fn wait_for_readers(
-    stdout: &thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
-    stderr: &thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
-    timeout: Duration,
-) -> bool {
-    let deadline = Instant::now() + timeout;
-    while (!stdout.is_finished() || !stderr.is_finished()) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(20));
-    }
-    stdout.is_finished() && stderr.is_finished()
-}
-
-#[cfg(windows)]
-fn read_limited<R: Read>(reader: R) -> io::Result<(Vec<u8>, bool)> {
-    let mut bytes = Vec::new();
-    reader.take(MAX_OUTPUT_BYTES + 1).read_to_end(&mut bytes)?;
-    let truncated = bytes.len() as u64 > MAX_OUTPUT_BYTES;
-    if truncated {
-        bytes.truncate(MAX_OUTPUT_BYTES as usize);
-    }
-    Ok((bytes, truncated))
-}
-
-#[cfg(windows)]
-fn kill_process_tree(pid: u32) {
-    let _ = Command::new("taskkill.exe")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+fn run_cmd(command: &str, cwd: &Path) -> io::Result<String> {
+    let mut process = Command::new(crate::windows_process::system_binary("cmd.exe")?);
+    process.args(["/D", "/S", "/C", command]).current_dir(cwd);
+    let output = crate::windows_process::run_captured(process, COMMAND_TIMEOUT)?;
+    Ok(output.combined_text())
 }
 
 #[cfg(not(windows))]
-fn run_cmd(_command: &str, _cwd: &std::path::Path) -> io::Result<String> {
+fn run_cmd(_command: &str, _cwd: &Path) -> io::Result<String> {
     Ok("Windows CMD is available only in the Windows build of NOVA.".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_words;
+    use super::{parse_words, TerminalState, TerminalTask};
+    use std::path::PathBuf;
 
     #[test]
     fn parses_quoted_ssid_and_password() {
@@ -498,5 +409,53 @@ mod tests {
     #[test]
     fn rejects_unclosed_quotes() {
         assert!(parse_words("wifi select \"Home WiFi").is_err());
+    }
+
+    #[test]
+    fn terminal_output_history_is_bounded_by_bytes() {
+        let mut state = TerminalState { input: String::new(), output: Vec::new(), cwd: PathBuf::from("."), wifi_mode: None };
+        state.line("x".repeat(super::MAX_OUTPUT_HISTORY_BYTES + 64));
+        let first_total: usize = state.output.iter().map(String::len).sum();
+        assert!(first_total <= super::MAX_OUTPUT_HISTORY_BYTES);
+        assert!(state.output[0].starts_with("[NOVA] Beginning of oversized output omitted"));
+        state.line("latest line");
+        let total: usize = state.output.iter().map(String::len).sum();
+        assert!(total <= super::MAX_OUTPUT_HISTORY_BYTES);
+        assert!(state.output.iter().any(|line| line == "latest line"));
+    }
+
+    #[test]
+    fn normal_commands_are_scheduled_as_background_jobs() {
+        let mut state = TerminalState { input: String::new(), output: Vec::new(), cwd: PathBuf::from("."), wifi_mode: None };
+        let task = state.submit(&dummy_paths(), "echo hello");
+        assert!(matches!(task, Some(TerminalTask::Command { .. })));
+    }
+
+    #[test]
+    fn wifi_scan_is_scheduled_as_a_background_job() {
+        let mut state = TerminalState { input: String::new(), output: Vec::new(), cwd: PathBuf::from("."), wifi_mode: None };
+        assert!(matches!(state.submit(&dummy_paths(), "wifi"), Some(TerminalTask::WifiScan)));
+    }
+
+    #[test]
+    fn selected_wifi_password_is_not_written_to_terminal_history() {
+        let mut state = TerminalState { input: String::new(), output: Vec::new(), cwd: PathBuf::from("."), wifi_mode: None };
+        let paths = dummy_paths();
+        assert!(state.submit(&paths, "wifi select \"Lab AP\"").is_none());
+        let task = state.submit(&paths, "password \"secret phrase\"");
+        assert!(matches!(task, Some(TerminalTask::WifiConnect { password: Some(secret), .. }) if secret == "secret phrase"));
+        assert!(!state.output.join("\n").contains("secret phrase"));
+    }
+
+    fn dummy_paths() -> crate::storage::AppPaths {
+        // The command scheduling path only needs the current directory, but
+        // AppPaths is used for the general API. Tests use a deterministic temp root.
+        let root = std::env::temp_dir();
+        crate::storage::AppPaths {
+            user_dir: root.clone(),
+            settings_file: root.join("settings.json"),
+            wifi_manifest: root.join("wifi.json"),
+            portable: true,
+        }
     }
 }

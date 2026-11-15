@@ -10,7 +10,7 @@ Use this route if you only want the finished Windows USB package and do not want
 4. In the left sidebar select **Build NOVA Native for Windows**.
 5. Choose **Run workflow**, select the default branch, and run it.
 6. Wait for the workflow to finish. Open its successful run and find **Artifacts** at the bottom.
-7. Download `NOVA-OS-Native-v0.3.2-USB`. It is the packaged portable folder, with `NOVA.exe`, `portable.flag`, `README_PORTABLE.txt`, `BUILD_INFO.txt` and `Data/`. GitHub supplies the artifact download as a ZIP archive.
+7. Download `NOVA-OS-Native-v0.3.5-USB`. It is the packaged portable folder, with `NOVA.exe`, `portable.flag`, `README_PORTABLE.txt`, `BUILD_INFO.txt` and `Data/`. GitHub supplies the artifact download as a ZIP archive.
 8. Extract the downloaded artifact once. Copy the entire extracted contents to the USB drive. Keep `NOVA.exe`, `portable.flag`, `README_PORTABLE.txt`, and `Data/` together.
 
 ## On the target Windows PC
@@ -20,4 +20,4 @@ Use this route if you only want the finished Windows USB package and do not want
 - Windows may show SmartScreen or antivirus warnings for a newly built unsigned executable. Do not bypass a warning unless you trust the source and have checked the artifact. A public release should be code-signed.
 - Close NOVA before ejecting the USB.
 
-The initial build is x64 only. The workflow builds and runs unit tests, then packages the EXE and portable data folders. It does not test every real PC, GPU, wireless adapter, or router.
+The initial build is x64 only. The first workflow run creates and commits `Cargo.lock` (the workflow needs `contents: write` permission); subsequent runs use `--locked` so indirect dependency versions stay fixed. Check **Settings → Actions → General → Workflow permissions** and allow read/write access if the bot cannot commit. If repository branch protection still blocks the bot commit, generate `Cargo.lock` on a local Rust 1.95.0 build machine and commit it manually. The workflow runs unit tests, builds the EXE and packages the portable data folders. It does not test every real PC, GPU, wireless adapter, or router.

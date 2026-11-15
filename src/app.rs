@@ -1,8 +1,10 @@
 use crate::storage::{canonical_user_path, create_user_directories, safe_user_path, AppPaths, Settings};
-use crate::terminal::TerminalState;
+use crate::terminal::{TerminalState, TerminalTask};
 use eframe::egui::{self, Color32, FontId, RichText, TextEdit};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
@@ -10,6 +12,8 @@ pub struct NovaApp {
     paths: AppPaths,
     settings: Settings,
     terminal: TerminalState,
+    terminal_job_receiver: Option<Receiver<String>>,
+    terminal_busy: bool,
     terminal_open: bool,
     files_open: bool,
     editor_open: bool,
@@ -45,6 +49,8 @@ impl NovaApp {
         };
         let app = Self {
             terminal: TerminalState::new(&paths),
+            terminal_job_receiver: None,
+            terminal_busy: false,
             files_dir: paths.user_dir.clone(),
             paths,
             settings,
@@ -168,7 +174,57 @@ impl NovaApp {
         }
     }
 
+    fn start_terminal_task(&mut self, task: TerminalTask) {
+        if self.terminal_busy {
+            self.terminal.line("A terminal command is already running. Please wait for it to finish.");
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new()
+            .name("nova-terminal-worker".to_owned())
+            .spawn(move || {
+                let result = task.run();
+                let _ = sender.send(result);
+            })
+        {
+            Ok(_) => {
+                self.terminal_job_receiver = Some(receiver);
+                self.terminal_busy = true;
+            }
+            Err(error) => self.terminal.line(format!("Could not start terminal worker: {error}")),
+        }
+    }
+
+    fn poll_terminal_task(&mut self, ctx: &egui::Context) {
+        let result = match self.terminal_job_receiver.as_ref() {
+            Some(receiver) => match receiver.try_recv() {
+                Ok(result) => Some(Ok(result)),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Err("Terminal worker stopped unexpectedly.".to_owned())),
+            },
+            None => None,
+        };
+
+        if let Some(result) = result {
+            match result {
+                Ok(output) if !output.trim().is_empty() => {
+                    for line in output.lines() {
+                        self.terminal.line(line.to_owned());
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => self.terminal.line(error),
+            }
+            self.terminal_job_receiver = None;
+            self.terminal_busy = false;
+        } else if self.terminal_busy {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
     fn terminal_window(&mut self, ctx: &egui::Context) {
+        self.poll_terminal_task(ctx);
         let mut submit = false;
         egui::Window::new("NOVA Terminal — Windows CMD")
             .open(&mut self.terminal_open)
@@ -180,10 +236,14 @@ impl NovaApp {
                     if self.terminal.wifi_mode.is_some() {
                         ui.label(RichText::new("Wi-Fi setup mode · input hidden").small().weak());
                     }
+                    if self.terminal_busy {
+                        ui.spinner();
+                        ui.label(RichText::new("Running in background…").small().weak());
+                    }
                 });
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
-                    .max_height(ui.available_height() - 74.0)
+                    .max_height(ui.available_height() - 82.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for line in &self.terminal.output {
@@ -195,26 +255,29 @@ impl NovaApp {
                     let prompt = self.terminal.prompt();
                     ui.label(RichText::new(prompt).monospace().color(Color32::from_rgb(117, 203, 172)));
                     let hide_input = self.terminal.password_entry();
-                    let response = ui.add(
+                    let response = ui.add_enabled(
+                        !self.terminal_busy,
                         TextEdit::singleline(&mut self.terminal.input)
                             .font(FontId::monospace(13.0))
                             .password(hide_input)
-                            .hint_text("Enter command…")
+                            .hint_text(if self.terminal_busy { "Command running…" } else { "Enter command…" })
                             .desired_width(f32::INFINITY),
                     );
-                    if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    if !self.terminal_busy && response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                         submit = true;
                     }
-                    if ui.button("Run").clicked() {
+                    if ui.add_enabled(!self.terminal_busy, egui::Button::new("Run")).clicked() {
                         submit = true;
                     }
                 });
                 ui.label(RichText::new("CMD runs with your Windows account permissions. This is not a sandbox.").small().weak());
             });
-        if submit {
+        if submit && !self.terminal_busy {
             let line = std::mem::take(&mut self.terminal.input);
             if !line.trim().is_empty() {
-                self.terminal.submit(&self.paths, &line);
+                if let Some(task) = self.terminal.submit(&self.paths, &line) {
+                    self.start_terminal_task(task);
+                }
             }
         }
     }
@@ -539,7 +602,7 @@ impl eframe::App for NovaApp {
                 ui.separator();
                 ui.label(RichText::new("NATIVE DESKTOP").small().weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("NOVA 0.3.2").small().weak());
+                    ui.label(RichText::new("NOVA 0.3.5").small().weak());
                     ui.separator();
                     let mode = if self.paths.portable { "USB PORTABLE" } else { "LOCAL MODE" };
                     ui.label(RichText::new(mode).small().color(Color32::from_rgb(105, 207, 170)));

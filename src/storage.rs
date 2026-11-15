@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
-    pub app_dir: PathBuf,
-    pub data_dir: PathBuf,
     pub user_dir: PathBuf,
     pub settings_file: PathBuf,
     pub wifi_manifest: PathBuf,
@@ -75,8 +73,6 @@ impl AppPaths {
         }
 
         Ok(Self {
-            app_dir,
-            data_dir,
             user_dir,
             settings_file,
             wifi_manifest,
@@ -140,7 +136,16 @@ impl AppPaths {
 /// Resolve a user-provided path inside NOVA's user area only.
 /// Absolute paths and parent traversal are rejected.
 pub fn safe_user_path(root: &Path, relative: &str) -> io::Result<PathBuf> {
-    let raw = Path::new(relative.trim());
+    // Do not trim the whole path: doing so would silently turn an invalid
+    // Windows filename such as "trailing " into the different valid name
+    // "trailing" before component validation can reject it.
+    if relative.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "A relative file or folder path is required.",
+        ));
+    }
+    let raw = Path::new(relative);
     if raw.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -318,6 +323,8 @@ mod tests {
             assert!(safe_user_path(root, unsafe_name).is_err(), "accepted {unsafe_name}");
         }
         assert!(safe_user_path(root, "Documents/normal-file.txt").is_ok());
+        assert!(safe_user_path(root, "").is_err());
+        assert!(safe_user_path(root, "   ").is_err());
         assert!(safe_user_path(root, &"a".repeat(256)).is_err());
     }
 
@@ -339,8 +346,6 @@ mod tests {
         let settings = base.join("Settings");
         std::fs::create_dir_all(&settings).unwrap();
         let paths = super::AppPaths {
-            app_dir: base.clone(),
-            data_dir: base.clone(),
             user_dir: base.join("Users/Default"),
             settings_file: settings.join("settings.json"),
             wifi_manifest: settings.join("wifi-profiles.json"),

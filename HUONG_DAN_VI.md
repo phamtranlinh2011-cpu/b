@@ -1,4 +1,4 @@
-# NOVA Native 0.3.2 — Huong dan tieng Viet
+# NOVA Native 0.3.5 — Huong dan tieng Viet
 
 ## NOVA Native la gi?
 
@@ -10,14 +10,14 @@ Source ZIP hien tai chua co `NOVA.exe` da bien dich. De tao EXE ma khong cai Rus
 
 1. Dang nhap GitHub va tao mot repository moi (private cung duoc).
 2. Giai nen source ZIP nay tren may.
-3. Tai len GitHub **toan bo noi dung** ben trong thu muc `NOVA-OS-Native-v0.3.2`, bao gom thu muc an `.github`.
+3. Tai len GitHub **toan bo noi dung** ben trong thu muc `NOVA-OS-Native-v0.3.5`, bao gom thu muc an `.github`.
 4. Mo tab **Actions** trong repository va cho phep GitHub Actions neu duoc hoi.
 5. Chon workflow **Build NOVA Native for Windows** o cot ben trai.
 6. Bam **Run workflow** va chay tren nhanh mac dinh.
-7. Khi job thanh cong, mo run vua hoan tat va tai artifact `NOVA-OS-Native-v0.3.2-USB` trong muc Artifacts.
+7. Khi job thanh cong, mo run vua hoan tat va tai artifact `NOVA-OS-Native-v0.3.5-USB` trong muc Artifacts.
 8. Giai nen ZIP artifact va copy toan bo noi dung vao USB.
 
-Workflow se chay unit tests, build `NOVA.exe` va dong goi artifact portable. GitHub cung cap artifact duoi dang ZIP de tai ve; giai nen mot lan roi copy toan bo noi dung vao USB. Neu workflow that bai, mo log cua buoc loi va gui log do de sua.
+Workflow se chay unit tests, build `NOVA.exe` va dong goi artifact portable. Lan chay dau tien se tao `Cargo.lock` va commit file nay vao nhanh duoc chon, vi vay repository can cho phep GitHub Actions co quyen `contents: write` va khong chan commit cua bot. Cac lan build sau su dung `--locked`. GitHub cung cap artifact duoi dang ZIP de tai ve; giai nen mot lan roi copy toan bo noi dung vao USB. Neu workflow that bai, mo log cua buoc loi va gui log do de sua.
 
 ## Cach chay tren may dich
 
@@ -47,18 +47,21 @@ NOVA-Portable/
 
 ## Gioi han va canh bao
 
-- CMD chay lenh that voi quyen cua tai khoan Windows hien tai; no khong phai sandbox.
+- CMD chay lenh that voi quyen cua tai khoan Windows hien tai; no khong phai sandbox. CMD/Wi-Fi chay tren worker nen giao dien khong bi dung; Job Object se don cac process con van nam trong job khi timeout/dong handle.
 - Wi-Fi can WLAN AutoConfig va driver Wi-Fi cua may. Ban dau ho tro mang mo va WPA2-Personal (AES).
 - Windows co the hien SmartScreen/antivirus warning voi EXE chua ky so. Chi cho phep neu ban tin tuong nguon build va da xac minh artifact.
 - Khong rut USB trong luc NOVA dang ghi du lieu.
 - Chua co benchmark hoac kiem thu tren nhieu may phan cung; can xac nhan tren may dich truoc khi dung thuong xuyen.
 
 
-## Ghi chu ban 0.3.2
+## Ghi chu ban 0.3.5
 
 - Files kiem tra duong dan canonical, tu choi ten tep khong hop le/reserved cua Windows; Editor tao thu muc cha theo tung cap va kiem tra lai truoc khi ghi.
 - Neu USB/thu muc Settings chi doc, NOVA hien loi luu Settings tren thanh trang thai.
-- Tep XML Wi-Fi tam thoi duoc don dep khi thao tac ket thuc theo luong Rust thong thuong. Tuy nhien tep van co the con lai neu app bi tat dot ngot; khong nen dung tren may/tai khoan Windows khong tin cay.
+- Tep XML Wi-Fi tam thoi duoc tao voi DACL gioi han cho owner, SYSTEM va Administrators. NOVA dong writer truoc khi netsh mo tep, xoa tep sau import va don tep NOVA cu hon 10 phut o lan khoi dong tiep theo neu lan truoc bi crash. Noi dung XML van la plaintext trong khoang thoi gian ngan no ton tai; SYSTEM va Administrators duoc xem la tin cay.
 - Manifest Wi-Fi loi/khong doc duoc se bi tu choi an toan thay vi xem nhu danh sach rong.
 - Monitor khong lam NOVA crash neu sysinfo khong khoi tao duoc; ket qua Calculator nho khong bi lam tron thanh 0.
-- CMD va Wi-Fi can kiem thu thuc te tren Windows 10/11 truoc khi su dung hang ngay.
+- CMD va Wi-Fi chay tren worker rieng; output duoc gioi han 1 MiB moi stream va van doc den EOF de tranh pipe bi day.
+- `cmd.exe` va `netsh.exe` duoc tim bang `GetSystemDirectoryW`, khong tim theo PATH/thu muc hien hanh.
+- Rust toolchain duoc pin 1.95.0; workflow tao/commit `Cargo.lock` lan dau va build `--locked` o cac lan sau.
+- Van can kiem thu thuc te tren Windows 10/11, nhieu adapter/router va cac tinh huong nested Job Object.

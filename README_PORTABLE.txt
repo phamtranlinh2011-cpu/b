@@ -1,4 +1,4 @@
-NOVA OS NATIVE 0.3.2 — USB PORTABLE EDITION
+NOVA OS NATIVE 0.3.5 — USB PORTABLE EDITION
 
 BAT DAU
 1. Giu NOVA.exe, portable.flag va thu muc Data/ cung nam trong mot thu muc.
@@ -24,7 +24,7 @@ LENH WI-FI
 BAO MAT
 - CMD khong phai sandbox. Lenh chay bang quyen tai khoan Windows va co the thay doi may that.
 - NOVA khong luu mat khau Wi-Fi trong Data/settings/log cua minh. Windows WLAN quan ly profile da luu.
-- Tep XML WLAN chua mat khau duoc tao tam thoi trong TEMP cua tai khoan Windows de netsh nhap profile; NOVA se thu xoa tep khi ket thuc thao tac. Tep co the con lai neu tien trinh bi ket thuc dot ngot; ban nay chua dat ACL rieng cho tep. Windows quan ly profile da nhap.
+- Tep XML WLAN chua mat khau duoc tao tam thoi trong TEMP cua tai khoan Windows de netsh nhap profile. Tep co DACL gioi han cho owner, SYSTEM va Administrators; NOVA dong writer truoc khi netsh mo tep va xoa tep sau khi import. Neu NOVA crash, tep co the con lai nhung van duoc DACL bao ve; lan mo NOVA sau se xoa cac tep NOVA cu hon 10 phut.
 - NOVA chi xoa profile Wi-Fi ma chinh NOVA da ghi nhan.
 
 GIOI HAN

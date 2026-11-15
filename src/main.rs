@@ -4,6 +4,7 @@ mod app;
 mod storage;
 mod terminal;
 mod wifi;
+mod windows_process;
 
 fn main() -> eframe::Result {
     let paths = match storage::AppPaths::discover() {
@@ -17,6 +18,10 @@ fn main() -> eframe::Result {
             return Err(eframe::Error::AppCreation(Box::new(error)));
         }
     };
+
+    if let Err(error) = wifi::cleanup_stale_temp_profiles() {
+        eprintln!("NOVA: could not clean stale temporary WLAN profiles: {error}");
+    }
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
