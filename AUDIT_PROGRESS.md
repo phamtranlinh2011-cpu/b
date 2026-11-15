@@ -50,6 +50,15 @@ Changes in Part 3:
 
 The source tree now declares 71 Rust `#[test]` functions across all target configurations.
 
+
+## Follow-up — Windows CI path assertion fix
+
+The first Windows CI run on the Part 3 source executed 61 tests: 60 passed and `unikey::tests::finds_only_known_portable_unikey_locations` failed because the implementation correctly returned `canonicalize()` output while the test compared it to the original, non-canonical input path. Windows may represent the canonical path with the `\\?\` extended-length prefix and may expand an 8.3 path component; these are equivalent filesystem paths, not a UniKey discovery failure.
+
+- Updated the regression test to canonicalize its expected path before comparing it with `find_portable()`.
+- Removed the redundant `scope_ready = false` assignment; the value is recomputed immediately after the scope field changes and confirmation is reset.
+- The fix is source-reviewed but still needs a fresh Windows Actions run. This container has no Rust/Cargo toolchain, so the updated Windows test has not been rerun here.
+
 ## Validation limits
 
 The current packaging container does not provide `rustc`, `cargo` or `rustfmt`. The changes have been reviewed statically, but `cargo test`, clippy, formatting and a Windows Release build have not been executed here. A Windows GitHub Actions run on this exact source revision and real Windows runtime checks are still required.

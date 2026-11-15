@@ -410,8 +410,9 @@ impl NovaApp {
                         .hint_text("Authorized domains, IPs or lab range")
                         .desired_width(f32::INFINITY));
                     if scope_response.changed() {
+                        // Re-acknowledgement is required whenever the target scope changes.
+                        // scope_ready is recomputed immediately below from this updated state.
                         self.security_scope_confirmed = false;
-                        scope_ready = false;
                     }
                     ui.checkbox(&mut self.security_scope_confirmed, "I own these assets or have written permission to test them.");
                     scope_ready = security_tools::validate_authorized_scope(

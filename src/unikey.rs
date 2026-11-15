@@ -167,7 +167,11 @@ mod tests {
         let target = root.join("Apps/UniKey/UniKeyNT.exe");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::write(&target, b"test placeholder").unwrap();
-        assert_eq!(find_portable(&root), Some(target));
+        // Windows canonicalize() may return an extended-length path (\\?\)
+        // and expand short/long names. Compare canonical paths on every platform
+        // instead of comparing their presentation forms.
+        let expected = target.canonicalize().expect("test UniKey path should canonicalize");
+        assert_eq!(find_portable(&root), Some(expected));
         let _ = fs::remove_dir_all(root);
     }
 
