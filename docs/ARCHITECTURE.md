@@ -1,21 +1,22 @@
-# NOVA Native 0.5.1 architecture
+# NOVA Native 0.5.2 architecture
 
 ## Runtime shape
 
 ```text
 NOVA.exe (Rust native process)
 ├── eframe / egui / Glow root viewport
-│   ├── desktop shell and navigation rail
-│   ├── searchable launcher
+│   ├── Windows-inspired desktop canvas and shortcuts
+│   ├── centered taskbar (Start, Search, pinned apps, active states)
+│   ├── Start surface (search, Pinned, Recommended, All apps/categories)
+│   ├── one shared application catalog for every app entry point
 │   ├── floating in-shell app windows
 │   │   ├── Files / Editor / Calculator / Monitor / Settings
 │   │   ├── Terminal / UniKey
 │   │   ├── NOVA Trash
-│   │   ├── Chrome launcher panel
+│   │   ├── Chrome launch panel
 │   │   ├── UniKey control panel
 │   │   ├── Security Center
 │   │   └── five external GUI security-tool workspaces
-│   └── bottom dock/taskbar
 ├── portable Data store
 │   ├── Users/Default/{Desktop,Documents,Downloads}
 │   ├── Settings
@@ -32,13 +33,17 @@ NOVA.exe (Rust native process)
 
 ## Application presentation model
 
-The desktop shell is one native eframe root window. Files, Editor, Terminal, Calculator, Monitor, Settings, Trash and Chrome panel are egui windows hosted inside that viewport. They are movable/resizable floating surfaces, use a consistent theme, and appear as active items in the dock. Launcher search opens an app; clicking an active dock item toggles its visibility. These are not independent native Windows top-level viewports. This keeps the desktop shell lightweight and lets NOVA control app layout consistently; separate native viewports remain a possible later architecture.
+The desktop shell is one native eframe root window. The home surface follows familiar Windows desktop conventions: shortcut icons on the desktop canvas, a bottom taskbar, a Start button, a Search entry point, pinned app buttons, and active-state feedback for open workspaces. The Start surface is anchored above the taskbar and presents Search, Pinned, Recommended quick access, and a categorized All apps view. It is part of NOVA's eframe viewport; it does not replace or hook into the actual Windows shell Start menu.
 
-Motion uses short hover/fade transitions and egui animation primitives. The Reduce visual effects setting disables most transitions and decorative desktop shapes. Motion is feedback, not required to access controls. UI structure uses consistent spacing, rounded window/popup surfaces, selected accent color, and standard egui buttons, inputs, selectable rows and scroll areas.
+`START_APPS` is the single application catalog used by desktop shortcuts, Start pins, search results and All apps. `START_PINS` is only the curated pinned subset. Adding an app therefore means adding one catalog entry and, when appropriate, adding its name to the pinned subset; the click action continues through `open_app`/`toggle_app` so existing application state and safety checks are preserved.
+
+Files, Editor, Terminal, Calculator, Monitor, Settings, Trash and Chrome panel are egui windows hosted inside the root viewport. They remain movable/resizable floating surfaces and appear as active taskbar icons. Clicking an active taskbar item toggles its window visibility. They are not independent native Windows top-level viewports. This keeps the shell lightweight and makes app layout consistent.
+
+Motion uses stable egui animation IDs for shortcut hover and the Start surface's fade/slide transition. The Reduce visual effects setting disables transitions and decorative desktop shapes. Motion is feedback, not required to access controls. Long-lived surfaces use restrained solid/tinted backgrounds; transient Start surfaces use a translucent acrylic-like treatment, border and shadow. The style follows Windows 11's guidance to keep persistent surfaces calm and use translucent materials on transient flyouts; it is an egui approximation rather than native Mica/Acrylic.
 
 ## App modules
 
-- `app.rs`: desktop shell, searchable launcher, dock, window state, Files/Editor/Trash/Chrome/UniKey/Security Center UI, worker-task coordination and settings.
+- `app.rs`: Windows-style desktop shell, shared Start app catalog, desktop shortcuts, Start surface, taskbar, window state, Files/Editor/Trash/Chrome/UniKey/Security Center UI, worker-task coordination and settings.
 - `apps.rs`: Chrome discovery, URL validation, bounded Google Authenticode publisher verification and normal host launch (requires explicit confirmation in the UI).
 - `isolation.rs`: creates disposable Windows Sandbox `.wsb` sessions for offline file inspection and isolated Chrome; no writable host folders are mapped.
 - `storage.rs`: portable path discovery with component-by-component symlink/junction/reparse-point rejection, settings/manifest file validation, atomic JSON writes and path containment.

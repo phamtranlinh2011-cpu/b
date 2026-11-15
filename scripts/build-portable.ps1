@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
-$Version = '0.5.1'
+$Version = '0.5.6'
 $Target = 'x86_64-pc-windows-msvc'
 
 function Require-Command([string]$Name) {

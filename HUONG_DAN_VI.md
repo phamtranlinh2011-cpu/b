@@ -1,4 +1,4 @@
-# NOVA Native 0.5.1 — Hướng dẫn tiếng Việt
+# NOVA Native 0.5.6 — Hướng dẫn tiếng Việt
 
 ## Security Center và 5 công cụ GUI (0.5.1)
 
@@ -9,7 +9,7 @@ Trong Security Center, nhập phạm vi tài sản được phép và xác nhậ
 
 ## 1. Chạy NOVA từ USB
 
-1. Giải nén gói `NOVA-OS-Native-v0.5.1-source.zip` để build, hoặc giải nén artifact `NOVA-OS-Native-v0.5.1-USB` sau khi GitHub Actions build thành công.
+1. Giải nén gói `NOVA-OS-Native-v0.5.6-source.zip` để build, hoặc giải nén artifact `NOVA-OS-Native-v0.5.6-USB` sau khi GitHub Actions build thành công.
 2. Giữ `NOVA.exe`, `portable.flag`, `README_PORTABLE.txt`, thư mục `scripts` và `Data` cùng một thư mục.
 3. Cắm USB vào Windows 10/11 x64 và mở `NOVA.exe`.
 4. Máy đích không cần Rust, Cargo, Node.js, npm hay WebView2. Máy vẫn cần driver đồ họa tương thích.
@@ -17,7 +17,7 @@ Trong Security Center, nhập phạm vi tài sản được phép và xác nhậ
 
 ## 2. Gõ tiếng Việt và Unicode
 
-- Mở **UniKey** từ Launcher hoặc thanh Dock.
+- Mở **Start** ở taskbar phía dưới, chọn **UniKey**.
 - Chọn **Download UniKey to USB**. NOVA tải UniKey 4.6 RC2 x64 từ `unikey.org`, kiểm tra chữ ký số và nhà phát hành `PHAM KIM LONG` trước khi cho chạy.
 - Chọn **Start UniKey**.
 - Mở biểu tượng UniKey ở khay hệ thống Windows, chọn **Bảng mã: Unicode**, **Kiểu gõ: Telex hoặc VNI**.
@@ -67,7 +67,7 @@ Không có phần mềm nào đảm bảo tuyệt đối trước mọi lỗ h�
 
 ## 6. Build bằng GitHub Actions
 
-Xem `BUILD_WITH_GITHUB.md`. Workflow `.github/workflows/rust.yml` chạy trên `windows-latest`, tạo/refresh `Cargo.lock` khi phiên bản crate gốc thay đổi, chạy `cargo test --locked`, build Release và tạo artifact `NOVA-OS-Native-v0.5.1-USB`.
+Xem `BUILD_WITH_GITHUB.md`. Workflow `.github/workflows/rust.yml` chạy trên `windows-latest`, tạo/refresh `Cargo.lock` khi phiên bản crate gốc thay đổi, chạy `cargo test --locked`, build Release và tạo artifact `NOVA-OS-Native-v0.5.6-USB`.
 
 ## 7. Tài liệu
 
@@ -75,6 +75,8 @@ Xem `BUILD_WITH_GITHUB.md`. Workflow `.github/workflows/rust.yml` chạy trên `
 - `docs/ARCHITECTURE.md`: kiến trúc.
 - `docs/SECURITY_0.5.0.md`: ranh giới bảo mật nền tảng và threat model.
 - `docs/RESEARCH_REFERENCES_0.5.0.md`: tài liệu tham khảo cho nền tảng portable, Unicode và Sandbox.
-- `RELEASE_NOTES_0.5.1.md`: ghi chú phát hành.
+- `RELEASE_NOTES_0.5.6.md`: các sửa đổi kiểm tra source mới nhất.
+- `RELEASE_NOTES_0.5.5.md`: cải tiến giao diện.
+- `RELEASE_NOTES_0.5.2.md`: ghi chú giao diện desktop ban đầu.
 - `docs/SECURITY_GUI_TOOLS_0.5.1.md`: phạm vi và giới hạn bảo mật của 5 công cụ GUI.
 - `docs/RESEARCH_REFERENCES_0.5.1.md`: tài liệu gốc cho Security Center và 5 GUI workspace.

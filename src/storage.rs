@@ -24,6 +24,7 @@ pub struct Settings {
     pub theme: String,
     pub reduce_motion: bool,
     pub accent: String,
+    pub pinned_apps: Vec<String>,
 }
 
 impl Default for Settings {
@@ -32,6 +33,12 @@ impl Default for Settings {
             theme: "dark".to_owned(),
             reduce_motion: false,
             accent: "blue".to_owned(),
+            pinned_apps: vec![
+                "Files".to_owned(), "Terminal".to_owned(), "Editor".to_owned(),
+                "Calculator".to_owned(), "Monitor".to_owned(), "Google Chrome".to_owned(),
+                "UniKey".to_owned(), "Security Center".to_owned(), "Settings".to_owned(),
+                "Trash".to_owned(), "Network Discovery".to_owned(), "Packet Analyzer".to_owned(),
+            ],
         }
     }
 }

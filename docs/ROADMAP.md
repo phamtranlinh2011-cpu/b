@@ -6,7 +6,7 @@
 - Protected WLAN TEMP XML, stale-file cleanup and bounded output/history.
 
 ## 0.4.0 — Desktop UX, applications and portable Trash (completed previous milestone)
-- Searchable Launcher, app tiles, navigation rail, floating in-shell windows and bottom dock/taskbar toggle.
+- Added a desktop workspace, navigation rail, floating in-shell windows and a bottom dock/taskbar toggle.
 - Visual design refresh: consistent spacing, rounded surfaces, theme/accent colors, window shadows, hover feedback and short fade transitions.
 - Reduce visual effects setting for less motion.
 - Files selection/double-click open, refresh, folder creation and Move to NOVA Trash.
@@ -35,6 +35,21 @@
 - UniKey helper also rejects reparse-point Apps/UniKey destinations and stages the verified executable before replacing the final file.
 - Workflow uses pinned Rust 1.95.0 and locked Cargo builds; the first CI run generates/commits Cargo.lock if missing or stale.
 
+## 0.5.2 — Windows-style desktop refresh (current source release)
+- Replaced the separate NOVA Launcher popup and navigation rail with desktop shortcuts, a centered Start/Search taskbar and one Start surface.
+- Start includes Pinned, Recommended quick access, categorized All apps and search results.
+- Desktop shortcuts, Start pins, search and All apps share one application catalog.
+- Existing app windows, Security Center checks and application launch routes remain in place.
+
+## 0.5.1 — Security Center GUI prototype (previous source release)
+
+- Five launch workspaces: Zenmap, Greenbone GSA, OWASP ZAP, Wireshark and Burp Suite.
+- Authorized-scope acknowledgement and third-party host-execution warnings.
+- Third-party engines are optional and separately installed; Greenbone needs its own server/scanner.
+- The scope acknowledgement is not technical enforcement. Local GUI tools run as Windows host processes and are not isolated by NOVA.
+- This remains a portable Windows desktop prototype, not the Linux bootable Security OS.
+
+
 ## 0.5.x — Runtime verification and hardening
 - Verify all unit tests and release build on Windows CI for the exact release commit.
 - Test Sandbox Pro/Enterprise/Education edition detection, optional feature installation, one-instance limitation, file inspection and isolated Chrome on physical Windows 10/11 devices.
@@ -45,14 +60,6 @@
 ## Future — NOVA Live USB
 - Separate bootable Linux-based Live image, persistence layer, UEFI and Secure Boot validation. Do not describe the Windows desktop executable as a bootable OS.
 
-
-## 0.5.1 — Security Center GUI prototype (current source release)
-
-- Five launch workspaces: Zenmap, Greenbone GSA, OWASP ZAP, Wireshark and Burp Suite.
-- Authorized-scope acknowledgement and third-party host-execution warnings.
-- Third-party engines are optional and separately installed; Greenbone needs its own server/scanner.
-- The scope acknowledgement is not technical enforcement. Local GUI tools run as Windows host processes and are not isolated by NOVA.
-- This remains a portable Windows desktop prototype, not the Linux bootable Security OS.
 
 ## Future 0.6.0 — Linux Bootable Foundation
 

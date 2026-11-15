@@ -1,4 +1,4 @@
-NOVA OS NATIVE 0.5.1 — USB PORTABLE EDITION
+NOVA OS NATIVE 0.5.6 — USB PORTABLE EDITION
 
 START
 1. Keep NOVA.exe, portable.flag and the Data folder together in one folder.
@@ -11,7 +11,7 @@ START
 UNICODE + UNIKEY
 - NOVA Editor reads UTF-8 (with/without BOM) and UTF-16 LE/BE text. Save writes UTF-8.
 - Windows paths and NOVA text fields use Unicode. NOVA Terminal starts CMD with code page 65001 (UTF-8).
-- Open UniKey in the NOVA Launcher, choose Download UniKey to USB, then Start UniKey.
+- Open Start from the bottom taskbar, choose UniKey, choose Download UniKey to USB, then Start UniKey.
 - The Download action uses a helper embedded in NOVA.exe (not a mutable USB script), downloads UniKey 4.6 RC2 x64 from unikey.org, enforces archive size limits and checks the exact Authenticode publisher PHAM KIM LONG before launch.
 - In UniKey's tray menu choose Character set: Unicode, then input method Telex or VNI. UniKey runs system-wide as a normal user process; NOVA does not install a service or startup task.
 

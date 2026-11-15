@@ -1,6 +1,13 @@
-# NOVA OS Native 0.5.1
+## UI update (0.5.6)
 
-**NOVA Native** is a portable Windows desktop workspace built with Rust and `egui/eframe`. It runs as a normal Windows application. It is not a replacement Windows kernel and is not a bootable Live USB image.
+NOVA now has responsive desktop and Start grids, a searchable List/Grid File Manager with contextual actions and clearer empty states, Settings pages for Appearance/System/Apps/Network/Security/About, System theme following Windows, a Quick Settings / recent-activity panel, keyboard shortcuts, persistent Start pin/unpin controls, a horizontally scrollable taskbar for all supported workspaces, taskbar app context menus and left/right snap layouts for supported workspaces. Windows remain draggable/resizable with egui's native in-app window behavior. See `RELEASE_NOTES_0.5.6.md`.
+
+## 0.5.2 — Windows-style desktop refresh
+
+- Replaces the old NOVA Launcher popup, left navigation rail and duplicate tile/dock navigation with a Windows-inspired desktop, centered taskbar and Start surface.
+- Uses one application catalog for desktop shortcuts, pinned apps, search and categorized All apps.
+- Adds pinned, recommended quick access, search, active taskbar states, hover transitions and a reduced-motion path.
+- Existing app windows and safety confirmation routes are preserved.
 
 ## 0.5.1 — Security Center GUI workspaces
 
@@ -66,12 +73,12 @@ On a compatible Windows 10/11 x64 machine, open the USB in File Explorer and dou
 
 Build computer requirements: Rust 1.95.0, Microsoft C++ Build Tools/MSVC and Windows SDK, plus internet access for dependencies on first build. Run `BUILD_NOVA.bat` or `scripts/build-portable.ps1` on Windows. They run tests, build `NOVA.exe`, create a portable folder, ZIP and SHA256. The target USB PC does not need developer tools.
 
-GitHub Actions uses `.github/workflows/rust.yml` on `windows-latest`, runs `cargo test --locked`, builds Release and uploads `NOVA-OS-Native-v0.5.1-USB`. The workflow generates or refreshes `Cargo.lock` when the root package version changes; the GitHub Actions token must be allowed to write `contents` for that lockfile commit.
+GitHub Actions uses `.github/workflows/rust.yml` on `windows-latest`, runs `cargo test --locked`, builds Release and uploads `NOVA-OS-Native-v0.5.6-USB`. The workflow generates or refreshes `Cargo.lock` when the root package version changes; the GitHub Actions token must be allowed to write `contents` for that lockfile commit.
 
 ## Source layout
 
 ```text
-src/app.rs              Desktop shell and in-shell applications
+src/app.rs              Windows-style desktop, Start/taskbar and in-shell applications
 src/apps.rs             Host Chrome detection, URL validation and launcher
 src/security_tools.rs   Five GUI tool integrations, detection and scope reminder
 src/isolation.rs        Windows Sandbox config, read-only staging and cleanup
@@ -99,7 +106,11 @@ docs/                   Architecture, security, research and roadmap
 - [0.5.1 Security Center and GUI tool references](docs/RESEARCH_REFERENCES_0.5.1.md)
 - [0.5.1 GUI tool integration and security boundary](docs/SECURITY_GUI_TOOLS_0.5.1.md)
 - [0.5.1 release notes](RELEASE_NOTES_0.5.1.md)
+- [0.5.2 Windows-style desktop refresh](RELEASE_NOTES_0.5.2.md)
+- [0.5.2 UI research references](docs/RESEARCH_REFERENCES_0.5.2.md)
+- [0.5.5 UI Polish](RELEASE_NOTES_0.5.5.md)
+- [0.5.6 audit fixes](RELEASE_NOTES_0.5.6.md)
 
 ## Validation status
 
-This package can be structurally checked (TOML/YAML parsing, source invariants, Windows workflow contents, version/manifest checks and ZIP integrity). The packaging environment used here does not have `rustc` or `cargo`, so it cannot claim that Rust compilation or `cargo test` passed. A successful GitHub Actions run on the exact 0.5.1 commit is required before treating the EXE as build-verified. Real Windows tests are still needed for UniKey signing/typing, Sandbox edition and launch behavior, Chrome mapped-folder operation, USB persistence and Windows security boundaries.
+This package can be structurally checked (TOML/YAML parsing, source invariants, Windows workflow contents, version/manifest checks and ZIP integrity). The packaging environment used here does not have `rustc` or `cargo`, so it cannot claim that Rust compilation or `cargo test` passed. A successful GitHub Actions run on the exact 0.5.6 commit is required before treating the EXE as build-verified. Real Windows tests are still needed for UniKey signing/typing, Sandbox edition and launch behavior, Chrome mapped-folder operation, USB persistence and Windows security boundaries.

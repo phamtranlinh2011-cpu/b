@@ -68,7 +68,7 @@ impl TerminalState {
             cwd: paths.user_dir.clone(),
             wifi_mode: None,
         };
-        state.line("NOVA OS Native Terminal 0.5.1");
+        state.line("NOVA OS Native Terminal 0.5.6");
         state.line("Type help for commands. Wi-Fi: wifi -h");
         state.line(format!("Working directory: {}", state.cwd.display()));
         state.line("");
