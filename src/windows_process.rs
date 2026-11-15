@@ -285,6 +285,11 @@ fn resume_suspended_process(process_id: u32) -> io::Result<()> {
     let previous_suspend_count = unsafe { ResumeThread(found_thread) };
     let resume_error = if previous_suspend_count == u32::MAX {
         Some(io::Error::last_os_error())
+    } else if previous_suspend_count != 1 {
+        Some(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unexpected initial thread suspend count: {previous_suspend_count}; refusing to resume the child."),
+        ))
     } else {
         None
     };

@@ -2,7 +2,7 @@ use crate::storage::{canonical_user_path, create_user_directories, safe_user_pat
 use crate::terminal::{TerminalState, TerminalTask};
 use crate::trash::{self, TrashEntry};
 use crate::apps;
-use crate::{isolation, unikey, unicode};
+use crate::{isolation, unikey, unicode, security_tools::{self, SecurityTool}};
 use eframe::egui::{self, Color32, FontId, RichText, TextEdit};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use std::process::Child;
 use sysinfo::System;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UniKeyProcessKind { Download, Running }
 
 pub struct NovaApp {
@@ -32,6 +32,11 @@ pub struct NovaApp {
     chrome_open: bool,
     unikey_open: bool,
     security_open: bool,
+    security_tool_open: [bool; 5],
+    security_tool_status: [String; 5],
+    security_scope: String,
+    security_scope_confirmed: bool,
+    greenbone_url: String,
     security_confirm_clear_quarantine: bool,
     chrome_confirm_host: bool,
     trash_confirm_empty: bool,
@@ -93,6 +98,11 @@ impl NovaApp {
             chrome_open: false,
             unikey_open: false,
             security_open: false,
+            security_tool_open: [false; 5],
+            security_tool_status: std::array::from_fn(|_| "Ready. Tool is not started.".to_owned()),
+            security_scope: String::new(),
+            security_scope_confirmed: false,
+            greenbone_url: "https://127.0.0.1:9392".to_owned(),
             security_confirm_clear_quarantine: false,
             chrome_confirm_host: false,
             trash_confirm_empty: false,
@@ -187,6 +197,11 @@ impl NovaApp {
             "Google Chrome" => self.chrome_open = true,
             "UniKey" => self.unikey_open = true,
             "Security Center" => self.security_open = true,
+            "Network Discovery" => self.security_tool_open[SecurityTool::NetworkDiscovery.index()] = true,
+            "Vulnerability Management" => self.security_tool_open[SecurityTool::VulnerabilityManagement.index()] = true,
+            "Web Security" => self.security_tool_open[SecurityTool::WebSecurity.index()] = true,
+            "Packet Analyzer" => self.security_tool_open[SecurityTool::PacketAnalyzer.index()] = true,
+            "Web / API Inspector" => self.security_tool_open[SecurityTool::WebApiInspector.index()] = true,
             _ => {}
         }
         self.launcher_open = false;
@@ -209,6 +224,11 @@ impl NovaApp {
             "Google Chrome" => self.chrome_open = !self.chrome_open,
             "UniKey" => self.unikey_open = !self.unikey_open,
             "Security Center" => self.security_open = !self.security_open,
+            "Network Discovery" => { let i = SecurityTool::NetworkDiscovery.index(); self.security_tool_open[i] = !self.security_tool_open[i]; },
+            "Vulnerability Management" => { let i = SecurityTool::VulnerabilityManagement.index(); self.security_tool_open[i] = !self.security_tool_open[i]; },
+            "Web Security" => { let i = SecurityTool::WebSecurity.index(); self.security_tool_open[i] = !self.security_tool_open[i]; },
+            "Packet Analyzer" => { let i = SecurityTool::PacketAnalyzer.index(); self.security_tool_open[i] = !self.security_tool_open[i]; },
+            "Web / API Inspector" => { let i = SecurityTool::WebApiInspector.index(); self.security_tool_open[i] = !self.security_tool_open[i]; },
             _ => {}
         }
     }
@@ -327,40 +347,166 @@ impl NovaApp {
     }
 
     fn security_window(&mut self, ctx: &egui::Context) {
-        let available = isolation::is_available();
+        let sandbox_available = isolation::is_available();
+        let installed_count = security_tools::TOOLS
+            .iter()
+            .filter(|info| info.requires_local_executable && info.tool.detect(&self.paths.app_dir).is_some())
+            .count();
+        let mut scope_ready = security_tools::validate_authorized_scope(
+            &self.security_scope,
+            self.security_scope_confirmed,
+        ).is_ok();
+        let mut open = self.security_open;
+        let mut clear_requested = false;
+        let mut selected_tool: Option<SecurityTool> = None;
+
         egui::Window::new("NOVA Security Center")
-            .open(&mut self.security_open)
+            .open(&mut open)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
-            .default_size([620.0, 510.0])
+            .default_size([820.0, 690.0])
             .show(ctx, |ui| {
-                ui.heading("Isolation status");
-                if available {
-                    ui.colored_label(Color32::from_rgb(87, 190, 140), "WindowsSandbox.exe found — feature launch still depends on Windows edition and virtualization settings");
-                } else {
-                    ui.colored_label(Color32::from_rgb(225, 166, 86), "Windows Sandbox launcher was not found");
-                }
-                ui.label("Requires Windows Pro, Enterprise or Education (not Home), hardware virtualization enabled, at least 4 GB RAM (8 GB recommended), 1 GB free disk space and 2 CPU cores.");
-                ui.label("Windows Sandbox allows one running instance at a time. NOVA will fail closed if Sandbox is unavailable; it will not run suspicious files on the host as a fallback.");
-                ui.separator();
-                ui.heading("What is isolated?");
-                ui.label("• Inspect file in Sandbox: NOVA copies one selected file into Data/Security/Quarantine, maps only that folder read-only, disables networking, vGPU and clipboard, and opens Explorer. You must manually run the sample inside Sandbox.");
-                ui.label("• Isolated Chrome: starts with a fresh temporary profile inside Windows Sandbox. The installed Chrome program folder is read-only; profile, cookies, extensions, cache and downloads stay inside the disposable VM. Networking is enabled so websites load and can expose the VM to your local network.");
-                ui.label("• Close Windows Sandbox and confirm its deletion to discard the VM's software, downloads and state. The staged sample copy and NOVA launch-config files remain on the USB until you clear them below.");
-                ui.separator();
-                ui.heading("Important security boundary");
-                ui.colored_label(Color32::from_rgb(225, 166, 86), "NOVA is a normal Windows process, not a virtual machine. Terminal/CMD, UniKey, Wi-Fi, Open on host and ordinary Files operations still run on or modify the Windows host.");
-                ui.label("Never execute unknown files or commands on the host. Use Inspect in Sandbox for untrusted files and Open isolated for browsing. If Windows Sandbox is unavailable, do not use the host launch buttons as a substitute.");
-                ui.label("No software can promise absolute protection against every hypervisor, Windows or firmware vulnerability. Keep Windows and Defender updated; do not map writable host folders into Sandbox.");
-                ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label(format!("Staged sample/config items: {}", self.quarantine_count));
-                    if ui.add_enabled(self.quarantine_count > 0, egui::Button::new("Clear staged copies…")).clicked() {
-                        self.security_confirm_clear_quarantine = true;
-                    }
+                    ui.vertical(|ui| {
+                        ui.heading(RichText::new("Security Center").size(25.0).strong());
+                        ui.label(RichText::new("A guided control room for authorized security work.").weak());
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new("NOVA SECURITY").small().strong().color(Color32::from_rgb(117, 169, 250)));
+                    });
                 });
-                if self.security_confirm_clear_quarantine {
-                    ui.colored_label(Color32::from_rgb(225, 166, 86), "Close all Windows Sandbox sessions before clearing staged files.");
+                ui.add_space(8.0);
+
+                egui::Grid::new("nova-security-overview-cards")
+                    .num_columns(3)
+                    .spacing(egui::vec2(10.0, 8.0))
+                    .show(ui, |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(175.0);
+                            ui.label(RichText::new("GUI TOOLS").small().weak().strong());
+                            ui.heading(format!("{installed_count}/4"));
+                            ui.label(RichText::new("local desktop engines detected").small().weak());
+                        });
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(175.0);
+                            ui.label(RichText::new("WINDOWS SANDBOX").small().weak().strong());
+                            ui.heading(if sandbox_available { "Detected" } else { "Unavailable" });
+                            ui.label(RichText::new("feature + virtualization required").small().weak());
+                        });
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(175.0);
+                            ui.label(RichText::new("TEST SCOPE").small().weak().strong());
+                            ui.heading(if scope_ready { "Confirmed" } else { "Not confirmed" });
+                            ui.label(RichText::new("operator acknowledgement").small().weak());
+                        });
+                        ui.end_row();
+                    });
+
+                ui.add_space(8.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("1. Authorized test scope");
+                    ui.label("Enter only assets you own or are explicitly authorized to assess. Example: lab.example.test; 192.0.2.10/32");
+                    let scope_response = ui.add(TextEdit::singleline(&mut self.security_scope)
+                        .hint_text("Authorized domains, IPs or lab range")
+                        .desired_width(f32::INFINITY));
+                    if scope_response.changed() {
+                        self.security_scope_confirmed = false;
+                        scope_ready = false;
+                    }
+                    ui.checkbox(&mut self.security_scope_confirmed, "I own these assets or have written permission to test them.");
+                    scope_ready = security_tools::validate_authorized_scope(
+                        &self.security_scope,
+                        self.security_scope_confirmed,
+                    ).is_ok();
+                    if scope_ready {
+                        ui.colored_label(Color32::from_rgb(87, 190, 140), "Scope acknowledged. Keep every external tool's target list inside this scope.");
+                    } else {
+                        ui.colored_label(Color32::from_rgb(225, 166, 86), "Opening a testing tool is disabled until a scope is entered and acknowledged.");
+                    }
+                    ui.label(RichText::new("Important: this acknowledgement is a workflow guard, not a technical firewall. The external tools still have their own target controls; NOVA does not enforce their scan scope.").small().weak());
+                });
+
+                ui.add_space(8.0);
+                ui.heading("2. GUI security applications");
+                ui.label(RichText::new("Open a dedicated NOVA workspace for each tool. Engines are installed separately and are not bundled in the USB image.").small().weak());
+                egui::Grid::new("nova-security-tool-cards")
+                    .num_columns(2)
+                    .spacing(egui::vec2(12.0, 10.0))
+                    .show(ui, |ui| {
+                        for (position, info) in security_tools::TOOLS.iter().enumerate() {
+                            let installed = if info.requires_local_executable {
+                                info.tool.detect(&self.paths.app_dir).is_some()
+                            } else {
+                                true
+                            };
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(310.0);
+                                ui.set_min_height(112.0);
+                                ui.horizontal(|ui| {
+                                    ui.heading(RichText::new(match position {
+                                        0 => "◎",
+                                        1 => "◈",
+                                        2 => "⌁",
+                                        3 => "▥",
+                                        _ => "⇄",
+                                    }).size(24.0).color(Color32::from_rgb(123, 164, 245)));
+                                    ui.vertical(|ui| {
+                                        ui.label(RichText::new(info.name).strong());
+                                        ui.label(RichText::new(info.executable).small().weak());
+                                    });
+                                });
+                                ui.label(RichText::new(info.description).small());
+                                ui.horizontal(|ui| {
+                                    if info.requires_local_executable && installed {
+                                        ui.colored_label(Color32::from_rgb(87, 190, 140), "Installed");
+                                    } else if info.requires_local_executable {
+                                        ui.colored_label(Color32::from_rgb(225, 166, 86), "Not detected");
+                                    } else {
+                                        ui.colored_label(Color32::from_rgb(225, 166, 86), "Separate GSA server required");
+                                    }
+                                    if ui.add_enabled(scope_ready, egui::Button::new("Open workspace")).clicked() {
+                                        selected_tool = Some(info.tool);
+                                    }
+                                });
+                            });
+                            if position % 2 == 1 { ui.end_row(); }
+                        }
+                    });
+
+                ui.add_space(8.0);
+                egui::CollapsingHeader::new("3. Isolation and disposable analysis")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if sandbox_available {
+                            ui.colored_label(Color32::from_rgb(87, 190, 140), "Windows Sandbox launcher detected. NOVA will fail closed if the optional feature cannot start.");
+                        } else {
+                            ui.colored_label(Color32::from_rgb(225, 166, 86), "Windows Sandbox is not available on this Windows installation.");
+                        }
+                        ui.label("Requires Windows Pro, Enterprise or Education (not Home), hardware virtualization enabled, at least 4 GB RAM (8 GB recommended), 1 GB free disk space and 2 CPU cores.");
+                        ui.label("Inspect in Sandbox stages a copy of one file, maps it read-only, disables networking and clipboard, then opens Explorer. Isolated Chrome uses a new disposable profile and networking; it may reach local-network services.");
+                        ui.label("NOVA, Terminal/CMD, UniKey, Wi-Fi and ordinary host applications still run on Windows itself. No isolation feature can promise protection against every Windows, hypervisor or firmware vulnerability.");
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Staged sample/config items: {}", self.quarantine_count));
+                            if ui.add_enabled(self.quarantine_count > 0, egui::Button::new("Clear staged copies…")).clicked() {
+                                clear_requested = true;
+                            }
+                        });
+                    });
+            });
+
+        self.security_open = open;
+        if let Some(tool) = selected_tool {
+            self.security_tool_open[tool.index()] = true;
+        }
+        if clear_requested {
+            self.security_confirm_clear_quarantine = true;
+        }
+        if self.security_confirm_clear_quarantine {
+            egui::Window::new("Clear NOVA quarantine staging?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Close every Windows Sandbox window before removing staged copies and NOVA .wsb launch files. Original workspace files are not deleted.");
                     ui.horizontal(|ui| {
                         if ui.button("Clear staged copies").clicked() {
                             match isolation::clear_quarantine(&self.paths) {
@@ -372,15 +518,97 @@ impl NovaApp {
                         }
                         if ui.button("Cancel").clicked() { self.security_confirm_clear_quarantine = false; }
                     });
+                });
+        }
+    }
+
+    fn security_tool_window(&mut self, ctx: &egui::Context, tool: SecurityTool) {
+        let index = tool.index();
+        if !self.security_tool_open[index] { return; }
+
+        let info = tool.info();
+        let detected = tool.detect(&self.paths.app_dir);
+        let mut open = self.security_tool_open[index];
+        let mut launch_requested = false;
+        let mut requested_url: Option<&'static str> = None;
+        let mut status = self.security_tool_status[index].clone();
+        let scope_ready = security_tools::validate_authorized_scope(&self.security_scope, self.security_scope_confirmed).is_ok();
+
+        egui::Window::new(format!("NOVA · {}", info.name))
+            .open(&mut open)
+            .fade_in(!self.settings.reduce_motion)
+            .fade_out(!self.settings.reduce_motion)
+            .default_size([590.0, 410.0])
+            .show(ctx, |ui| {
+                ui.heading(info.name);
+                ui.label(RichText::new(info.description).weak());
+                ui.separator();
+                ui.label(RichText::new("AUTHORIZED SCOPE").small().strong().weak());
+                ui.label(if self.security_scope.trim().is_empty() { "No target scope configured in Security Center.".to_owned() } else { self.security_scope.clone() });
+                if !scope_ready {
+                    ui.colored_label(Color32::from_rgb(225, 166, 86), "Return to Security Center, enter the authorized scope and confirm permission before launching this tool.");
                 }
-                if !available {
+
+                if tool == SecurityTool::VulnerabilityManagement {
                     ui.separator();
-                    ui.label("Enable Windows Sandbox from Turn Windows features on or off, then restart Windows. On supported Pro/Enterprise/Education editions, enable the Windows Sandbox optional feature and CPU virtualization. Windows Home does not include this feature.");
+                    ui.label("Greenbone is a separate scanner/server. NOVA opens its Greenbone Security Assistant (GSA) web console; it does not install the scanner/database/feed on this USB.");
+                    ui.add(TextEdit::singleline(&mut self.greenbone_url).hint_text("https://greenbone.example.test:9392").desired_width(f32::INFINITY));
+                    ui.colored_label(Color32::from_rgb(225, 166, 86), "The default-browser action runs on the Windows host and is not sandboxed. Do not use it for an untrusted GSA server.");
+                    if ui.add_enabled(scope_ready, egui::Button::new("Open Greenbone console in default browser…")).clicked() { launch_requested = true; }
+                } else {
+                    ui.separator();
+                    if let Some(path) = &detected {
+                        ui.colored_label(Color32::from_rgb(87, 190, 140), "Application detected");
+                        ui.label(RichText::new(path.display().to_string()).small().weak());
+                    } else {
+                        ui.colored_label(Color32::from_rgb(225, 166, 86), "Application not detected on this PC or NOVA USB.");
+                        ui.label("Install the official application first. NOVA does not download or silently install third-party scanner binaries.");
+                    }
+                    if ui.add_enabled(scope_ready && detected.is_some(), egui::Button::new(format!("Launch {}", info.executable))).clicked() {
+                        launch_requested = true;
+                    }
                 }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Official download / project page").clicked() { requested_url = Some(info.website); }
+                    if ui.button("Documentation").clicked() { requested_url = Some(info.documentation); }
+                });
+                ui.label(RichText::new(&status).small().weak());
+                ui.separator();
+                ui.label(RichText::new("Safety: these third-party apps run on the Windows host, not inside Windows Sandbox. The scope acknowledgement is a reminder, not an enforced network boundary. Use only approved assets; start with passive or non-invasive features and use active testing only with explicit authorization.").small().weak());
             });
+
+        self.security_tool_open[index] = open;
+        if launch_requested {
+            if let Err(error) = security_tools::validate_authorized_scope(&self.security_scope, self.security_scope_confirmed) {
+                status = error.to_string();
+            } else if tool == SecurityTool::VulnerabilityManagement {
+                match security_tools::open_web_console(&self.greenbone_url) {
+                    Ok(url) => status = format!("Opened Greenbone console: {url}"),
+                    Err(error) => status = format!("Could not open Greenbone console: {error}"),
+                }
+            } else {
+                match tool.launch(&self.paths.app_dir) {
+                    Ok(path) => status = format!("Launched {} from {}", info.name, path.display()),
+                    Err(error) => status = error.to_string(),
+                }
+            }
+            self.status_message = status.clone();
+        }
+        if let Some(url) = requested_url {
+            match security_tools::open_web_console(url) {
+                Ok(url) => status = format!("Opened official project page: {url}"),
+                Err(error) => status = format!("Could not open project page: {error}"),
+            }
+        }
+        self.security_tool_status[index] = status;
     }
 
     fn unikey_window(&mut self, ctx: &egui::Context) {
+        let mut download_requested = false;
+        let mut start_requested = false;
+        let mut stop_requested = false;
         egui::Window::new("UniKey — Vietnamese Input")
             .open(&mut self.unikey_open)
             .fade_in(!self.settings.reduce_motion)
@@ -401,15 +629,15 @@ impl NovaApp {
                 }
                 ui.horizontal(|ui| {
                     if ui.add_enabled(self.unikey_child.is_none(), egui::Button::new("Download UniKey to USB")).clicked() {
-                        self.download_unikey();
+                        download_requested = true;
                     }
                     if ui.add_enabled(self.unikey_path.is_some() && self.unikey_child.is_none(), egui::Button::new("Start UniKey")).clicked() {
-                        self.start_unikey();
+                        start_requested = true;
                     }
                     if self.unikey_process_kind == Some(UniKeyProcessKind::Running)
                         && ui.button("Stop UniKey").clicked()
                     {
-                        self.stop_unikey();
+                        stop_requested = true;
                     }
                 });
                 if self.unikey_process_kind == Some(UniKeyProcessKind::Download) {
@@ -430,6 +658,14 @@ impl NovaApp {
                     }
                 }
             });
+        // Defer whole-self methods until egui releases the `.open(&mut self.unikey_open)` borrow.
+        if download_requested {
+            self.download_unikey();
+        } else if start_requested {
+            self.start_unikey();
+        } else if stop_requested {
+            self.stop_unikey();
+        }
     }
 
     fn sidebar_button(&mut self, ui: &mut egui::Ui, glyph: &str, app: &str) {
@@ -482,11 +718,11 @@ impl NovaApp {
         let visibility = if self.settings.reduce_motion {
             if self.launcher_open { 1.0 } else { 0.0 }
         } else {
-            ctx.animate_bool_with_time(egui::Id::new("nova-start-menu-visibility"), self.launcher_open, 0.18)
+            ctx.animate_bool_with_time(egui::Id::unique("nova-start-menu-visibility"), self.launcher_open, 0.18)
         };
         if visibility <= 0.001 { return; }
         let mut selected_app: Option<&'static str> = None;
-        egui::Area::new(egui::Id::new("nova-start-menu"))
+        egui::Area::new(egui::Id::unique("nova-start-menu"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(14.0, -66.0))
             .fade_in(!self.settings.reduce_motion)
@@ -518,7 +754,12 @@ impl NovaApp {
                             ("Trash", "▤", "Restore deleted NOVA files"),
                             ("Google Chrome", "🌐", "Open Chrome normally or isolated"),
                             ("UniKey", "文", "Vietnamese Unicode Telex / VNI input"),
-                            ("Security Center", "🛡", "Windows Sandbox and file isolation"),
+                            ("Security Center", "🛡", "Authorized assessment, isolation and GUI security tools"),
+                            ("Network Discovery", "◎", "Zenmap visual network discovery"),
+                            ("Vulnerability Management", "◈", "Greenbone vulnerability management console"),
+                            ("Web Security", "⌁", "OWASP ZAP desktop workspace"),
+                            ("Packet Analyzer", "▥", "Wireshark packet analysis"),
+                            ("Web / API Inspector", "⇄", "Burp Suite web and API testing"),
                             ("Settings", "⚙", "Theme, accent and motion"),
                         ];
                         let query = self.launcher_search.to_lowercase();
@@ -838,7 +1079,7 @@ impl NovaApp {
                 );
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&self.editor_status).small().weak());
-                ui.label(RichText::new("Unicode: UTF-8 / UTF-16 files · Vietnamese input via UniKey (Unicode mode)").small().weak());
+                    ui.label(RichText::new("Unicode: UTF-8 / UTF-16 files · Vietnamese input via UniKey (Unicode mode)").small().weak());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(format!("{} chars · {} words", self.editor_text.chars().count(), self.editor_text.split_whitespace().count())).small().weak());
                     });
@@ -950,6 +1191,7 @@ impl NovaApp {
     fn trash_window(&mut self, ctx: &egui::Context) {
         let mut restore_id: Option<String> = None;
         let mut delete_id: Option<String> = None;
+        let mut refresh_requested = false;
         egui::Window::new("▤  NOVA Trash")
             .open(&mut self.trash_open)
             .fade_in(!self.settings.reduce_motion)
@@ -966,7 +1208,7 @@ impl NovaApp {
                             if ui.button("Delete permanently…").clicked() { delete_id = Some(id.clone()); }
                             if ui.button("Restore").clicked() { restore_id = Some(id.clone()); }
                         }
-                        if ui.button("↻").on_hover_text("Refresh Trash").clicked() { self.refresh_trash(); }
+                        if ui.button("↻").on_hover_text("Refresh Trash").clicked() { refresh_requested = true; }
                     });
                 });
                 ui.separator();
@@ -995,6 +1237,7 @@ impl NovaApp {
                 ui.label(RichText::new("NOVA Trash is stored in the Data folder on this USB. Emptying Trash permanently deletes these items.").small().weak());
             });
 
+        if refresh_requested { self.refresh_trash(); }
         if let Some(id) = restore_id {
             match trash::restore_from_trash(&self.paths, &id) {
                 Ok(path) => { self.status_message = format!("Restored to {}", path.display()); self.refresh_trash(); }
@@ -1053,6 +1296,7 @@ impl NovaApp {
 
     fn chrome_window(&mut self, ctx: &egui::Context) {
         let mut open_host_now = false;
+        let mut open_isolated_now = false;
         egui::Window::new("🌐  Google Chrome")
             .open(&mut self.chrome_open)
             .fade_in(!self.settings.reduce_motion)
@@ -1071,7 +1315,7 @@ impl NovaApp {
                     .desired_width(f32::INFINITY));
                 ui.horizontal(|ui| {
                     if ui.add_enabled(self.chrome_path.is_some(), egui::Button::new("Open isolated (recommended)")).clicked() {
-                        self.launch_chrome_in_sandbox();
+                        open_isolated_now = true;
                     }
                     if ui.add_enabled(self.chrome_path.is_some(), egui::Button::new("Open on Windows host…")).clicked() {
                         self.chrome_confirm_host = true;
@@ -1107,9 +1351,8 @@ impl NovaApp {
                 }
                 ui.label(RichText::new("The isolated browser requires Windows Sandbox (Pro/Enterprise/Education + hardware virtualization). Network is enabled for browsing and may reach local-network services; vGPU, clipboard and writable host folders are disabled.").small().weak());
             });
-        if open_host_now {
-            self.launch_chrome();
-        }
+        if open_isolated_now { self.launch_chrome_in_sandbox(); }
+        if open_host_now { self.launch_chrome(); }
     }
 
     fn calculator_window(&mut self, ctx: &egui::Context) {
@@ -1251,7 +1494,7 @@ impl eframe::App for NovaApp {
                             ui.separator();
                             ui.label(RichText::new("DESKTOP WORKSPACE").small().weak().strong());
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(RichText::new("NOVA 0.5.0").small().weak());
+                                ui.label(RichText::new("NOVA 0.5.1").small().weak());
                                 ui.separator();
                                 let mode = if self.paths.portable { "● USB PORTABLE" } else { "● LOCAL MODE" };
                                 ui.label(RichText::new(mode).small().color(Color32::from_rgb(105, 207, 170)));
@@ -1386,6 +1629,9 @@ impl eframe::App for NovaApp {
         self.chrome_window(&ctx);
         self.unikey_window(&ctx);
         self.security_window(&ctx);
+        for info in &security_tools::TOOLS {
+            self.security_tool_window(&ctx, info.tool);
+        }
         // Keep periodic repaints only while the live monitor is visible.
         // egui animations and user input schedule their own frames otherwise.
         if self.monitor_open {

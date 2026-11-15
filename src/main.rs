@@ -9,6 +9,7 @@ mod trash;
 mod unicode;
 mod unikey;
 mod wifi;
+mod security_tools;
 mod windows_process;
 
 fn main() -> eframe::Result {

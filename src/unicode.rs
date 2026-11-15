@@ -69,6 +69,17 @@ mod tests {
     }
 
     #[test]
+    fn decodes_non_bmp_unicode_surrogate_pairs() {
+        let text = "NOVA 🚀 Tiếng Việt";
+        let mut little = vec![0xFF, 0xFE];
+        for unit in text.encode_utf16() { little.extend_from_slice(&unit.to_le_bytes()); }
+        let mut big = vec![0xFE, 0xFF];
+        for unit in text.encode_utf16() { big.extend_from_slice(&unit.to_be_bytes()); }
+        assert_eq!(decode_text_file(&little).unwrap(), text);
+        assert_eq!(decode_text_file(&big).unwrap(), text);
+    }
+
+    #[test]
     fn rejects_truncated_or_invalid_unicode() {
         assert!(decode_text_file(&[0xFF, 0xFE, 0x41]).is_err());
         assert!(decode_text_file(&[0xFF, 0xFE, 0x00, 0xD8]).is_err());

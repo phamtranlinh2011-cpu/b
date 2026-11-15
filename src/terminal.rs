@@ -68,7 +68,7 @@ impl TerminalState {
             cwd: paths.user_dir.clone(),
             wifi_mode: None,
         };
-        state.line("NOVA OS Native Terminal 0.5.0");
+        state.line("NOVA OS Native Terminal 0.5.1");
         state.line("Type help for commands. Wi-Fi: wifi -h");
         state.line(format!("Working directory: {}", state.cwd.display()));
         state.line("");
@@ -447,6 +447,20 @@ mod tests {
     fn wifi_scan_is_scheduled_as_a_background_job() {
         let mut state = TerminalState { input: String::new(), output: Vec::new(), cwd: PathBuf::from("."), wifi_mode: None };
         assert!(matches!(state.submit(&dummy_paths(), "wifi"), Some(TerminalTask::WifiScan)));
+    }
+
+    #[test]
+    fn password_entry_masks_direct_and_selected_wifi_passwords_only() {
+        let mut state = TerminalState { input: String::new(), output: Vec::new(), cwd: PathBuf::from("."), wifi_mode: None };
+        assert!(!state.password_entry());
+        state.input = "wifi connect \"Lab AP\" secret".to_owned();
+        assert!(state.password_entry());
+        state.input = "/WIFI CONNECT \"Lab AP\" secret".to_owned();
+        assert!(state.password_entry());
+        state.input = "echo safe".to_owned();
+        assert!(!state.password_entry());
+        state.wifi_mode = Some("Lab AP".to_owned());
+        assert!(state.password_entry());
     }
 
     #[test]

@@ -43,13 +43,33 @@ struct WifiManifest {
 
 static ATOMIC_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+/// Verify every existing directory component rather than checking only the
+/// leaf. `symlink_metadata` follows intermediate links, so checking just the
+/// final parent would miss a replaced ancestor directory.
+fn ensure_real_directory_chain(path: &Path) -> io::Result<()> {
+    let mut ancestors = path.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
+    for directory in ancestors {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(directory)?;
+        if !metadata.is_dir() || is_link_or_reparse_point(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("NOVA refuses to use a redirected or non-directory path component: {}", directory.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Replace a small JSON file without exposing a partially-written document if
 /// NOVA or Windows is interrupted during the write. The temporary file is
 /// created in the destination directory so the final rename stays on-volume.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Target file has no parent directory."))?;
-    fs::create_dir_all(parent)?;
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "Target file has no file name.")
     })?;
@@ -204,6 +224,9 @@ impl AppPaths {
 /// Refuse to read or replace a settings/manifest file that is redirected by a
 /// symlink or Windows reparse point. A missing file is allowed for first-run.
 fn ensure_regular_file_not_reparse(path: &Path) -> io::Result<()> {
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Target file has no parent directory."))?;
+    ensure_real_directory_chain(parent)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() && !is_link_or_reparse_point(&metadata) => Ok(()),
         Ok(_) => Err(io::Error::new(
@@ -222,6 +245,7 @@ pub(crate) fn ensure_real_child(parent: &Path, name: &str) -> io::Result<PathBuf
     if name.is_empty() || name == "." || name == ".." || (name.contains('/') || name.contains('\\')) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid NOVA data folder component."));
     }
+    ensure_real_directory_chain(parent)?;
     let canonical_parent = parent.canonicalize()?;
     let candidate = canonical_parent.join(name);
     match fs::symlink_metadata(&candidate) {
@@ -359,6 +383,7 @@ pub fn safe_user_path(root: &Path, relative: &str) -> io::Result<PathBuf> {
 /// resolve outside NOVA's user-data root. Both paths are canonicalized so
 /// Windows junctions and symlinks are checked against their final target.
 pub fn canonical_user_path(root: &Path, candidate: &Path) -> io::Result<PathBuf> {
+    ensure_real_directory_chain(root)?;
     let canonical_root = root.canonicalize()?;
     let canonical_candidate = candidate.canonicalize()?;
     if !canonical_candidate.starts_with(&canonical_root) {
@@ -419,6 +444,7 @@ fn validate_user_component(component: &std::ffi::OsStr) -> io::Result<()> {
 /// after each operation so existing links/junctions cannot redirect creation
 /// outside NOVA's user-data root.
 pub fn create_user_directories(root: &Path, candidate: &Path) -> io::Result<PathBuf> {
+    ensure_real_directory_chain(root)?;
     let canonical_root = root.canonicalize()?;
     let relative = candidate.strip_prefix(root).map_err(|_| {
         io::Error::new(
@@ -573,6 +599,65 @@ mod tests {
         symlink(&external, &paths.wifi_manifest).unwrap();
         assert!(paths.is_nova_wifi_profile("Home").is_err());
         assert_eq!(std::fs::read_to_string(&external).unwrap(), r#"{"theme":"light"}"#);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_settings_write_rejects_a_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("nova-settings-parent-link-{}", std::process::id()));
+        let external = base.join("external");
+        let redirected = base.join("Settings");
+        std::fs::create_dir_all(&external).unwrap();
+        symlink(&external, &redirected).unwrap();
+        let paths = super::AppPaths {
+            app_dir: base.clone(),
+            data_dir: base.clone(),
+            security_dir: base.join("Security"),
+            user_dir: base.join("Users/Default"),
+            settings_file: redirected.join("settings.json"),
+            wifi_manifest: redirected.join("wifi-profiles.json"),
+            trash_dir: base.join("Trash"),
+            portable: true,
+        };
+
+        assert!(paths.save_settings(&super::Settings::default()).is_err());
+        assert!(!external.join("settings.json").exists());
+        let _ = std::fs::remove_file(&redirected);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_directory_creation_rejects_a_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("nova-user-ancestor-link-{}", std::process::id()));
+        let external = base.join("external");
+        let alias = base.join("Alias");
+        std::fs::create_dir_all(external.join("Users/Default")).unwrap();
+        symlink(&external, &alias).unwrap();
+        let root = alias.join("Users/Default");
+
+        assert!(super::create_user_directories(&root, &root.join("Documents")).is_err());
+        assert!(!external.join("Users/Default/Documents").exists());
+        let _ = std::fs::remove_file(&alias);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_user_directories_rejects_a_symlinked_root() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("nova-user-root-link-{}", std::process::id()));
+        let external = base.join("external");
+        let redirected = base.join("Users");
+        std::fs::create_dir_all(&external).unwrap();
+        symlink(&external, &redirected).unwrap();
+
+        assert!(super::create_user_directories(&redirected, &redirected.join("Documents")).is_err());
+        assert!(!external.join("Documents").exists());
+        let _ = std::fs::remove_file(&redirected);
         let _ = std::fs::remove_dir_all(base);
     }
 

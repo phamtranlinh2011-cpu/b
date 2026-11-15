@@ -1,8 +1,15 @@
-# NOVA Native 0.5.0 — Hướng dẫn tiếng Việt
+# NOVA Native 0.5.1 — Hướng dẫn tiếng Việt
+
+## Security Center và 5 công cụ GUI (0.5.1)
+
+NOVA có workspace cho Zenmap/Nmap, Greenbone GSA, OWASP ZAP, Wireshark và Burp Suite. Các engine bên thứ ba phải được cài riêng từ trang chính thức; Greenbone cần máy chủ/scanner riêng. NOVA không nhúng engine quét vào USB.
+
+Trong Security Center, nhập phạm vi tài sản được phép và xác nhận quyền kiểm thử trước khi mở workspace. Đây là bước nhắc nhở trong quy trình, không phải firewall hoặc cơ chế ràng buộc target bên trong công cụ. Những ứng dụng bên thứ ba được mở trên Windows host, không chạy trong Windows Sandbox. Hãy cấu hình target allowlist tương ứng ngay trong từng công cụ.
+
 
 ## 1. Chạy NOVA từ USB
 
-1. Giải nén gói `NOVA-OS-Native-v0.5.0-source.zip` để build, hoặc giải nén artifact `NOVA-OS-Native-v0.5.0-USB` sau khi GitHub Actions build thành công.
+1. Giải nén gói `NOVA-OS-Native-v0.5.1-source.zip` để build, hoặc giải nén artifact `NOVA-OS-Native-v0.5.1-USB` sau khi GitHub Actions build thành công.
 2. Giữ `NOVA.exe`, `portable.flag`, `README_PORTABLE.txt`, thư mục `scripts` và `Data` cùng một thư mục.
 3. Cắm USB vào Windows 10/11 x64 và mở `NOVA.exe`.
 4. Máy đích không cần Rust, Cargo, Node.js, npm hay WebView2. Máy vẫn cần driver đồ họa tương thích.
@@ -60,12 +67,14 @@ Không có phần mềm nào đảm bảo tuyệt đối trước mọi lỗ h�
 
 ## 6. Build bằng GitHub Actions
 
-Xem `BUILD_WITH_GITHUB.md`. Workflow `.github/workflows/rust.yml` chạy trên `windows-latest`, tạo/refresh `Cargo.lock` khi phiên bản crate gốc thay đổi, chạy `cargo test --locked`, build Release và tạo artifact `NOVA-OS-Native-v0.5.0-USB`.
+Xem `BUILD_WITH_GITHUB.md`. Workflow `.github/workflows/rust.yml` chạy trên `windows-latest`, tạo/refresh `Cargo.lock` khi phiên bản crate gốc thay đổi, chạy `cargo test --locked`, build Release và tạo artifact `NOVA-OS-Native-v0.5.1-USB`.
 
 ## 7. Tài liệu
 
 - `README_PORTABLE.txt`: hướng dẫn bản portable trên USB.
 - `docs/ARCHITECTURE.md`: kiến trúc.
-- `docs/SECURITY_0.5.0.md`: ranh giới bảo mật và threat model.
-- `docs/RESEARCH_REFERENCES_0.5.0.md`: tài liệu tham khảo.
-- `RELEASE_NOTES_0.5.0.md`: ghi chú phát hành.
+- `docs/SECURITY_0.5.0.md`: ranh giới bảo mật nền tảng và threat model.
+- `docs/RESEARCH_REFERENCES_0.5.0.md`: tài liệu tham khảo cho nền tảng portable, Unicode và Sandbox.
+- `RELEASE_NOTES_0.5.1.md`: ghi chú phát hành.
+- `docs/SECURITY_GUI_TOOLS_0.5.1.md`: phạm vi và giới hạn bảo mật của 5 công cụ GUI.
+- `docs/RESEARCH_REFERENCES_0.5.1.md`: tài liệu gốc cho Security Center và 5 GUI workspace.

@@ -1,14 +1,16 @@
-# NOVA Native 0.5.0 — build status
+# NOVA Native 0.5.1 — build status
 
 ## Source-side checks
 
-- Package version is `0.5.0`; artifact name is `NOVA-OS-Native-v0.5.0-USB`.
-- 57 distinct unit-test functions are present in source; the Windows x64 MSVC target includes 50 tests after platform-specific `cfg` selection.
+- Package version is `0.5.1`; artifact name is `NOVA-OS-Native-v0.5.1-USB`.
+- 71 distinct `#[test]` functions are declared across the Rust source; target-specific `cfg` attributes determine which tests are compiled for Windows.
 - Windows workflow uses pinned Rust 1.95.0 and x64 MSVC target.
 - Workflow refreshes and commits `Cargo.lock` only when absent or when the root crate version changes; tests and release build use `--locked`.
-- Packaging copies the UniKey download helper and pre-creates Data/Trash/Security folders.
-- Unicode, UniKey, Chrome Sandbox and file-inspection Sandbox behavior are described in the source/docs. Startup validates Data directory components against symlink/junction/reparse-point redirection; Trash and Security staging revalidate their roots at use time. Permanent deletion and quarantine cleanup recurse without following nested symlinks or Windows reparse points.
+- Packaging copies the UniKey download helper, records the five optional GUI tool integrations and pre-creates Data/Trash/Security folders.
+- Unicode, UniKey, Chrome Sandbox and file-inspection Sandbox behavior are described in the source/docs. Startup validates Data directory components against symlink/junction/reparse-point redirection; storage, Trash and Security operations re-check each existing path component and revalidate their roots at use time. Settings writes reject redirected parent folders; Trash metadata is size-limited on write and restore; Sandbox staging uses an exclusive destination and bounded copy; quarantine cleanup preserves unrelated `.wsb` files. Permanent deletion and quarantine cleanup recurse without following nested symlinks or Windows reparse points.
+- Authenticode checks for UniKey and host Chrome use the bounded process runner (15-second deadline, process-tree cleanup and capped output). Executable paths are passed as environment values, not interpolated PowerShell source. UniKey is launched from its own directory for portable relative-file resolution.
+- CMD/WLAN process work uses the Job Object runner with bounded execution and retained output. Terminal password inputs are masked and regression-tested; UTF-8/UTF-16 decoding includes non-BMP Unicode; WLAN profile XML escaping includes Vietnamese SSIDs.
 
 ## Validation limits
 
-The packaging environment does not contain `rustc`, `cargo` or `rustfmt`. It cannot claim Rust compilation, `cargo test`, clippy or a Release EXE build passed. A successful GitHub Actions run on the exact 0.5.0 commit is required to verify compilation and tests. Real Windows runtime tests are still needed for UniKey signature/typing, Windows Sandbox edition and launch behavior, Chrome read-only mapping, USB persistence, graphics drivers, Wi-Fi and process cleanup.
+The current packaging environment does not contain `rustc`, `cargo` or `rustfmt`. Static source review and regression-test additions are complete for all three audit passes, but compilation, `cargo test`, clippy, formatting and a Release EXE build have not been run here. A successful GitHub Actions run on the exact source revision is required to verify compilation and tests. Real Windows runtime tests are still needed for UniKey signature/typing, Windows Sandbox edition and launch behavior, Chrome read-only mapping, USB persistence, graphics drivers, Wi-Fi and process cleanup.

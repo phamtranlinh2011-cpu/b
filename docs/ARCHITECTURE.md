@@ -1,4 +1,4 @@
-# NOVA Native 0.5.0 architecture
+# NOVA Native 0.5.1 architecture
 
 ## Runtime shape
 
@@ -12,7 +12,9 @@ NOVA.exe (Rust native process)
 │   │   ├── Terminal / UniKey
 │   │   ├── NOVA Trash
 │   │   ├── Chrome launcher panel
-│   │   └── Security Center
+│   │   ├── UniKey control panel
+│   │   ├── Security Center
+│   │   └── five external GUI security-tool workspaces
 │   └── bottom dock/taskbar
 ├── portable Data store
 │   ├── Users/Default/{Desktop,Documents,Downloads}
@@ -37,15 +39,16 @@ Motion uses short hover/fade transitions and egui animation primitives. The Redu
 ## App modules
 
 - `app.rs`: desktop shell, searchable launcher, dock, window state, Files/Editor/Trash/Chrome/UniKey/Security Center UI, worker-task coordination and settings.
-- `apps.rs`: Chrome discovery, URL validation, Google Authenticode publisher verification and normal host launch (requires explicit confirmation in the UI).
+- `apps.rs`: Chrome discovery, URL validation, bounded Google Authenticode publisher verification and normal host launch (requires explicit confirmation in the UI).
 - `isolation.rs`: creates disposable Windows Sandbox `.wsb` sessions for offline file inspection and isolated Chrome; no writable host folders are mapped.
 - `storage.rs`: portable path discovery with component-by-component symlink/junction/reparse-point rejection, settings/manifest file validation, atomic JSON writes and path containment.
 - `terminal.rs`: UTF-8 CMD payload, Wi-Fi command parser, masked secrets, bounded command history and background task model.
 - `unicode.rs`: strict UTF-8/UTF-16 LE/BE decoding; Editor saves Unicode as UTF-8.
-- `unikey.rs`: embedded official UniKey download helper, Authenticode publisher verification and host process launcher.
+- `unikey.rs`: embedded official UniKey download helper, bounded Authenticode publisher verification and USB-relative host process launcher.
 - `windows_process.rs`: suspended process creation, Job Object assignment, timeout, output draining and bounded capture.
 - `wifi.rs`: WLAN XML profile generation, protected TEMP file, netsh import/scan/connect/delete and stale-file cleanup.
 - `trash.rs`: move/restore/permanent deletion and metadata for NOVA's own Trash; validates Trash roots and rejects reparse-point entries.
+- `security_tools.rs`: detects and launches separately installed Zenmap, ZAP, Wireshark and Burp GUIs; opens a separately hosted Greenbone GSA console; validates the NOVA-side scope acknowledgement. It does not bundle scanner engines or enforce target allowlists inside those tools.
 - `scripts/Download-UniKey.ps1`: readable source copy of the helper embedded into NOVA at compile time; the runtime Download action does not execute a mutable USB copy.
 
 ## Unicode and Vietnamese input
@@ -70,11 +73,11 @@ The built-in Editor decodes UTF-8 (with or without BOM) and UTF-16 LE/BE with BO
 
 ## Windows process runner
 
-CMD and WLAN work runs outside the egui UI thread. The runner creates the process suspended, assigns it to a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, then resumes its initial thread. This avoids executing unassigned child code before the Job Object takes ownership. It drains stdout/stderr continuously, retaining at most 1 MiB per stream. CMD commands have a 30-second deadline and WLAN helper operations have a 20-second deadline. Reader wait/cleanup has bounded grace periods. Interactive stdin and persistent command shells are not supported.
+CMD and WLAN work runs outside the egui UI thread. The runner creates the process suspended, assigns it to a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, then verifies and resumes the expected initial thread. This avoids executing unassigned child code before the Job Object takes ownership. It drains stdout/stderr continuously, retaining at most 1 MiB per stream. CMD commands have a 30-second deadline, WLAN helper operations have a 20-second deadline, and UniKey/Chrome publisher checks have a 15-second deadline. Reader wait/cleanup has bounded grace periods. Interactive stdin and persistent command shells are not supported.
 
 ## UniKey verification and host boundary
 
-The UniKey helper is compiled into `NOVA.exe` from `scripts/Download-UniKey.ps1`, rather than loaded from a potentially replaced USB script at runtime. It downloads only the official UniKey x64 ZIP, enforces archive/executable size limits, checks a valid Authenticode signature whose simple publisher name is exactly `PHAM KIM LONG`, copies the executable onto USB and checks the signature again. NOVA checks it again immediately before launch. This is a provenance/integrity check, not a guarantee that UniKey is free of defects. UniKey runs on the Windows host and is not part of Windows Sandbox.
+The UniKey helper is compiled into `NOVA.exe` from `scripts/Download-UniKey.ps1`, rather than loaded from a potentially replaced USB script at runtime. It downloads only the official UniKey x64 ZIP, enforces archive/executable size limits, checks a valid Authenticode signature whose simple publisher name is exactly `PHAM KIM LONG`, copies the executable onto USB and checks the signature again. NOVA checks it again immediately before launch using a bounded PowerShell process. The executable path is passed as a process environment value rather than embedded in PowerShell source, preserving Unicode paths. UniKey starts with its own directory as the working directory so USB-relative resources can be resolved. This is a provenance/integrity check, not a guarantee that UniKey is free of defects. UniKey runs on the Windows host and is not part of Windows Sandbox.
 
 ## Wi-Fi integration
 

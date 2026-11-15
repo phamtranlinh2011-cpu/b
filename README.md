@@ -1,13 +1,22 @@
-# NOVA OS Native 0.5.0
+# NOVA OS Native 0.5.1
 
 **NOVA Native** is a portable Windows desktop workspace built with Rust and `egui/eframe`. It runs as a normal Windows application. It is not a replacement Windows kernel and is not a bootable Live USB image.
 
-## What changed in 0.5.0
+## 0.5.1 — Security Center GUI workspaces
+
+- Adds NOVA Security Center with an authorized-asset scope acknowledgement.
+- Adds five GUI workspaces: Zenmap/Nmap, Greenbone GSA, OWASP ZAP, Wireshark and Burp Suite.
+- Third-party engines are optional and must be installed separately; Greenbone uses a separately hosted server/web console.
+- The scope acknowledgement is a user workflow guard, not a technical scan boundary. Third-party tools run on the Windows host and are not sandboxed by this release.
+- Fixes the UniKey enum comparison, quarantine cleanup iterator, Chrome/Trash egui borrow issues, deprecated egui ID calls and a duplicate Calculator `.open()` call.
+
+
+## What changed in 0.5.1
 
 - Unicode UI fallback: eframe's `system_fonts` feature and `NativeOptions::system_font_fallback` load missing glyphs from fonts installed on the Windows host (CJK, Arabic and other scripts, where the host has a suitable font).
 - Unicode Editor: opens UTF-8 (with or without BOM) and UTF-16 LE/BE files with BOM; saves UTF-8. Filesystem paths and text fields use Unicode.
 - Terminal: CMD starts with code page 65001 for UTF-8 console-mode tools. Some legacy programs may still emit OEM/ANSI output and display imperfectly.
-- UniKey app: its download helper is embedded in `NOVA.exe`, fetches the official UniKey 4.6 RC2 x64 ZIP, enforces archive/executable size limits, verifies Authenticode with the exact publisher `PHAM KIM LONG`, and places it on USB without installing a service or startup task. Select Unicode plus Telex or VNI in its tray menu.
+- UniKey app: its download helper is embedded in `NOVA.exe`, fetches the official UniKey 4.6 RC2 x64 ZIP, enforces archive/executable size limits, verifies Authenticode with the exact publisher `PHAM KIM LONG`, and places it on USB without installing a service or startup task. Launch-time publisher checks use a bounded process and preserve Unicode paths; UniKey starts from its USB folder. Select Unicode plus Telex or VNI in its tray menu.
 - Windows Sandbox integration: inspect a single NOVA workspace file using a read-only mapped copy, with networking, vGPU and clipboard disabled; or browse with Chrome in a fresh disposable Sandbox profile.
 - Portable data hardening: build the Data tree component by component and reject symlinks, junctions and reparse points in core folders; Trash and Security roots are checked again before use.
 - Chrome's isolated action is the primary choice; launching normal Chrome on the Windows host requires an explicit confirmation.
@@ -32,7 +41,12 @@ On a compatible Windows 10/11 x64 machine, open the USB in File Explorer and dou
 | NOVA Trash | Restore or permanently remove items deleted through NOVA Files |
 | Google Chrome | Open an existing Chrome install in Windows Sandbox (recommended) or, after confirmation, on the host |
 | UniKey | Optional official signed Vietnamese input companion, downloaded to USB on demand |
-| Security Center | Shows Sandbox availability, isolation limits, staged sample count and cleanup |
+| Security Center | Authorized-scope workflow reminder, Sandbox availability, isolation limits, staged-sample cleanup and five GUI security-tool workspaces |
+| Network Discovery | Opens the separately installed Zenmap/Nmap GUI |
+| Vulnerability Management | Opens a separately hosted Greenbone Security Assistant (GSA) console; scanner/server is not bundled |
+| Web Security | Opens the separately installed OWASP ZAP desktop GUI |
+| Packet Analyzer | Opens the separately installed Wireshark desktop GUI |
+| Web / API Inspector | Opens the separately installed Burp Suite Community/Professional GUI |
 
 ## Important security boundaries
 
@@ -52,13 +66,14 @@ On a compatible Windows 10/11 x64 machine, open the USB in File Explorer and dou
 
 Build computer requirements: Rust 1.95.0, Microsoft C++ Build Tools/MSVC and Windows SDK, plus internet access for dependencies on first build. Run `BUILD_NOVA.bat` or `scripts/build-portable.ps1` on Windows. They run tests, build `NOVA.exe`, create a portable folder, ZIP and SHA256. The target USB PC does not need developer tools.
 
-GitHub Actions uses `.github/workflows/rust.yml` on `windows-latest`, runs `cargo test --locked`, builds Release and uploads `NOVA-OS-Native-v0.5.0-USB`. The workflow generates or refreshes `Cargo.lock` when the root package version changes; the GitHub Actions token must be allowed to write `contents` for that lockfile commit.
+GitHub Actions uses `.github/workflows/rust.yml` on `windows-latest`, runs `cargo test --locked`, builds Release and uploads `NOVA-OS-Native-v0.5.1-USB`. The workflow generates or refreshes `Cargo.lock` when the root package version changes; the GitHub Actions token must be allowed to write `contents` for that lockfile commit.
 
 ## Source layout
 
 ```text
 src/app.rs              Desktop shell and in-shell applications
 src/apps.rs             Host Chrome detection, URL validation and launcher
+src/security_tools.rs   Five GUI tool integrations, detection and scope reminder
 src/isolation.rs        Windows Sandbox config, read-only staging and cleanup
 src/storage.rs          Portable paths, settings, validation and atomic JSON writes
 src/terminal.rs         CMD/Wi-Fi command parsing and background task model
@@ -81,7 +96,10 @@ docs/                   Architecture, security, research and roadmap
 - [Security boundary and threat model](docs/SECURITY_0.5.0.md)
 - [Research references](docs/RESEARCH_REFERENCES_0.5.0.md)
 - [Release notes](RELEASE_NOTES_0.5.0.md)
+- [0.5.1 Security Center and GUI tool references](docs/RESEARCH_REFERENCES_0.5.1.md)
+- [0.5.1 GUI tool integration and security boundary](docs/SECURITY_GUI_TOOLS_0.5.1.md)
+- [0.5.1 release notes](RELEASE_NOTES_0.5.1.md)
 
 ## Validation status
 
-This package can be structurally checked (TOML/YAML parsing, source invariants, Windows workflow contents, version/manifest checks and ZIP integrity). The packaging environment used here does not have `rustc` or `cargo`, so it cannot claim that Rust compilation or `cargo test` passed. A successful GitHub Actions run on the exact 0.5.0 commit is required before treating the EXE as build-verified. Real Windows tests are still needed for UniKey signing/typing, Sandbox edition and launch behavior, Chrome mapped-folder operation, USB persistence and Windows security boundaries.
+This package can be structurally checked (TOML/YAML parsing, source invariants, Windows workflow contents, version/manifest checks and ZIP integrity). The packaging environment used here does not have `rustc` or `cargo`, so it cannot claim that Rust compilation or `cargo test` passed. A successful GitHub Actions run on the exact 0.5.1 commit is required before treating the EXE as build-verified. Real Windows tests are still needed for UniKey signing/typing, Sandbox edition and launch behavior, Chrome mapped-folder operation, USB persistence and Windows security boundaries.

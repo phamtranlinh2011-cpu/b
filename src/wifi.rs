@@ -429,6 +429,14 @@ mod tests {
     }
 
     #[test]
+    fn profile_xml_preserves_vietnamese_ssid_and_escapes_xml_metacharacters() {
+        let xml = build_profile("Wi-Fi Việt & Lab", "NOVA::Wi-Fi Việt & Lab", Some("password123"));
+        assert!(xml.contains("Wi-Fi Việt &amp; Lab"));
+        assert!(xml.contains("NOVA::Wi-Fi Việt &amp; Lab"));
+        assert!(xml.contains("<keyMaterial>password123</keyMaterial>"));
+    }
+
+    #[test]
     fn validates_wpa2_password_length() {
         assert!(validate_password("12345678").is_ok());
         assert!(validate_password("short").is_err());

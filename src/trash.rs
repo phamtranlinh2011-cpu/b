@@ -83,10 +83,25 @@ fn ensure_dirs(paths: &AppPaths) -> io::Result<()> {
 }
 
 fn save_entry(paths: &AppPaths, entry: &TrashEntry) -> io::Result<()> {
+    ensure_dirs(paths)?;
     let target = metadata_path(paths, &entry.id)?;
     let temp = metadata_dir(paths).join(format!(".{}.{}.tmp", entry.id, std::process::id()));
     let json = serde_json::to_vec_pretty(entry)
         .map_err(|error| io::Error::other(format!("Could not encode Trash metadata: {error}")))?;
+    if json.len() > 64 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Trash metadata would exceed the 64 KiB safety limit; the item was not moved.",
+        ));
+    }
+
+    let metadata_parent = fs::symlink_metadata(metadata_dir(paths))?;
+    if !metadata_parent.is_dir() || is_link_or_reparse_point(&metadata_parent) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "NOVA refuses to write Trash metadata through a redirected folder.",
+        ));
+    }
 
     let write_result = (|| {
         let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
@@ -231,8 +246,8 @@ pub fn restore_from_trash(paths: &AppPaths, id: &str) -> io::Result<PathBuf> {
     ensure_dirs(paths)?;
     let metadata = metadata_path(paths, id)?;
     let metadata_info = fs::symlink_metadata(&metadata)?;
-    if !metadata_info.is_file() || is_link_or_reparse_point(&metadata_info) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Trash metadata is not a regular file."));
+    if !metadata_info.is_file() || is_link_or_reparse_point(&metadata_info) || metadata_info.len() > 64 * 1024 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Trash metadata is not a valid regular file within the 64 KiB limit."));
     }
     let text = fs::read_to_string(&metadata)?;
     let entry: TrashEntry = serde_json::from_str(&text)
@@ -387,6 +402,20 @@ mod tests {
         let entry = move_to_trash(&paths, &original).unwrap();
         delete_permanently(&paths, &entry.id).unwrap();
         assert!(list_trash(&paths).unwrap().is_empty());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn restore_rejects_oversized_metadata_before_reading_it() {
+        let (paths, base) = paths("oversized-metadata");
+        let original = paths.user_dir.join("note.txt");
+        fs::write(&original, "keep").unwrap();
+        let entry = move_to_trash(&paths, &original).unwrap();
+        let metadata = super::metadata_path(&paths, &entry.id).unwrap();
+        fs::write(&metadata, vec![b' '; 64 * 1024 + 1]).unwrap();
+
+        assert!(restore_from_trash(&paths, &entry.id).is_err());
+        assert!(super::item_path(&paths, &entry.id).unwrap().exists());
         let _ = fs::remove_dir_all(base);
     }
 

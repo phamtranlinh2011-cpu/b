@@ -23,7 +23,7 @@
 - Add keyboard shortcuts, accessibility review, focus order, AccessKit/screen-reader testing and high contrast.
 - Consider separate native app viewports if window ownership/lifecycle and resource use are validated.
 
-## 0.5.0 — Unicode, Vietnamese input and disposable isolation (current source release)
+## 0.5.0 — Unicode, Vietnamese input and disposable isolation (completed foundation)
 - UTF-8 and UTF-16 LE/BE text decoding; UTF-8 saves; eframe system-font fallback for missing glyphs.
 - CMD requests UTF-8 code page before user commands; legacy OEM/ANSI utilities may still display incorrectly.
 - UniKey 4.6 RC2 x64 companion download from the official site, strict Authenticode publisher check and USB-side placement; the helper script is embedded in NOVA at compile time.
@@ -44,3 +44,18 @@
 
 ## Future — NOVA Live USB
 - Separate bootable Linux-based Live image, persistence layer, UEFI and Secure Boot validation. Do not describe the Windows desktop executable as a bootable OS.
+
+
+## 0.5.1 — Security Center GUI prototype (current source release)
+
+- Five launch workspaces: Zenmap, Greenbone GSA, OWASP ZAP, Wireshark and Burp Suite.
+- Authorized-scope acknowledgement and third-party host-execution warnings.
+- Third-party engines are optional and separately installed; Greenbone needs its own server/scanner.
+- The scope acknowledgement is not technical enforcement. Local GUI tools run as Windows host processes and are not isolated by NOVA.
+- This remains a portable Windows desktop prototype, not the Linux bootable Security OS.
+
+## Future 0.6.0 — Linux Bootable Foundation
+
+- Start the separate Debian Live-based Security OS branch.
+- Port the NOVA shell and Security Center UI to the Linux environment.
+- Design actual firewall-enforced network domains, disposable VM/lab environments, signed modules and encrypted persistence before integrating scanners.

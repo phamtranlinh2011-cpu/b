@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
-$Version = '0.5.0'
+$Version = '0.5.1'
 $Target = 'x86_64-pc-windows-msvc'
 
 function Require-Command([string]$Name) {
@@ -69,7 +69,7 @@ Copy-Item (Join-Path $ProjectRoot 'README_PORTABLE.txt') $PackageRoot
 New-Item -ItemType Directory -Path (Join-Path $PackageRoot 'scripts') -Force | Out-Null
 Copy-Item (Join-Path $ProjectRoot 'scripts\Download-UniKey.ps1') (Join-Path $PackageRoot 'scripts\Download-UniKey.ps1')
 Copy-Item (Join-Path $ProjectRoot 'Cargo.lock') (Join-Path $PackageRoot 'Cargo.lock.build-reference')
-"NOVA Native $Version`nTarget: $Target`nRust: 1.95.0`nUnicode: UTF-8 editor + system-font fallback + CMD UTF-8 code page`nChrome: host app files read-only in isolated Windows Sandbox`nIsolation: Windows Sandbox required; Windows Home is not supported`nUniKey: optional official signed companion downloaded to USB" | Set-Content (Join-Path $PackageRoot 'BUILD_INFO.txt')
+"NOVA Native $Version`nTarget: $Target`nRust: 1.95.0`nUnicode: UTF-8 editor + system-font fallback + CMD UTF-8 code page`nChrome: host app files read-only in isolated Windows Sandbox`nIsolation: Windows Sandbox required; Windows Home is not supported`nUniKey: optional official signed companion downloaded to USB`nSecurity GUI: Zenmap, Greenbone GSA, OWASP ZAP, Wireshark and Burp are optional external tools; Greenbone requires a separate server; scope acknowledgement is not technical enforcement; local tools run on Windows host" | Set-Content (Join-Path $PackageRoot 'BUILD_INFO.txt')
 
 Write-Host '[6/6] Creating ZIP and SHA256...' -ForegroundColor Cyan
 New-Item -ItemType Directory -Path $ReleaseDirectory -Force | Out-Null

@@ -42,21 +42,27 @@ pub fn find_portable(app_dir: &Path) -> Option<PathBuf> {
 #[cfg(windows)]
 pub fn verify_official_signature(path: &Path) -> io::Result<()> {
     use std::process::Command;
-    use std::os::windows::process::CommandExt;
+    use std::time::Duration;
 
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let system_dir = crate::windows_process::system_binary("WindowsPowerShell\\v1.0\\powershell.exe")?;
-    let path_literal = path.to_string_lossy().replace('\'', "''");
-    let script = format!(
-        "$ErrorActionPreference='Stop'; $sig=Get-AuthenticodeSignature -LiteralPath '{}'; if ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -ceq 'PHAM KIM LONG') {{ exit 0 }}; exit 17",
-        path_literal
-    );
-    // std::process::Command passes Windows arguments as UTF-16. The script is
-    // one argument and is never routed through cmd.exe.
-    let output = Command::new(system_dir)
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()?;
+    if !path.is_file() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "UniKey executable was not found."));
+    }
+    let powershell = crate::windows_process::system_binary("WindowsPowerShell\\v1.0\\powershell.exe")?;
+    // Pass the path as an environment value instead of interpolating it into
+    // PowerShell source. This preserves Unicode and avoids script injection
+    // through unusual file names.
+    let script = "$ErrorActionPreference='Stop'; $sig=Get-AuthenticodeSignature -LiteralPath $env:NOVA_VERIFY_PATH; if ($sig.Status -eq 'Valid' -and $sig.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -ceq 'PHAM KIM LONG') { exit 0 }; exit 17";
+    let mut command = Command::new(powershell);
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("NOVA_VERIFY_PATH", path);
+    let output = crate::windows_process::run_captured(command, Duration::from_secs(15))?;
+    if output.timed_out || output.drain_timed_out {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "UniKey signature verification timed out. Check Windows certificate services and try again.",
+        ));
+    }
     if output.status.success() {
         Ok(())
     } else {
@@ -76,7 +82,12 @@ pub fn verify_official_signature(_path: &Path) -> io::Result<()> {
 pub fn launch_verified(path: &Path) -> io::Result<std::process::Child> {
     use std::process::Command;
     verify_official_signature(path)?;
-    Command::new(path).spawn()
+    let working_directory = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "UniKey executable has no parent directory.")
+    })?;
+    // Keep UniKey's relative configuration/resource files beside the USB copy
+    // instead of inheriting NOVA's potentially unrelated working directory.
+    Command::new(path).current_dir(working_directory).spawn()
 }
 
 #[cfg(not(windows))]

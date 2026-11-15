@@ -1,4 +1,4 @@
-NOVA OS NATIVE 0.5.0 — USB PORTABLE EDITION
+NOVA OS NATIVE 0.5.1 — USB PORTABLE EDITION
 
 START
 1. Keep NOVA.exe, portable.flag and the Data folder together in one folder.
@@ -24,7 +24,13 @@ APPS
 - Terminal: Windows CMD and NOVA Wi-Fi commands. CMD executes on the real Windows host with your user permissions.
 - NOVA Trash: restores files moved from NOVA Files. Emptying it permanently deletes those NOVA items.
 - Google Chrome: opens existing host Chrome normally or in a fresh Windows Sandbox profile.
-- Security Center: explains isolation status and lets you clear staged sample copies after closing all Sandbox sessions.
+- Security Center: authorized-scope workflow reminder, Windows Sandbox status, staged-copy cleanup and launch workspaces for five GUI security tools. The scope acknowledgement is not a firewall or technical target restriction.
+- Network Discovery: launches the separately installed Zenmap/Nmap GUI.
+- Vulnerability Management: opens a separately hosted Greenbone Security Assistant (GSA) console; the scanner/server/database/feed are not bundled.
+- Web Security: launches the separately installed OWASP ZAP desktop GUI.
+- Packet Analyzer: launches the separately installed Wireshark GUI.
+- Web/API Inspector: launches the separately installed Burp Suite Community/Professional GUI.
+- These third-party tools run on the Windows host, not in Windows Sandbox. Install them from their official sources and set the same authorized target allowlist inside each tool before testing.
 
 SECURITY BOUNDARY — READ THIS
 - NOVA itself is a normal Windows app, NOT a virtual machine. Only content explicitly opened in Windows Sandbox receives the disposable VM isolation. Core Data directories are validated against symlink/junction/reparse-point redirection, but this is not a full host sandbox.

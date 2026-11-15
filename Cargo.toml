@@ -1,9 +1,9 @@
 [package]
 name = "nova-native"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.95"
-description = "NOVA OS - portable Windows desktop with Unicode, UniKey and disposable Sandbox workflows"
+description = "NOVA OS - portable Windows desktop with GUI security tool workspaces and Security Center"
 license = "MIT"
 authors = ["NOVA OS"]
 

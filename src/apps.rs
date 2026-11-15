@@ -38,19 +38,27 @@ fn is_trusted_google_publisher(name: &str) -> bool {
 
 #[cfg(windows)]
 pub(crate) fn verify_google_chrome_signature(chrome: &std::path::Path) -> io::Result<()> {
-    use std::os::windows::process::CommandExt;
     use std::process::Command;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    use std::time::Duration;
+
+    if !chrome.is_file() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "Google Chrome executable was not found."));
+    }
     let powershell = crate::windows_process::system_binary(r"WindowsPowerShell\v1.0\powershell.exe")?;
-    let literal = chrome.to_string_lossy().replace('\'', "''");
-    let script = format!(
-        "$ErrorActionPreference='Stop'; $sig=Get-AuthenticodeSignature -LiteralPath '{}'; if ($sig.Status -eq 'Valid') {{ $name=$sig.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false); if ($name -in @('Google LLC','Google Inc.')) {{ exit 0 }} }}; exit 17",
-        literal
-    );
-    let output = Command::new(powershell)
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()?;
+    // Keep the path out of PowerShell source text and preserve Windows Unicode
+    // paths by passing it through the process environment.
+    let script = "$ErrorActionPreference='Stop'; $sig=Get-AuthenticodeSignature -LiteralPath $env:NOVA_VERIFY_PATH; if ($sig.Status -eq 'Valid') { $name=$sig.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false); if ($name -in @('Google LLC','Google Inc.')) { exit 0 } }; exit 17";
+    let mut command = Command::new(powershell);
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("NOVA_VERIFY_PATH", chrome);
+    let output = crate::windows_process::run_captured(command, Duration::from_secs(15))?;
+    if output.timed_out || output.drain_timed_out {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Chrome publisher verification timed out. Check Windows certificate services and try again.",
+        ));
+    }
     if output.status.success() {
         Ok(())
     } else {
