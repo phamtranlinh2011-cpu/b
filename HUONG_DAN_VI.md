@@ -1,67 +1,71 @@
-# NOVA Native 0.3.5 — Huong dan tieng Viet
+# NOVA Native 0.5.0 — Hướng dẫn tiếng Việt
 
-## NOVA Native la gi?
+## 1. Chạy NOVA từ USB
 
-NOVA Native la desktop environment portable chay tren Windows. Day chua phai kernel he dieu hanh rieng va chua boot doc lap tu USB.
+1. Giải nén gói `NOVA-OS-Native-v0.5.0-source.zip` để build, hoặc giải nén artifact `NOVA-OS-Native-v0.5.0-USB` sau khi GitHub Actions build thành công.
+2. Giữ `NOVA.exe`, `portable.flag`, `README_PORTABLE.txt`, thư mục `scripts` và `Data` cùng một thư mục.
+3. Cắm USB vào Windows 10/11 x64 và mở `NOVA.exe`.
+4. Máy đích không cần Rust, Cargo, Node.js, npm hay WebView2. Máy vẫn cần driver đồ họa tương thích.
+5. Đóng NOVA và đóng các cửa sổ Windows Sandbox trước khi rút USB an toàn.
 
-## Cach lay ban EXE ma khong cai bo cong cu tren may cua ban
+## 2. Gõ tiếng Việt và Unicode
 
-Source ZIP hien tai chua co `NOVA.exe` da bien dich. De tao EXE ma khong cai Rust/Cargo tren may cua ban, dung GitHub Actions:
+- Mở **UniKey** từ Launcher hoặc thanh Dock.
+- Chọn **Download UniKey to USB**. NOVA tải UniKey 4.6 RC2 x64 từ `unikey.org`, kiểm tra chữ ký số và nhà phát hành `PHAM KIM LONG` trước khi cho chạy.
+- Chọn **Start UniKey**.
+- Mở biểu tượng UniKey ở khay hệ thống Windows, chọn **Bảng mã: Unicode**, **Kiểu gõ: Telex hoặc VNI**.
+- NOVA Editor lưu văn bản ở UTF-8; có thể mở UTF-8 và UTF-16 LE/BE có BOM. Windows font fallback được bật để hiển thị thêm glyph nếu máy đã có font phù hợp.
+- Terminal yêu cầu CMD dùng code page UTF-8 (`65001`). Một số chương trình console cũ vẫn có thể xuất ra bảng mã OEM/ANSI nên tiếng Việt có thể hiển thị chưa hoàn hảo.
+- UniKey chạy trên Windows host, không nằm trong Windows Sandbox. NOVA không cài service hay tác vụ khởi động cùng Windows.
 
-1. Dang nhap GitHub va tao mot repository moi (private cung duoc).
-2. Giai nen source ZIP nay tren may.
-3. Tai len GitHub **toan bo noi dung** ben trong thu muc `NOVA-OS-Native-v0.3.5`, bao gom thu muc an `.github`.
-4. Mo tab **Actions** trong repository va cho phep GitHub Actions neu duoc hoi.
-5. Chon workflow **Build NOVA Native for Windows** o cot ben trai.
-6. Bam **Run workflow** va chay tren nhanh mac dinh.
-7. Khi job thanh cong, mo run vua hoan tat va tai artifact `NOVA-OS-Native-v0.3.5-USB` trong muc Artifacts.
-8. Giai nen ZIP artifact va copy toan bo noi dung vao USB.
+## 3. Bảo vệ khi tải hoặc kiểm tra tệp lạ
 
-Workflow se chay unit tests, build `NOVA.exe` va dong goi artifact portable. Lan chay dau tien se tao `Cargo.lock` va commit file nay vao nhanh duoc chon, vi vay repository can cho phep GitHub Actions co quyen `contents: write` va khong chan commit cua bot. Cac lan build sau su dung `--locked`. GitHub cung cap artifact duoi dang ZIP de tai ve; giai nen mot lan roi copy toan bo noi dung vao USB. Neu workflow that bai, mo log cua buoc loi va gui log do de sua.
+**NOVA không phải máy ảo.** Bản thân `NOVA.exe` chạy trên Windows host. Chỉ những thao tác được mở rõ ràng trong **Windows Sandbox** mới được cách ly.
 
-## Cach chay tren may dich
+### Kiểm tra một tệp đáng ngờ
 
-1. Cam USB vao may Windows 10/11 x64.
-2. Mo USB trong File Explorer.
-3. Double-click `NOVA.exe`.
-4. Khong can cai Node.js, npm, Rust, Cargo, Visual Studio Build Tools, WebView2 hay NOVA installer tren may dich.
-5. Khi xong, dong NOVA truoc khi safely eject USB.
+1. Đưa tệp vào `Data/Users/Default/Downloads` hoặc thư mục làm việc bên trong NOVA.
+2. Mở **Files**, chọn tệp và nhấn **Inspect in Sandbox**.
+3. NOVA tạo một bản sao riêng ở `Data/Security/Quarantine`, chỉ chia sẻ bản sao đó ở chế độ read-only vào Windows Sandbox.
+4. Sandbox tắt mạng, clipboard, vGPU, audio/video input và printer redirection. Explorer mở thư mục mẫu; bạn phải tự chọn tệp để mở/chạy bên trong Sandbox.
+5. Khi xong, đóng Windows Sandbox và xác nhận xóa toàn bộ nội dung phiên.
+6. Quay lại **Security Center** → **Clear staged copies** để xóa bản sao mẫu và file `.wsb` do NOVA tạo. Hãy đóng tất cả cửa sổ Sandbox trước khi dọn.
 
-Windows khong tu dong chay ung dung bat ky chi vi USB duoc cam vao. Vi vay buoc mo `NOVA.exe` bang tay la gioi han bao mat cua Windows, khong phai cai dat them.
+Tệp gốc trong thư mục NOVA không bị sửa hoặc xóa. Bản sao tạm trên USB sẽ vẫn nằm trong `Data/Security/Quarantine` cho đến khi bạn dọn.
 
-## Khong duoc tach cac thanh phan nay
+### Duyệt web bằng Chrome cách ly
 
-```text
-NOVA-Portable/
-  NOVA.exe
-  portable.flag
-  README_PORTABLE.txt
-  Data/
-    Users/Default/
-    Settings/
-    Logs/
-  Backup/
-```
+- Mở **Google Chrome** → **Open isolated (recommended)**.
+- Chrome chạy trong Windows Sandbox với profile mới; cookie, extension, cache và tệp tải xuống nằm trong máy ảo dùng một lần và bị xóa khi đóng Sandbox.
+- Chế độ này bật mạng để trang web hoạt động; mạng nội bộ có thể nhìn thấy từ Sandbox. Clipboard và thư mục host ghi được đều bị tắt.
+- Nút **Open on Windows host** phải xác nhận cảnh báo. Chrome bình thường trên Windows không được NOVA cách ly.
 
-`NOVA.exe` la executable duy nhat. `portable.flag` va `Data/` la tep/thu muc phu can thiet de NOVA nhan biet che do USB va luu du lieu. Khong chi copy rieng EXE.
+## 4. Yêu cầu Windows Sandbox
 
-## Gioi han va canh bao
+- Windows Pro, Enterprise hoặc Education; Windows Home không hỗ trợ Windows Sandbox.
+- Bật CPU virtualization trong BIOS/UEFI.
+- Máy cần Windows build tương thích, ít nhất 4 GB RAM (8 GB khuyến nghị), 1 GB đĩa trống và 2 lõi CPU theo hướng dẫn Microsoft.
+- Vào **Turn Windows features on or off**, bật **Windows Sandbox**, khởi động lại nếu được yêu cầu.
+- Nếu Sandbox không chạy, NOVA sẽ báo lỗi và không tự chạy tệp lạ trên host để thay thế.
 
-- CMD chay lenh that voi quyen cua tai khoan Windows hien tai; no khong phai sandbox. CMD/Wi-Fi chay tren worker nen giao dien khong bi dung; Job Object se don cac process con van nam trong job khi timeout/dong handle.
-- Wi-Fi can WLAN AutoConfig va driver Wi-Fi cua may. Ban dau ho tro mang mo va WPA2-Personal (AES).
-- Windows co the hien SmartScreen/antivirus warning voi EXE chua ky so. Chi cho phep neu ban tin tuong nguon build va da xac minh artifact.
-- Khong rut USB trong luc NOVA dang ghi du lieu.
-- Chua co benchmark hoac kiem thu tren nhieu may phan cung; can xac nhan tren may dich truoc khi dung thuong xuyen.
+## 5. Những gì vẫn chạy trên Windows host
 
+- NOVA Terminal chạy CMD với quyền của tài khoản Windows hiện tại. Không chạy lệnh không rõ nguồn gốc.
+- UniKey là tiến trình Windows riêng, có thể nhận dữ liệu gõ trên toàn hệ thống.
+- Wi-Fi sử dụng cấu hình WLAN của Windows.
+- Chrome bình thường, nếu bạn chọn Open on Windows host, dùng profile Windows hiện có.
+- Files/Editor thông thường ghi vào thư mục dữ liệu NOVA (trong portable mode là USB), không phải một hệ điều hành/VM riêng.
 
-## Ghi chu ban 0.3.5
+Không có phần mềm nào đảm bảo tuyệt đối trước mọi lỗ hổng Windows, hypervisor, firmware hoặc driver trong tương lai. Giữ Windows và Microsoft Defender luôn cập nhật.
 
-- Files kiem tra duong dan canonical, tu choi ten tep khong hop le/reserved cua Windows; Editor tao thu muc cha theo tung cap va kiem tra lai truoc khi ghi.
-- Neu USB/thu muc Settings chi doc, NOVA hien loi luu Settings tren thanh trang thai.
-- Tep XML Wi-Fi tam thoi duoc tao voi DACL gioi han cho owner, SYSTEM va Administrators. NOVA dong writer truoc khi netsh mo tep, xoa tep sau import va don tep NOVA cu hon 10 phut o lan khoi dong tiep theo neu lan truoc bi crash. Noi dung XML van la plaintext trong khoang thoi gian ngan no ton tai; SYSTEM va Administrators duoc xem la tin cay.
-- Manifest Wi-Fi loi/khong doc duoc se bi tu choi an toan thay vi xem nhu danh sach rong.
-- Monitor khong lam NOVA crash neu sysinfo khong khoi tao duoc; ket qua Calculator nho khong bi lam tron thanh 0.
-- CMD va Wi-Fi chay tren worker rieng; output duoc gioi han 1 MiB moi stream va van doc den EOF de tranh pipe bi day.
-- `cmd.exe` va `netsh.exe` duoc tim bang `GetSystemDirectoryW`, khong tim theo PATH/thu muc hien hanh.
-- Rust toolchain duoc pin 1.95.0; workflow tao/commit `Cargo.lock` lan dau va build `--locked` o cac lan sau.
-- Van can kiem thu thuc te tren Windows 10/11, nhieu adapter/router va cac tinh huong nested Job Object.
+## 6. Build bằng GitHub Actions
+
+Xem `BUILD_WITH_GITHUB.md`. Workflow `.github/workflows/rust.yml` chạy trên `windows-latest`, tạo/refresh `Cargo.lock` khi phiên bản crate gốc thay đổi, chạy `cargo test --locked`, build Release và tạo artifact `NOVA-OS-Native-v0.5.0-USB`.
+
+## 7. Tài liệu
+
+- `README_PORTABLE.txt`: hướng dẫn bản portable trên USB.
+- `docs/ARCHITECTURE.md`: kiến trúc.
+- `docs/SECURITY_0.5.0.md`: ranh giới bảo mật và threat model.
+- `docs/RESEARCH_REFERENCES_0.5.0.md`: tài liệu tham khảo.
+- `RELEASE_NOTES_0.5.0.md`: ghi chú phát hành.

@@ -68,7 +68,7 @@ impl TerminalState {
             cwd: paths.user_dir.clone(),
             wifi_mode: None,
         };
-        state.line("NOVA OS Native Terminal 0.3.5");
+        state.line("NOVA OS Native Terminal 0.5.0");
         state.line("Type help for commands. Wi-Fi: wifi -h");
         state.line(format!("Working directory: {}", state.cwd.display()));
         state.line("");
@@ -376,10 +376,17 @@ pub fn parse_words(input: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
+/// Ask CMD and console-mode child programs to use UTF-8 for redirected text.
+/// Process arguments and filesystem paths are still passed to Windows as UTF-16.
+fn utf8_cmd_payload(command: &str) -> String {
+    format!("chcp 65001>nul & {command}")
+}
+
 #[cfg(windows)]
 fn run_cmd(command: &str, cwd: &Path) -> io::Result<String> {
     let mut process = Command::new(crate::windows_process::system_binary("cmd.exe")?);
-    process.args(["/D", "/S", "/C", command]).current_dir(cwd);
+    let payload = utf8_cmd_payload(command);
+    process.args(["/D", "/S", "/C", &payload]).current_dir(cwd);
     let output = crate::windows_process::run_captured(process, COMMAND_TIMEOUT)?;
     Ok(output.combined_text())
 }
@@ -409,6 +416,11 @@ mod tests {
     #[test]
     fn rejects_unclosed_quotes() {
         assert!(parse_words("wifi select \"Home WiFi").is_err());
+    }
+
+    #[test]
+    fn cmd_payload_enables_utf8_before_user_command() {
+        assert_eq!(super::utf8_cmd_payload("echo Tiếng Việt 日本語"), "chcp 65001>nul & echo Tiếng Việt 日本語");
     }
 
     #[test]
@@ -452,9 +464,13 @@ mod tests {
         // AppPaths is used for the general API. Tests use a deterministic temp root.
         let root = std::env::temp_dir();
         crate::storage::AppPaths {
+            app_dir: root.clone(),
+            data_dir: root.clone(),
+            security_dir: root.join("Security"),
             user_dir: root.clone(),
             settings_file: root.join("settings.json"),
             wifi_manifest: root.join("wifi.json"),
+            trash_dir: root.join("Trash"),
             portable: true,
         }
     }

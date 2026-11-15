@@ -1,23 +1,13 @@
-# Build NOVA Native on GitHub (no Rust toolchain on your PC)
+# Build NOVA Native 0.5.0 on GitHub (without installing Rust locally)
 
-Use this route if you only want the finished Windows USB package and do not want to install Rust/Cargo or C++ Build Tools on your own computer. The build happens on a GitHub-hosted Windows runner.
+1. Extract the NOVA 0.5.0 source ZIP.
+2. Upload the complete contents to the repository root, keeping `.github/` and `.cargo/` (including hidden folders).
+3. Commit to `main`. The `push` trigger runs the Windows workflow automatically. You can also open **Actions → Build NOVA Native for Windows → Run workflow**.
+4. The workflow uses pinned Rust 1.95.0 and `x86_64-pc-windows-msvc`.
+5. It generates or refreshes `Cargo.lock` if missing or if the root `nova-native` package version changed, commits the lockfile using the Actions token, then runs `cargo test --locked` and `cargo build --locked --release`.
+6. On success, download artifact **`NOVA-OS-Native-v0.5.0-USB`** from the bottom of the successful workflow run.
+7. Extract the artifact and copy the entire folder to USB. Keep `NOVA.exe`, `portable.flag`, `README_PORTABLE.txt`, `BUILD_INFO.txt`, `scripts/Download-UniKey.ps1` and `Data/` together.
 
-## Steps
+Repository Actions permissions must allow `contents: write` for the lockfile commit when the package version changes. Branch protection or organization policy may block the workflow from pushing the lockfile; if that happens, add a generated `Cargo.lock` manually and rerun.
 
-1. Sign in to GitHub and create a new repository. A private repository is fine.
-2. Upload the **contents** of this NOVA Native source folder to the repository root. Make sure `.github/workflows/windows-build.yml` is included. Do not upload `target/` or `release/` if they exist.
-3. Open the repository's **Actions** tab. If GitHub asks, enable Actions for the repository.
-4. In the left sidebar select **Build NOVA Native for Windows**.
-5. Choose **Run workflow**, select the default branch, and run it.
-6. Wait for the workflow to finish. Open its successful run and find **Artifacts** at the bottom.
-7. Download `NOVA-OS-Native-v0.3.5-USB`. It is the packaged portable folder, with `NOVA.exe`, `portable.flag`, `README_PORTABLE.txt`, `BUILD_INFO.txt` and `Data/`. GitHub supplies the artifact download as a ZIP archive.
-8. Extract the downloaded artifact once. Copy the entire extracted contents to the USB drive. Keep `NOVA.exe`, `portable.flag`, `README_PORTABLE.txt`, and `Data/` together.
-
-## On the target Windows PC
-
-- No GitHub account, internet connection, Node.js, npm, Rust, Cargo, Visual Studio, WebView2, installer, or administrator permission is required to start NOVA.
-- Open the USB in File Explorer and double-click `NOVA.exe`. Windows intentionally does not auto-run arbitrary programs when a USB is inserted.
-- Windows may show SmartScreen or antivirus warnings for a newly built unsigned executable. Do not bypass a warning unless you trust the source and have checked the artifact. A public release should be code-signed.
-- Close NOVA before ejecting the USB.
-
-The initial build is x64 only. The first workflow run creates and commits `Cargo.lock` (the workflow needs `contents: write` permission); subsequent runs use `--locked` so indirect dependency versions stay fixed. Check **Settings → Actions → General → Workflow permissions** and allow read/write access if the bot cannot commit. If repository branch protection still blocks the bot commit, generate `Cargo.lock` on a local Rust 1.95.0 build machine and commit it manually. The workflow runs unit tests, builds the EXE and packages the portable data folders. It does not test every real PC, GPU, wireless adapter, or router.
+A green workflow confirms the Windows tests/build/package steps ran successfully for that commit. It does not replace real-device testing of Unicode/UniKey typing, Windows Sandbox availability, Chrome mapped-folder operation, USB write behavior, Wi-Fi adapters or graphics drivers.

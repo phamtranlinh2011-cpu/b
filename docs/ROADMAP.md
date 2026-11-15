@@ -1,43 +1,46 @@
 # NOVA Native roadmap
 
-## 0.3.1 — Native foundation (previous source milestone)
-- Rust native GUI, no WebView or Node runtime at execution time.
-- Portable data folder and settings.
-- Built-in Files, Editor, Calculator, Settings, Monitor.
-- CMD terminal and Wi-Fi command flow.
-- Windows ZIP packaging scripts and CI workflow.
+## 0.3.x — Native foundation and hardening (previous milestones)
+- Rust native GUI, portable Data directory, Files/Editor/Calculator/Settings/Monitor, CMD and Wi-Fi integration.
+- Fix MSVC build errors, harden file paths and settings writes, correct WPA2 raw PSK validation, background terminal tasks and Windows Job Object cleanup.
+- Protected WLAN TEMP XML, stale-file cleanup and bounded output/history.
 
-## 0.3.2 — Windows build and safety fixes (previous)
-- Fix Windows build errors reported by the MSVC runner.
-- Harden Files/Editor path handling and portable Windows filename validation.
-- Fail closed on corrupt Wi-Fi profile manifests and improve temporary XML cleanup.
-- Improve CMD output/timeout diagnostics and calculator precision.
-- Add unit tests for path validation, Wi-Fi parsing/profile helpers and calculator formatting.
+## 0.4.0 — Desktop UX, applications and portable Trash (completed previous milestone)
+- Searchable Launcher, app tiles, navigation rail, floating in-shell windows and bottom dock/taskbar toggle.
+- Visual design refresh: consistent spacing, rounded surfaces, theme/accent colors, window shadows, hover feedback and short fade transitions.
+- Reduce visual effects setting for less motion.
+- Files selection/double-click open, refresh, folder creation and Move to NOVA Trash.
+- Portable NOVA Trash with restore, collision-safe names, permanent delete and confirmation before empty.
+- Editor New/Save and word/character count; Calculator Clear/Swap; System Monitor updates only while visible.
+- Google Chrome host launcher with install detection, new-window launch and official download-page fallback.
+- Docs and CI artifact naming updated to v0.4.0.
 
-## 0.3.3 — CI test corrections (previous)
-- Fix trailing-space filename validation so validation sees the original input.
-- Correct the WPA2 password test to allow a valid 64-character hexadecimal raw PSK.
-- Remove unused AppPaths fields that generated a dead-code warning.
+## 0.4.x — Quality and native integration
+- Execute Windows CI and physical PC test matrix (Windows 10/11, high DPI, Intel/AMD/NVIDIA GPU, USB flash drive, read-only and near-full drive).
+- Test process termination, nested Job Objects, repeated CMD commands, slow/large output and application shutdown.
+- Test actual WLAN profiles, locale-specific `netsh` output, adapters, WPA2/open networks and cleanup after forced process termination.
+- Consider Windows Shell Recycle Bin integration as an optional mode distinct from NOVA Trash.
+- Add keyboard shortcuts, accessibility review, focus order, AccessKit/screen-reader testing and high contrast.
+- Consider separate native app viewports if window ownership/lifecycle and resource use are validated.
 
-## 0.3.5 — Responsive terminal and process security (current)
-- Run CMD and Windows WLAN operations on a background worker rather than the UI thread.
-- Use a shared process runner with bounded output, timeouts and Windows Job Object cleanup.
-- Create temporary WLAN XML with a protected DACL, remove it after import, and clean stale protected files at startup.
-- Pin Rust 1.95.0 and persist a generated Cargo.lock before CI test/build; use `--locked` after first resolution.
-- Validate on Windows CI and real adapters; nested Job Object restrictions and actual WLAN import remain platform integration checks.
+## 0.5.0 — Unicode, Vietnamese input and disposable isolation (current source release)
+- UTF-8 and UTF-16 LE/BE text decoding; UTF-8 saves; eframe system-font fallback for missing glyphs.
+- CMD requests UTF-8 code page before user commands; legacy OEM/ANSI utilities may still display incorrectly.
+- UniKey 4.6 RC2 x64 companion download from the official site, strict Authenticode publisher check and USB-side placement; the helper script is embedded in NOVA at compile time.
+- Offline Windows Sandbox profile for inspecting a staged read-only copy of one selected NOVA file; sample is not auto-executed.
+- Isolated Chrome profile inside Windows Sandbox with a read-only app mapping, no writable host folder or clipboard redirection, and networking enabled for browsing.
+- Security Center explains host/Sandbox boundaries and clears NOVA staging files/configs after Sandbox is closed.
+- Fail-closed behavior: no fallback to host execution when Windows Sandbox is unavailable.
+- Startup creates the Data tree component-by-component and fails closed on symlinks, junctions and reparse points in the core data folders; Trash/Security roots revalidate on use.
+- UniKey helper also rejects reparse-point Apps/UniKey destinations and stages the verified executable before replacing the final file.
+- Workflow uses pinned Rust 1.95.0 and locked Cargo builds; the first CI run generates/commits Cargo.lock if missing or stale.
 
-## 0.4.0 — Desktop polish
-- Independent app viewports / improved window manager.
-- Search and file previews.
-- Keyboard shortcuts, clipboard and notifications.
-- Accessibility review and high-DPI testing.
-
-## 0.5.0 — Performance and release validation
-- Cold/warm launch benchmarks on HDD, SSD and USB flash drives.
-- Idle CPU and RAM baselines on Windows 10/11.
-- Test matrix across hardware and Wi-Fi adapters.
-- Signed release process and update strategy.
+## 0.5.x — Runtime verification and hardening
+- Verify all unit tests and release build on Windows CI for the exact release commit.
+- Test Sandbox Pro/Enterprise/Education edition detection, optional feature installation, one-instance limitation, file inspection and isolated Chrome on physical Windows 10/11 devices.
+- Evaluate Defender scan integration and Windows Shell Recycle Bin integration as separate capabilities.
+- Review process shutdown, Job Object behavior, USB read-only/near-full conditions and Unicode paths with non-ASCII usernames.
+- Add signed NOVA releases, reproducible build provenance and an explicit update/rollback strategy that preserves portable user data.
 
 ## Future — NOVA Live USB
-- Separate Linux Live image, persistence layer, UEFI and Secure Boot validation.
-- Share visual design and selected apps; do not claim the Windows desktop executable is a bootable OS.
+- Separate bootable Linux-based Live image, persistence layer, UEFI and Secure Boot validation. Do not describe the Windows desktop executable as a bootable OS.

@@ -1,140 +1,87 @@
-# NOVA OS Native 0.3.5
+# NOVA OS Native 0.5.0
 
-**NOVA Native** is a portable Windows desktop environment built in Rust with `egui/eframe`. It is a normal native Windows application, not a replacement for Windows and not yet a bootable USB operating system.
+**NOVA Native** is a portable Windows desktop workspace built with Rust and `egui/eframe`. It runs as a normal Windows application. It is not a replacement Windows kernel and is not a bootable Live USB image.
 
-## User-facing goal
+## What changed in 0.5.0
 
-The finished USB package is intended to work on a compatible Windows 10/11 x64 computer without installing Node.js, npm, Rust, Cargo, WebView2, a separate runtime, or NOVA itself. The user opens `NOVA.exe` manually from the USB. Windows does not reliably auto-run software merely because removable media was inserted, by design.
+- Unicode UI fallback: eframe's `system_fonts` feature and `NativeOptions::system_font_fallback` load missing glyphs from fonts installed on the Windows host (CJK, Arabic and other scripts, where the host has a suitable font).
+- Unicode Editor: opens UTF-8 (with or without BOM) and UTF-16 LE/BE files with BOM; saves UTF-8. Filesystem paths and text fields use Unicode.
+- Terminal: CMD starts with code page 65001 for UTF-8 console-mode tools. Some legacy programs may still emit OEM/ANSI output and display imperfectly.
+- UniKey app: its download helper is embedded in `NOVA.exe`, fetches the official UniKey 4.6 RC2 x64 ZIP, enforces archive/executable size limits, verifies Authenticode with the exact publisher `PHAM KIM LONG`, and places it on USB without installing a service or startup task. Select Unicode plus Telex or VNI in its tray menu.
+- Windows Sandbox integration: inspect a single NOVA workspace file using a read-only mapped copy, with networking, vGPU and clipboard disabled; or browse with Chrome in a fresh disposable Sandbox profile.
+- Portable data hardening: build the Data tree component by component and reject symlinks, junctions and reparse points in core folders; Trash and Security roots are checked again before use.
+- Chrome's isolated action is the primary choice; launching normal Chrome on the Windows host requires an explicit confirmation.
+- Security Center explains the isolation boundary and removes NOVA's staged sample copies and generated `.wsb` launch configs after all Sandbox sessions are closed.
 
-The target computer still supplies Windows system components and drivers. NOVA uses built-in `cmd.exe` for the real command shell and `netsh wlan` for Windows Wi-Fi management. The `eframe`/Glow renderer uses Windows OpenGL support; an up-to-date compatible graphics driver is recommended. Windows' basic OpenGL fallback may be limited.
+## Portable runtime
 
-## Features in this native first pass
+The intended USB package contains `NOVA.exe`, `portable.flag`, `README_PORTABLE.txt`, `BUILD_INFO.txt`, `scripts/Download-UniKey.ps1` (source of the helper embedded into NOVA.exe), and a `Data/` folder. Keep them together. The app checks for `portable.flag` beside `NOVA.exe` and stores NOVA files/settings/Trash/security staging below `Data/`.
 
-- Native desktop window with NOVA launcher, sidebar, app tiles and taskbar.
-- Files app scoped to `Data/Users/Default` (no access to arbitrary host folders through the Files UI).
-- Text editor for UTF-8 text files up to 2 MiB.
-- Calculator, dark/light settings, and system monitor (CPU, memory, process count).
-- Windows CMD terminal using the current signed-in Windows user's permissions.
-- Terminal `cd` state persists between one-shot `cmd.exe /C` invocations. `cd`, `cd /d`, `cd..`, and `cd\` are handled by NOVA.
-- Wi-Fi commands: `wifi`, `wifi -h`, `wifi connect "SSID" [password]`, `wifi select "SSID"`, `password <password>`, `password delete`, `exit`.
-- Settings and user files stored beside the executable in portable mode.
+On a compatible Windows 10/11 x64 machine, open the USB in File Explorer and double-click `NOVA.exe`. The target machine does not need Node.js, npm, Rust, Cargo, WebView2, a NOVA installer or administrator elevation. It still requires Windows system components and a compatible graphics driver for the Glow/OpenGL renderer. Windows intentionally does not auto-run arbitrary programs just because a USB drive is inserted.
 
-## Important distinctions
+## Built-in apps
 
-- **Build machine:** compiling this Rust project requires Rust/Cargo and Microsoft C++ Build Tools for the MSVC target. Those are development tools only.
-- **Target machine:** the built portable package does not require Rust, Cargo, Node.js, npm, WebView2, or an installer.
-- **One EXE:** `NOVA.exe` is the only application executable. `portable.flag` and `Data/` are sidecar files/folders that let the EXE detect portable mode and persist user data. Keep them together.
-- **Windows tools:** CMD and Wi-Fi commands invoke `cmd.exe` and `netsh.exe` internally; users do not need to download these tools because they are supplied by supported Windows installations.
-- **Not a kernel:** NOVA is a desktop environment running on Windows, not a separate OS kernel or bootable Live USB. Its built-in app windows are panels inside the main NOVA window in this first native version.
+| App | Behavior |
+|---|---|
+| Files | Browse `Data/Users/Default`; create folders; select, open as text, and move items into NOVA Trash; inspect a selected file in Windows Sandbox |
+| Editor | Unicode text editor; UTF-8 and UTF-16 LE/BE input; UTF-8 output; 2 MiB per-file limit |
+| Calculator | Basic addition, subtraction, multiplication and division |
+| System Monitor | Host CPU usage, memory and process count; refresh while visible |
+| Terminal | Real Windows CMD with signed-in user's permissions; UTF-8 code page request; NOVA Wi-Fi commands |
+| Settings | Dark/light theme, accent color, reduced-motion option, shortcuts to UniKey and Security Center |
+| NOVA Trash | Restore or permanently remove items deleted through NOVA Files |
+| Google Chrome | Open an existing Chrome install in Windows Sandbox (recommended) or, after confirmation, on the host |
+| UniKey | Optional official signed Vietnamese input companion, downloaded to USB on demand |
+| Security Center | Shows Sandbox availability, isolation limits, staged sample count and cleanup |
 
-## Build locally on Windows
+## Important security boundaries
 
-Requirements on the *developer/build computer*:
+- **NOVA itself is not a VM or a security boundary.** It is an ordinary Windows process running as the current user. A vulnerability in NOVA, Windows, a driver, firmware or the hypervisor could still affect the host.
+- **Inspect in Sandbox:** NOVA copies one selected file into `Data/Security/Quarantine/<session>/`, maps only that folder read-only, disables networking, vGPU and clipboard, and opens Explorer. The sample is not auto-executed; the user manually chooses what to open inside the Sandbox. The original workspace file is not modified.
+- **Isolated Chrome:** the existing Chrome application directory is mapped read-only. A new profile is created inside Windows Sandbox; cookies, cache, extensions and downloads stay in the disposable VM. Networking is enabled for browsing and can expose the Sandbox to local-network services. Clipboard and writable host mappings are disabled.
+- Close Windows Sandbox and confirm deletion to discard the VM's software, files and state. NOVA's staged sample copy and `.wsb` config remain on the USB until you close all Sandbox sessions and clear them in Security Center.
+- Windows Sandbox is supported on Windows Pro, Enterprise and Education, not Windows Home. It also requires hardware virtualization, compatible Windows build and sufficient RAM/CPU/disk. NOVA fails closed when Sandbox is unavailable; it does not fall back to running a suspicious file on the host.
+- **Terminal/CMD, normal host Chrome, UniKey, Wi-Fi and ordinary NOVA file operations are not sandboxed.** CMD commands can change the real host. UniKey is a separate host process and can receive keyboard input system-wide.
+- UniKey is downloaded from `unikey.org`; NOVA checks a valid Authenticode signature and the expected publisher before launch. A valid signature is a provenance check, not a guarantee that software is vulnerability-free. Chrome host and Sandbox launch also reject executables without a valid Google publisher signature.
+- Wi-Fi setup imports a profile into the real Windows user account. Its XML password file exists briefly in host TEMP with a protected DACL for the owner, SYSTEM and local Administrators; a same-user malicious process is still outside NOVA's protection.
+- NOVA does not automatically sandbox every download made by Windows, host Chrome, CMD or another host application. Only the explicit isolated browser and file-inspection routes use Windows Sandbox.
+- Isolated Chrome has networking enabled; do not treat it as an offline malware-analysis environment. For unknown executable files, use **Inspect in Sandbox**, which disables networking.
+- Keep Windows and Microsoft Defender up to date. No sandbox can promise protection against every future hypervisor or OS vulnerability.
 
-1. Rust 1.95.0 (the project toolchain is pinned in `rust-toolchain.toml`).
-2. Microsoft C++ Build Tools / Visual Studio Build Tools with MSVC and Windows SDK.
-3. Internet access for the first Cargo dependency download.
+## Build
 
-Node.js, npm and WebView2 are not used by this project.
+Build computer requirements: Rust 1.95.0, Microsoft C++ Build Tools/MSVC and Windows SDK, plus internet access for dependencies on first build. Run `BUILD_NOVA.bat` or `scripts/build-portable.ps1` on Windows. They run tests, build `NOVA.exe`, create a portable folder, ZIP and SHA256. The target USB PC does not need developer tools.
 
-Open this folder in Windows and run:
+GitHub Actions uses `.github/workflows/rust.yml` on `windows-latest`, runs `cargo test --locked`, builds Release and uploads `NOVA-OS-Native-v0.5.0-USB`. The workflow generates or refreshes `Cargo.lock` when the root package version changes; the GitHub Actions token must be allowed to write `contents` for that lockfile commit.
 
-```powershell
-.\BUILD_NOVA.bat
-```
-
-Or in PowerShell:
-
-```powershell
-.\scripts\build-portable.ps1
-```
-
-The source archive does not include a generated `Cargo.lock` because this packaging environment has no Cargo toolchain. On the first GitHub Actions run, the workflow generates `Cargo.lock` and commits it to the selected branch using the workflow token; therefore the repository must allow Actions `contents: write` and must not block the bot commit with branch protection. After that, CI and local builds use `--locked`. The local build script generates a lockfile if one is missing.
-
-The build script creates:
-
-```text
-release/
-├── NOVA-Portable/
-│   ├── NOVA.exe
-│   ├── portable.flag
-│   ├── README_PORTABLE.txt
-│   ├── Data/
-│   │   ├── Users/Default/Desktop/
-│   │   ├── Users/Default/Documents/
-│   │   ├── Users/Default/Downloads/
-│   │   ├── Settings/
-│   │   └── Logs/
-│   └── Backup/
-├── NOVA-OS-Native-v0.3.5-USB.zip
-└── NOVA-OS-Native-v0.3.5-USB.zip.sha256
-```
-
-Copy the whole `NOVA-Portable` folder to the USB. Do not copy only `NOVA.exe`, because portable mode and saved data require the sidecar files/folders.
-
-## Build without installing Rust on your own computer
-
-This repository includes `.github/workflows/windows-build.yml`. Upload the source repository to GitHub, open **Actions → Build NOVA Native for Windows → Run workflow**, and download the generated artifact. GitHub's Windows runner runs unit tests, builds the EXE and uploads the prepared USB folder as a downloadable ZIP artifact. The computer that runs NOVA still needs no developer tools. Follow [BUILD_WITH_GITHUB.md](BUILD_WITH_GITHUB.md) for step-by-step instructions.
-
-## Wi-Fi commands
+## Source layout
 
 ```text
-wifi
-wifi -h
-wifi connect "Home WiFi" "your-password"
-wifi connect "Open Guest Network"
-wifi select "Home WiFi"
-<wifi-Home WiFi>: password "your password"
-<wifi-Home WiFi>: password delete
-<wifi-Home WiFi>: exit
+src/app.rs              Desktop shell and in-shell applications
+src/apps.rs             Host Chrome detection, URL validation and launcher
+src/isolation.rs        Windows Sandbox config, read-only staging and cleanup
+src/storage.rs          Portable paths, settings, validation and atomic JSON writes
+src/terminal.rs         CMD/Wi-Fi command parsing and background task model
+src/trash.rs            Portable NOVA Trash and restore operations
+src/unicode.rs          UTF-8 / UTF-16 text decoding
+src/unikey.rs           Official UniKey discovery, signature validation and launcher
+src/wifi.rs             Windows WLAN profile operations and protected TEMP XML
+src/windows_process.rs  Windows Job Object, process timeout and bounded output
+scripts/Download-UniKey.ps1  Official UniKey download and Authenticode verification
+.github/workflows/      Windows CI build and packaging
+.cargo/                 Windows static CRT target flags
+docs/                   Architecture, security, research and roadmap
 ```
 
-Both `wifi ...` and `/wifi ...` are accepted. SSIDs containing spaces must be quoted. `password` input in Wi-Fi setup mode and the direct `wifi connect` input are masked in the terminal UI.
+## Documentation
 
-The initial implementation supports open networks and WPA2-Personal (AES), using printable ASCII passphrases or a 64-character hexadecimal key. WPA3-only, Enterprise/802.1X, captive portal login, hidden-network setup, and advanced adapter selection are not implemented. A scan result does not guarantee the adapter can connect.
+- [Vietnamese guide](HUONG_DAN_VI.md)
+- [Portable USB guide](README_PORTABLE.txt)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Security boundary and threat model](docs/SECURITY_0.5.0.md)
+- [Research references](docs/RESEARCH_REFERENCES_0.5.0.md)
+- [Release notes](RELEASE_NOTES_0.5.0.md)
 
-**Credential detail:** NOVA does not save Wi-Fi passwords in its own Data folder, settings or terminal history. To import a Windows WLAN profile via `netsh`, a short-lived XML file containing the password is created in the current user's TEMP folder. Its protected DACL grants access to the file owner, SYSTEM and local Administrators. NOVA closes its writer before invoking `netsh` to avoid Windows file-sharing conflicts, then deletes the file after the import process exits. If NOVA crashes, the file may remain temporarily, but its DACL still restricts access; a later NOVA startup removes matching abandoned profile files older than 10 minutes. The XML remains plaintext while it exists, and local SYSTEM/Administrators are trusted. Windows then stores/manages its WLAN profile. NOVA records only SSID names of profiles it created, so `password delete` refuses to delete profiles it does not manage. The Windows profile itself may persist after USB removal until deleted.
+## Validation status
 
-## CMD safety
-
-The Terminal is a real Windows command shell, not a sandbox. It runs as the currently signed-in Windows user and is not automatically elevated. Commands such as `del`, `format`, `diskpart`, `shutdown`, and scripts can affect the actual computer. Run only commands you understand. Each command is a one-shot process; working directory is preserved, but interactive shells and environment-variable changes do not persist. CMD and WLAN operations execute on a background worker, so the NOVA UI remains responsive. A child is created suspended, assigned to a Windows Job Object, and only then resumed; NOVA does not enable breakaway. If Windows refuses job assignment, the command is not resumed. The job is configured to terminate remaining processes on close, and timeout also explicitly terminates the job. Captured output is limited to 1 MiB per stream while pipes continue to be drained, with truncation reported. Terminal history is bounded to 1,500 lines and 4 MiB.
-
-## Portability and performance notes
-
-- The MSVC C runtime is statically linked through `.cargo/config.toml` to avoid a separate Visual C++ runtime dependency in the target package.
-- The release profile uses size optimization, LTO, one codegen unit and symbol stripping.
-- Glow uses the system OpenGL implementation/driver; Windows' `opengl32.dll` is a system component, but a compatible graphics driver is still needed.
-- No benchmark numbers are claimed yet. Measure cold launch, warm launch, idle RAM/CPU, and USB read latency on real Windows computers before publishing a performance target. System Monitor is lazy-started: NOVA does not scan the process list until that window is opened.
-- The executable is not code-signed in this source package. Windows SmartScreen or antivirus may warn about an unfamiliar binary; a public release should use an Authenticode code-signing certificate.
-- Do not remove the USB while NOVA is writing data. Close NOVA and safely eject the drive.
-
-## Tests
-
-Run on a developer machine:
-
-```powershell
-# Only if Cargo.lock is not present yet:
-cargo generate-lockfile
-cargo test --locked --target x86_64-pc-windows-msvc
-cargo build --locked --release --target x86_64-pc-windows-msvc
-```
-
-Then test on at least one Windows 10 and one Windows 11 computer without Rust/Node/WebView2 installed. Test USB persistence, command timeout, CMD behavior, open Wi-Fi and WPA2-Personal Wi-Fi. Do not use a critical network during initial validation.
-
-## Project structure
-
-```text
-src/main.rs          Windows native entry point
-src/app.rs           NOVA desktop UI and built-in apps
-src/storage.rs       Portable/local data paths, settings, Wi-Fi manifest
-src/terminal.rs      CMD terminal and Wi-Fi command parser
-src/wifi.rs          Windows WLAN scan/profile/connect/delete logic
-src/windows_process.rs Windows Job Objects, timeout and bounded process capture
-scripts/             Local Windows build and USB packager
-.github/workflows/   Cloud Windows build workflow
-docs/                Architecture and release notes
-```
-
-## Release notes
-
-See [RELEASE_NOTES_0.3.5.md](RELEASE_NOTES_0.3.5.md) for fixes in this release. CMD and Wi-Fi operations run in the background; a Windows Job Object controls their process trees. The WLAN import XML uses a protected DACL and is removed after import, with stale-file cleanup at startup.
+This package can be structurally checked (TOML/YAML parsing, source invariants, Windows workflow contents, version/manifest checks and ZIP integrity). The packaging environment used here does not have `rustc` or `cargo`, so it cannot claim that Rust compilation or `cargo test` passed. A successful GitHub Actions run on the exact 0.5.0 commit is required before treating the EXE as build-verified. Real Windows tests are still needed for UniKey signing/typing, Sandbox edition and launch behavior, Chrome mapped-folder operation, USB persistence and Windows security boundaries.

@@ -1,8 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod isolation;
+mod apps;
 mod storage;
 mod terminal;
+mod trash;
+mod unicode;
+mod unikey;
 mod wifi;
 mod windows_process;
 
@@ -26,9 +31,10 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([960.0, 620.0])
+            .with_min_inner_size([800.0, 500.0])
             .with_title("NOVA OS"),
         renderer: eframe::Renderer::Glow,
+        system_font_fallback: true,
         ..Default::default()
     };
 

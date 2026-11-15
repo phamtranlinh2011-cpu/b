@@ -1,22 +1,29 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::env;
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
+    pub app_dir: PathBuf,
+    pub data_dir: PathBuf,
+    pub security_dir: PathBuf,
     pub user_dir: PathBuf,
     pub settings_file: PathBuf,
     pub wifi_manifest: PathBuf,
+    pub trash_dir: PathBuf,
     pub portable: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub theme: String,
     pub reduce_motion: bool,
+    pub accent: String,
 }
 
 impl Default for Settings {
@@ -24,6 +31,7 @@ impl Default for Settings {
         Self {
             theme: "dark".to_owned(),
             reduce_motion: false,
+            accent: "blue".to_owned(),
         }
     }
 }
@@ -33,17 +41,66 @@ struct WifiManifest {
     profiles: BTreeSet<String>,
 }
 
+static ATOMIC_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Replace a small JSON file without exposing a partially-written document if
+/// NOVA or Windows is interrupted during the write. The temporary file is
+/// created in the destination directory so the final rename stays on-volume.
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Target file has no parent directory."))?;
+    fs::create_dir_all(parent)?;
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Target file has no file name.")
+    })?;
+    ensure_regular_file_not_reparse(path)?;
+
+    for _ in 0..8 {
+        let sequence = ATOMIC_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut temp_name = std::ffi::OsString::from(".");
+        temp_name.push(file_name);
+        temp_name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
+        let temp_path = parent.join(temp_name);
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&temp_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+
+        let write_result = (|| {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temp_path, path)
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "Could not allocate a unique temporary settings file.",
+    ))
+}
+
 impl AppPaths {
     pub fn discover() -> io::Result<Self> {
         let exe = env::current_exe()?;
         let app_dir = exe
             .parent()
             .map(Path::to_path_buf)
-            .ok_or_else(|| io::Error::other("NOVA.exe has no parent directory"))?;
+            .ok_or_else(|| io::Error::other("NOVA.exe has no parent directory"))?
+            .canonicalize()?;
         let portable = app_dir.join("portable.flag").is_file();
 
+        // Build the data tree one component at a time. create_dir_all follows
+        // Windows junctions/reparse points, which could redirect a USB Data
+        // folder into the host filesystem before later path checks run.
         let data_dir = if portable {
-            app_dir.join("Data")
+            ensure_real_child(&app_dir, "Data")?
         } else {
             let base = env::var_os("LOCALAPPDATA")
                 .filter(|value| !value.is_empty())
@@ -51,36 +108,42 @@ impl AppPaths {
                 .ok_or_else(|| io::Error::new(
                     io::ErrorKind::NotFound,
                     "LOCALAPPDATA is unavailable; refusing to store NOVA data in a temporary folder.",
-                ))?;
-            base.join("NOVA OS").join("Data")
+                ))?
+                .canonicalize()?;
+            let app_data = ensure_real_child(&base, "NOVA OS")?;
+            ensure_real_child(&app_data, "Data")?
         };
 
-        let user_dir = data_dir.join("Users").join("Default");
-        let settings_file = data_dir.join("Settings").join("settings.json");
-        let wifi_manifest = data_dir.join("Settings").join("wifi-profiles.json");
+        let users_dir = ensure_real_child(&data_dir, "Users")?;
+        let user_dir = ensure_real_child(&users_dir, "Default")?;
+        let _desktop = ensure_real_child(&user_dir, "Desktop")?;
+        let _documents = ensure_real_child(&user_dir, "Documents")?;
+        let _downloads = ensure_real_child(&user_dir, "Downloads")?;
+        let settings_dir = ensure_real_child(&data_dir, "Settings")?;
+        let _logs = ensure_real_child(&data_dir, "Logs")?;
+        let trash_dir = ensure_real_child(&data_dir, "Trash")?;
+        let _trash_items = ensure_real_child(&trash_dir, "Items")?;
+        let _trash_meta = ensure_real_child(&trash_dir, "Meta")?;
+        let security_dir = ensure_real_child(&data_dir, "Security")?;
+        let _quarantine = ensure_real_child(&security_dir, "Quarantine")?;
 
-        let directories = vec![
-            data_dir.clone(),
-            user_dir.clone(),
-            user_dir.join("Desktop"),
-            user_dir.join("Documents"),
-            user_dir.join("Downloads"),
-            data_dir.join("Settings"),
-            data_dir.join("Logs"),
-        ];
-        for directory in directories {
-            fs::create_dir_all(directory)?;
-        }
+        let settings_file = settings_dir.join("settings.json");
+        let wifi_manifest = settings_dir.join("wifi-profiles.json");
 
         Ok(Self {
+            app_dir,
+            data_dir,
+            security_dir,
             user_dir,
             settings_file,
             wifi_manifest,
+            trash_dir,
             portable,
         })
     }
 
     pub fn load_settings(&self) -> io::Result<Settings> {
+        ensure_regular_file_not_reparse(&self.settings_file)?;
         let mut settings = match fs::read_to_string(&self.settings_file) {
             Ok(text) => serde_json::from_str::<Settings>(&text).map_err(|error| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("Settings file is invalid: {error}"))
@@ -91,13 +154,16 @@ impl AppPaths {
         if settings.theme != "dark" && settings.theme != "light" {
             settings.theme = "dark".to_owned();
         }
+        if !matches!(settings.accent.as_str(), "blue" | "violet" | "teal" | "rose" | "amber") {
+            settings.accent = "blue".to_owned();
+        }
         Ok(settings)
     }
 
     pub fn save_settings(&self, settings: &Settings) -> io::Result<()> {
-        let json = serde_json::to_string_pretty(settings)
+        let json = serde_json::to_vec_pretty(settings)
             .map_err(|error| io::Error::other(error.to_string()))?;
-        fs::write(&self.settings_file, json)
+        atomic_write(&self.settings_file, &json)
     }
 
     pub fn is_nova_wifi_profile(&self, ssid: &str) -> io::Result<bool> {
@@ -117,6 +183,7 @@ impl AppPaths {
     }
 
     fn read_wifi_manifest(&self) -> io::Result<WifiManifest> {
+        ensure_regular_file_not_reparse(&self.wifi_manifest)?;
         match fs::read_to_string(&self.wifi_manifest) {
             Ok(text) => serde_json::from_str::<WifiManifest>(&text).map_err(|error| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("Wi-Fi profile manifest is invalid: {error}"))
@@ -127,10 +194,126 @@ impl AppPaths {
     }
 
     fn write_wifi_manifest(&self, manifest: &WifiManifest) -> io::Result<()> {
-        let json = serde_json::to_string_pretty(manifest)
+        let json = serde_json::to_vec_pretty(manifest)
             .map_err(|error| io::Error::other(error.to_string()))?;
-        fs::write(&self.wifi_manifest, json)
+        atomic_write(&self.wifi_manifest, &json)
     }
+}
+
+
+/// Refuse to read or replace a settings/manifest file that is redirected by a
+/// symlink or Windows reparse point. A missing file is allowed for first-run.
+fn ensure_regular_file_not_reparse(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !is_link_or_reparse_point(&metadata) => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("NOVA refuses to read or replace a non-regular or redirected file: {}", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Create or open a single direct child directory without following a symlink
+/// or Windows reparse point. The canonical child must remain directly below
+/// the canonical parent; this is used before any portable Data tree is touched.
+pub(crate) fn ensure_real_child(parent: &Path, name: &str) -> io::Result<PathBuf> {
+    if name.is_empty() || name == "." || name == ".." || (name.contains('/') || name.contains('\\')) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid NOVA data folder component."));
+    }
+    let canonical_parent = parent.canonicalize()?;
+    let candidate = canonical_parent.join(name);
+    match fs::symlink_metadata(&candidate) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match fs::create_dir(&candidate) {
+                Ok(()) => {}
+                Err(create_error) if create_error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(create_error) => return Err(create_error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    let metadata = fs::symlink_metadata(&candidate)?;
+    if !metadata.is_dir() || is_link_or_reparse_point(&metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("NOVA data folder '{}' must be a real directory; links and reparse points are blocked.", candidate.display()),
+        ));
+    }
+    let canonical = candidate.canonicalize()?;
+    if canonical.parent() != Some(canonical_parent.as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "NOVA data folder resolves outside its expected parent.",
+        ));
+    }
+    Ok(canonical)
+}
+
+pub(crate) fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Remove a tree without traversing symlinks or Windows reparse points.
+/// Reparse-point directories are removed as links, never enumerated. The walk
+/// is iterative so an adversarially deep directory tree cannot exhaust the
+/// Rust call stack during permanent deletion or quarantine cleanup.
+pub(crate) fn remove_tree_without_following_reparse_points(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if is_link_or_reparse_point(&metadata) {
+        return if metadata.is_dir() { fs::remove_dir(path) } else { fs::remove_file(path) };
+    }
+    if metadata.is_file() {
+        return fs::remove_file(path);
+    }
+    if !metadata.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "Unsupported filesystem object; refusing recursive deletion."));
+    }
+
+    let mut pending = vec![path.to_path_buf()];
+    let mut directories_postorder = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let directory_metadata = fs::symlink_metadata(&directory)?;
+        if is_link_or_reparse_point(&directory_metadata) {
+            if directory_metadata.is_dir() { fs::remove_dir(&directory)?; } else { fs::remove_file(&directory)?; }
+            continue;
+        }
+        if !directory_metadata.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Directory changed type during safe deletion."));
+        }
+        directories_postorder.push(directory.clone());
+        for entry in fs::read_dir(&directory)? {
+            let child = entry?.path();
+            let child_metadata = fs::symlink_metadata(&child)?;
+            if is_link_or_reparse_point(&child_metadata) {
+                if child_metadata.is_dir() { fs::remove_dir(&child)?; } else { fs::remove_file(&child)?; }
+            } else if child_metadata.is_dir() {
+                pending.push(child);
+            } else if child_metadata.is_file() {
+                fs::remove_file(child)?;
+            } else {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "Unsupported nested filesystem object; refusing recursive deletion."));
+            }
+        }
+    }
+    for directory in directories_postorder.into_iter().rev() {
+        fs::remove_dir(directory)?;
+    }
+    Ok(())
 }
 
 /// Resolve a user-provided path inside NOVA's user area only.
@@ -340,20 +523,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn app_data_directory_creation_rejects_symlink_escape_before_writing() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("nova-data-tree-symlink-{}", std::process::id()));
+        let app = base.join("usb");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, app.join("Data")).unwrap();
+        assert!(super::ensure_real_child(&app, "Data").is_err());
+        assert!(!outside.join("Users").exists());
+        let _ = std::fs::remove_file(app.join("Data"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn ensure_real_child_creates_only_directories_below_parent() {
+        let base = std::env::temp_dir().join(format!("nova-safe-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let child = super::ensure_real_child(&base, "Data").unwrap();
+        assert_eq!(child.parent(), Some(base.canonicalize().unwrap().as_path()));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_and_manifest_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("nova-config-symlink-{}", std::process::id()));
+        let settings = base.join("Settings");
+        let external = base.join("outside.json");
+        std::fs::create_dir_all(&settings).unwrap();
+        std::fs::write(&external, r#"{"theme":"light"}"#).unwrap();
+        let paths = super::AppPaths {
+            app_dir: base.clone(),
+            data_dir: base.clone(),
+            security_dir: base.join("Security"),
+            user_dir: base.join("Users/Default"),
+            settings_file: settings.join("settings.json"),
+            wifi_manifest: settings.join("wifi-profiles.json"),
+            trash_dir: base.join("Trash"),
+            portable: true,
+        };
+        symlink(&external, &paths.settings_file).unwrap();
+        assert!(paths.load_settings().is_err());
+        std::fs::remove_file(&paths.settings_file).unwrap();
+        symlink(&external, &paths.wifi_manifest).unwrap();
+        assert!(paths.is_nova_wifi_profile("Home").is_err());
+        assert_eq!(std::fs::read_to_string(&external).unwrap(), r#"{"theme":"light"}"#);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn corrupted_wifi_manifest_is_not_treated_as_empty() {
         let base = std::env::temp_dir().join(format!("nova-manifest-test-{}", std::process::id()));
         let settings = base.join("Settings");
         std::fs::create_dir_all(&settings).unwrap();
         let paths = super::AppPaths {
+            app_dir: base.clone(),
+            data_dir: base.clone(),
+            security_dir: base.join("Security"),
             user_dir: base.join("Users/Default"),
             settings_file: settings.join("settings.json"),
             wifi_manifest: settings.join("wifi-profiles.json"),
+            trash_dir: base.join("Trash"),
             portable: true,
         };
         assert!(!paths.is_nova_wifi_profile("Home WiFi").unwrap());
         std::fs::write(&paths.wifi_manifest, "{ invalid json").unwrap();
         assert!(paths.is_nova_wifi_profile("Home WiFi").is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn settings_are_atomically_replaced_and_old_settings_remain_compatible() {
+        let base = std::env::temp_dir().join(format!("nova-settings-atomic-{}", std::process::id()));
+        let settings_dir = base.join("Settings");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        let paths = super::AppPaths {
+            app_dir: base.clone(),
+            data_dir: base.clone(),
+            security_dir: base.join("Security"),
+            user_dir: base.join("Users/Default"),
+            settings_file: settings_dir.join("settings.json"),
+            wifi_manifest: settings_dir.join("wifi-profiles.json"),
+            trash_dir: base.join("Trash"),
+            portable: true,
+        };
+        // Version 0.3.5 settings did not contain an accent field.
+        std::fs::write(&paths.settings_file, r#"{"theme":"light","reduce_motion":true}"#).unwrap();
+        let loaded = paths.load_settings().unwrap();
+        assert_eq!(loaded.theme, "light");
+        assert!(loaded.reduce_motion);
+        assert_eq!(loaded.accent, "blue");
+
+        let next = super::Settings { theme: "dark".to_owned(), reduce_motion: false, accent: "violet".to_owned() };
+        paths.save_settings(&next).unwrap();
+        assert_eq!(paths.load_settings().unwrap().accent, "violet");
+        assert!(!std::fs::read_dir(&settings_dir).unwrap().any(|entry| {
+            entry.ok().is_some_and(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        }));
         let _ = std::fs::remove_dir_all(base);
     }
 }
