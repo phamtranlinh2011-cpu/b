@@ -475,6 +475,48 @@ mod tests {
         let output = super::run_captured(command, Duration::from_millis(250)).unwrap();
         assert!(output.timed_out);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn job_object_timeout_terminates_descendant_processes() {
+        use std::process::Command;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let powershell = super::system_binary(r"WindowsPowerShell\v1.0\powershell.exe").unwrap();
+        let child_pid_file = std::env::temp_dir().join(format!(
+            "nova-job-child-{}-{}.txt",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let script = r#"$child = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\ping.exe') -ArgumentList @('-n','30','127.0.0.1') -PassThru; [IO.File]::WriteAllText($env:NOVA_CHILD_PID_FILE, [string]$child.Id); Start-Sleep -Seconds 30"#;
+        let mut command = Command::new(powershell);
+        command.args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("NOVA_CHILD_PID_FILE", &child_pid_file);
+
+        let output = super::run_captured(command, Duration::from_secs(8)).unwrap();
+        assert!(output.timed_out, "PowerShell parent should be terminated by the timeout");
+
+        let child_pid = std::fs::read_to_string(&child_pid_file)
+            .expect("PowerShell should have written the child PID before sleeping")
+            .trim()
+            .parse::<u32>()
+            .expect("child PID should be numeric");
+        let _ = std::fs::remove_file(&child_pid_file);
+
+        let mut system = sysinfo::System::new().expect("sysinfo must initialize in the Windows test runner");
+        for _ in 0..10 {
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::All,
+                true,
+                sysinfo::ProcessRefreshKind::nothing(),
+            );
+            if system.process(sysinfo::Pid::from_u32(child_pid)).is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("child process {child_pid} survived termination of its NOVA Job Object");
+    }
 }
 
 #[cfg(not(windows))]

@@ -1,12 +1,15 @@
+[CmdletBinding()]
+param()
+
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
-$Version = '0.5.6'
 $Target = 'x86_64-pc-windows-msvc'
+$RustVersion = '1.95.0'
 
 function Require-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
-        throw "Build tool '$Name' was not found. Use the GitHub Actions workflow if you do not want a local Rust toolchain."
+        throw "Build tool '$Name' was not found. Install Rust $RustVersion and MSVC Build Tools, or use GitHub Actions."
     }
 }
 
@@ -16,35 +19,45 @@ if (-not $IsWindows -and $env:OS -ne 'Windows_NT') {
 Require-Command 'cargo'
 Require-Command 'rustc'
 
-Write-Host '[1/6] Checking pinned Rust toolchain...' -ForegroundColor Cyan
-rustc --version
-cargo --version
+$CargoToml = Get-Content (Join-Path $ProjectRoot 'Cargo.toml') -Raw
+$VersionMatch = [regex]::Match($CargoToml, '(?m)^version\s*=\s*"([^"]+)"')
+if (-not $VersionMatch.Success) { throw 'Could not read the NOVA package version from Cargo.toml.' }
+$Version = $VersionMatch.Groups[1].Value
 
-Write-Host '[2/6] Preparing reproducible dependency lockfile...' -ForegroundColor Cyan
-$LockPath = Join-Path $ProjectRoot 'Cargo.lock'
-$ExpectedVersion = (Select-String -Path (Join-Path $ProjectRoot 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
-$RefreshLock = -not (Test-Path $LockPath)
-if (-not $RefreshLock) {
-    $LockText = Get-Content $LockPath -Raw
-    $RootPackage = [regex]::Match($LockText, '(?ms)^\[\[package\]\]\s+name = "nova-native"\s+version = "([^"]+)"')
-    if (-not $RootPackage.Success -or $RootPackage.Groups[1].Value -ne $ExpectedVersion) { $RefreshLock = $true }
+$DetectedRust = (& rustc --version).Trim()
+if ($LASTEXITCODE -ne 0 -or $DetectedRust -notmatch "^rustc $([regex]::Escape($RustVersion))(?:\s|$)") {
+    throw "NOVA requires rustc $RustVersion. Detected: $DetectedRust"
 }
-if ($RefreshLock) {
-    cargo generate-lockfile
+
+Write-Host '[1/6] Checking pinned Rust toolchain...' -ForegroundColor Cyan
+& rustc --version
+& cargo --version
+
+Write-Host '[2/6] Preparing the dependency lockfile...' -ForegroundColor Cyan
+$LockPath = Join-Path $ProjectRoot 'Cargo.lock'
+if (-not (Test-Path $LockPath)) {
+    Write-Warning 'Cargo.lock is absent. Generating it once on this developer machine. Commit the new Cargo.lock before pushing.'
+    & cargo generate-lockfile
     if ($LASTEXITCODE -ne 0) { throw 'cargo generate-lockfile failed.' }
 }
+$LockText = Get-Content $LockPath -Raw
+$RootPackage = [regex]::Match($LockText, '(?ms)^\[\[package\]\]\s+name = "nova-native"\s+version = "([^"]+)"')
+if (-not $RootPackage.Success -or $RootPackage.Groups[1].Value -ne $Version) {
+    throw "Cargo.lock does not match nova-native $Version. Run scripts/prepare-lockfile.ps1 -Update, then commit Cargo.lock."
+}
+& cargo metadata --locked --format-version 1 --no-deps | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Cargo.lock is invalid or stale. Run scripts/prepare-lockfile.ps1 -Update.' }
 
-Write-Host '[3/6] Running NOVA unit tests...' -ForegroundColor Cyan
-cargo test --locked --target $Target
+Write-Host '[3/6] Running Windows-target unit and integration tests...' -ForegroundColor Cyan
+& cargo test --locked --target $Target
 if ($LASTEXITCODE -ne 0) { throw 'cargo test failed.' }
 
-Write-Host '[4/6] Building NOVA Native (x64 MSVC)...' -ForegroundColor Cyan
-cargo build --locked --release --target $Target
+Write-Host '[4/6] Building NOVA Native (x64 MSVC Release)...' -ForegroundColor Cyan
+& cargo build --locked --release --target $Target
 if ($LASTEXITCODE -ne 0) { throw 'cargo build failed.' }
 
 $BuiltExe = Join-Path $ProjectRoot "target\$Target\release\NOVA.exe"
 if (-not (Test-Path $BuiltExe)) { throw "Expected executable not found: $BuiltExe" }
-if (-not (Test-Path (Join-Path $ProjectRoot 'Cargo.lock'))) { throw 'Cargo.lock is missing.' }
 
 Write-Host '[5/6] Preparing the portable USB folder...' -ForegroundColor Cyan
 $ReleaseDirectory = Join-Path $ProjectRoot 'release'
@@ -65,24 +78,23 @@ foreach ($Folder in $Folders) {
 }
 Copy-Item $BuiltExe (Join-Path $PackageRoot 'NOVA.exe')
 Copy-Item (Join-Path $ProjectRoot 'portable.flag') $PackageRoot
-Copy-Item (Join-Path $ProjectRoot 'README_PORTABLE.txt') $PackageRoot
 New-Item -ItemType Directory -Path (Join-Path $PackageRoot 'scripts') -Force | Out-Null
-Copy-Item (Join-Path $ProjectRoot 'scripts\Download-UniKey.ps1') (Join-Path $PackageRoot 'scripts\Download-UniKey.ps1')
-Copy-Item (Join-Path $ProjectRoot 'Cargo.lock') (Join-Path $PackageRoot 'Cargo.lock.build-reference')
-"NOVA Native $Version`nTarget: $Target`nRust: 1.95.0`nUnicode: UTF-8 editor + system-font fallback + CMD UTF-8 code page`nChrome: host app files read-only in isolated Windows Sandbox`nIsolation: Windows Sandbox required; Windows Home is not supported`nUniKey: optional official signed companion downloaded to USB`nSecurity GUI: Zenmap, Greenbone GSA, OWASP ZAP, Wireshark and Burp are optional external tools; Greenbone requires a separate server; scope acknowledgement is not technical enforcement; local tools run on Windows host" | Set-Content (Join-Path $PackageRoot 'BUILD_INFO.txt')
+Copy-Item (Join-Path $PSScriptRoot 'Download-UniKey.ps1') (Join-Path $PackageRoot 'scripts\Download-UniKey.ps1')
 
-Write-Host '[6/6] Creating ZIP and SHA256...' -ForegroundColor Cyan
-New-Item -ItemType Directory -Path $ReleaseDirectory -Force | Out-Null
-$ZipPath = Join-Path $ReleaseDirectory "NOVA-OS-Native-v$Version-USB.zip"
-if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
-Compress-Archive -Path (Join-Path $PackageRoot '*') -DestinationPath $ZipPath -CompressionLevel Optimal
-$Checksum = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
-Set-Content -Path ($ZipPath + '.sha256') -Value "$Checksum  $(Split-Path -Leaf $ZipPath)" -Encoding ASCII
+@"
+NOVA Native $Version - QUICK START
 
-Write-Host ''
-Write-Host '[SUCCESS] NOVA Native package created.' -ForegroundColor Green
-Write-Host "EXE: $PackageRoot\NOVA.exe" -ForegroundColor Green
-Write-Host "USB folder: $PackageRoot" -ForegroundColor Green
-Write-Host "ZIP: $ZipPath" -ForegroundColor Green
-Write-Host "SHA256: $($ZipPath).sha256" -ForegroundColor Green
-Write-Host 'Copy the complete package folder to a USB drive.' -ForegroundColor Green
+1. Keep NOVA.exe, portable.flag, QUICK_START.txt, BUILD_INFO.txt, scripts and Data together on the USB drive.
+2. Open NOVA.exe on Windows 10/11 x64.
+3. Windows Sandbox requires a supported Windows edition with the feature enabled and hardware virtualization available.
+4. NOVA itself runs on the Windows host; only explicitly opened Sandbox tasks are isolated.
+5. Close NOVA and all Windows Sandbox windows before safely removing the USB drive.
+6. Data, settings, Trash and staged files are stored below Data/ in portable mode.
+
+Inspect the security boundaries and optional third-party tool requirements in README.md and HUONG_DAN_VI.md in the source repository.
+"@ | Set-Content (Join-Path $PackageRoot 'QUICK_START.txt') -Encoding UTF8
+
+Write-Host '[6/6] Finalizing build metadata, checksums and portable ZIP...' -ForegroundColor Cyan
+& (Join-Path $PSScriptRoot 'finalize-portable.ps1') -PackageDirectory $PackageRoot
+if (-not $?) { throw 'Portable package finalization failed.' }
+Write-Host '[SUCCESS] Unsigned portable package created. Trusted release signing, when configured, runs in a separate post-build step.' -ForegroundColor Green

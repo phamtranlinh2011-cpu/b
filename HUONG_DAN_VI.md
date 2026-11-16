@@ -1,4 +1,4 @@
-# NOVA Native 0.5.6 — Hướng dẫn tiếng Việt
+# NOVA Native 0.5.7 — Hướng dẫn tiếng Việt
 
 ## Security Center và 5 công cụ GUI (0.5.1)
 
@@ -9,8 +9,8 @@ Trong Security Center, nhập phạm vi tài sản được phép và xác nhậ
 
 ## 1. Chạy NOVA từ USB
 
-1. Giải nén gói `NOVA-OS-Native-v0.5.6-source.zip` để build, hoặc giải nén artifact `NOVA-OS-Native-v0.5.6-USB` sau khi GitHub Actions build thành công.
-2. Giữ `NOVA.exe`, `portable.flag`, `README_PORTABLE.txt`, thư mục `scripts` và `Data` cùng một thư mục.
+1. Giải nén gói `NOVA-OS-Native-v0.5.7-Stability-Security.zip` để build, hoặc giải nén artifact `NOVA-OS-Native-v0.5.7-USB` sau khi GitHub Actions build thành công.
+2. Giữ `NOVA.exe`, `portable.flag`, `QUICK_START.txt`, thư mục `scripts` và `Data` cùng một thư mục.
 3. Cắm USB vào Windows 10/11 x64 và mở `NOVA.exe`.
 4. Máy đích không cần Rust, Cargo, Node.js, npm hay WebView2. Máy vẫn cần driver đồ họa tương thích.
 5. Đóng NOVA và đóng các cửa sổ Windows Sandbox trước khi rút USB an toàn.
@@ -65,18 +65,35 @@ Tệp gốc trong thư mục NOVA không bị sửa hoặc xóa. Bản sao tạm
 
 Không có phần mềm nào đảm bảo tuyệt đối trước mọi lỗ hổng Windows, hypervisor, firmware hoặc driver trong tương lai. Giữ Windows và Microsoft Defender luôn cập nhật.
 
-## 6. Build bằng GitHub Actions
+## 6. Build và dependency lockfile
 
-Xem `BUILD_WITH_GITHUB.md`. Workflow `.github/workflows/rust.yml` chạy trên `windows-latest`, tạo/refresh `Cargo.lock` khi phiên bản crate gốc thay đổi, chạy `cargo test --locked`, build Release và tạo artifact `NOVA-OS-Native-v0.5.6-USB`.
+Máy build cần Rust 1.95.0, Microsoft C++ Build Tools/MSVC, Windows SDK và Internet để tải dependency ở lần đầu.
 
-## 7. Tài liệu
+1. Mở PowerShell tại thư mục source.
+2. Chạy `powershell -ExecutionPolicy Bypass -File scripts/prepare-lockfile.ps1` để tạo và xác minh `Cargo.lock` nếu đây là lần đầu.
+3. Commit `Cargo.lock` vào Git cùng source. CI không tự push hoặc cập nhật lockfile thay bạn.
+4. Khi chủ động nâng cấp dependency, chạy `scripts/prepare-lockfile.ps1 -Update`, xem kỹ diff rồi commit.
+5. Chạy `BUILD_NOVA.bat` để test, build và đóng gói USB.
 
-- `README_PORTABLE.txt`: hướng dẫn bản portable trên USB.
-- `docs/ARCHITECTURE.md`: kiến trúc.
-- `docs/SECURITY_0.5.0.md`: ranh giới bảo mật nền tảng và threat model.
-- `docs/RESEARCH_REFERENCES_0.5.0.md`: tài liệu tham khảo cho nền tảng portable, Unicode và Sandbox.
-- `RELEASE_NOTES_0.5.6.md`: các sửa đổi kiểm tra source mới nhất.
-- `RELEASE_NOTES_0.5.5.md`: cải tiến giao diện.
-- `RELEASE_NOTES_0.5.2.md`: ghi chú giao diện desktop ban đầu.
-- `docs/SECURITY_GUI_TOOLS_0.5.1.md`: phạm vi và giới hạn bảo mật của 5 công cụ GUI.
-- `docs/RESEARCH_REFERENCES_0.5.1.md`: tài liệu gốc cho Security Center và 5 GUI workspace.
+GitHub Actions chạy trên `windows-latest` khi push, pull request hoặc chạy thủ công. Pipeline kiểm tra lockfile, Clippy, test Windows và build Release. Repository permission chỉ đọc; nếu thiếu `Cargo.lock`, CI sẽ dừng và chỉ rõ cách tạo file.
+
+### Ký số EXE (tùy chọn)
+
+Chỉ bước ký số riêng sau khi Cargo build/test hoàn tất trên workflow push lên nhánh `main` mới nhận hai GitHub Secrets `NOVA_SIGN_CERT_BASE64` và `NOVA_SIGN_CERT_PASSWORD`. Cargo và build script của dependency không nhận hai secret này. Pull request và chạy thủ công luôn build unsigned để tránh đưa chứng thư cho mã chưa tin cậy. Secret thứ nhất là PFX code-signing được mã hóa Base64; secret thứ hai là mật khẩu PFX. Không đưa PFX hoặc mật khẩu vào source. Nếu thiếu hai secret, EXE không có chữ ký Authenticode nhưng vẫn có checksum SHA-256.
+
+Sau khi ký EXE thủ công, chạy `scripts/finalize-portable.ps1` để cập nhật BUILD_INFO, checksum và ZIP.
+
+## 7. Đo CPU/RAM
+
+Chạy NOVA trên Windows, mở PowerShell và chạy:
+
+`powershell -ExecutionPolicy Bypass -File scripts/measure-performance.ps1 -DurationSeconds 120`
+
+Script ghi một mẫu mỗi giây vào CSV: CPU đã chuẩn hóa theo tổng số logical CPU của máy, working set, private memory, handles và threads. Kết quả nằm trong `perf-results/`. Để đo khi có nhiều tiến trình NOVA, truyền thêm `-ProcessId <PID>`. Nên đo riêng lúc idle, lúc mở System Monitor và lúc mở nhiều workspace.
+
+## 8. Tài liệu
+
+- `README.md`: tổng quan dự án, cấu trúc và trạng thái kiểm thử.
+- `RELEASE_NOTES_0.5.7.md`: thay đổi của bản hiện tại.
+- `SECURITY.md`: ranh giới bảo mật và cách báo cáo lỗ hổng riêng tư.
+- `QUICK_START.txt`: hướng dẫn nhanh được tạo tự động trong gói USB.

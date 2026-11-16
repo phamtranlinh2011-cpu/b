@@ -581,6 +581,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_junctions_are_rejected_and_safe_delete_never_follows_them() {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let base = std::env::temp_dir().join(format!("nova-junction-test-{}-{nonce}", std::process::id()));
+        let root = base.join("root");
+        let outside = base.join("outside");
+        let junction = root.join("redirected-data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), "must survive").unwrap();
+
+        let output = Command::new(crate::windows_process::system_binary("cmd.exe").unwrap())
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside)
+            .output()
+            .expect("cmd.exe must be available on Windows");
+        assert!(output.status.success(), "Could not create junction for Windows integration test: {}", String::from_utf8_lossy(&output.stderr));
+
+        assert!(super::ensure_real_child(&root, "redirected-data").is_err());
+        super::remove_tree_without_following_reparse_points(&junction).unwrap();
+        assert!(!junction.exists());
+        assert_eq!(std::fs::read_to_string(outside.join("keep.txt")).unwrap(), "must survive");
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[cfg(unix)]
     #[test]
     fn settings_and_manifest_symlinks_are_rejected() {

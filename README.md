@@ -1,6 +1,6 @@
-## UI update (0.5.6)
+## Current release: 0.5.7 — Stability, Security and Release Pipeline
 
-NOVA now has responsive desktop and Start grids, a searchable List/Grid File Manager with contextual actions and clearer empty states, Settings pages for Appearance/System/Apps/Network/Security/About, System theme following Windows, a Quick Settings / recent-activity panel, keyboard shortcuts, persistent Start pin/unpin controls, a horizontally scrollable taskbar for all supported workspaces, taskbar app context menus and left/right snap layouts for supported workspaces. Windows remain draggable/resizable with egui's native in-app window behavior. See `RELEASE_NOTES_0.5.6.md`.
+NOVA now has responsive desktop and Start grids, a searchable List/Grid File Manager with contextual actions and clearer empty states, Settings pages for Appearance/System/Apps/Network/Security/About, System theme following Windows, a Quick Settings / recent-activity panel, keyboard shortcuts, persistent Start pin/unpin controls, a horizontally scrollable taskbar for all supported workspaces, taskbar app context menus and left/right snap layouts for supported workspaces. Windows remain draggable/resizable with egui's native in-app window behavior. See `RELEASE_NOTES_0.5.7.md` for the current release summary. The Windows UI refresh itself remains the 0.5.6 feature set.
 
 ## 0.5.2 — Windows-style desktop refresh
 
@@ -31,7 +31,7 @@ NOVA now has responsive desktop and Start grids, a searchable List/Grid File Man
 
 ## Portable runtime
 
-The intended USB package contains `NOVA.exe`, `portable.flag`, `README_PORTABLE.txt`, `BUILD_INFO.txt`, `scripts/Download-UniKey.ps1` (source of the helper embedded into NOVA.exe), and a `Data/` folder. Keep them together. The app checks for `portable.flag` beside `NOVA.exe` and stores NOVA files/settings/Trash/security staging below `Data/`.
+The intended USB package contains `NOVA.exe`, `portable.flag`, `QUICK_START.txt`, `BUILD_INFO.txt`, `scripts/Download-UniKey.ps1` (source of the helper embedded into NOVA.exe), and a `Data/` folder. Keep them together. The app checks for `portable.flag` beside `NOVA.exe` and stores NOVA files/settings/Trash/security staging below `Data/`.
 
 On a compatible Windows 10/11 x64 machine, open the USB in File Explorer and double-click `NOVA.exe`. The target machine does not need Node.js, npm, Rust, Cargo, WebView2, a NOVA installer or administrator elevation. It still requires Windows system components and a compatible graphics driver for the Glow/OpenGL renderer. Windows intentionally does not auto-run arbitrary programs just because a USB drive is inserted.
 
@@ -71,9 +71,17 @@ On a compatible Windows 10/11 x64 machine, open the USB in File Explorer and dou
 
 ## Build
 
-Build computer requirements: Rust 1.95.0, Microsoft C++ Build Tools/MSVC and Windows SDK, plus internet access for dependencies on first build. Run `BUILD_NOVA.bat` or `scripts/build-portable.ps1` on Windows. They run tests, build `NOVA.exe`, create a portable folder, ZIP and SHA256. The target USB PC does not need developer tools.
+Build computer requirements: Rust 1.95.0, Microsoft C++ Build Tools/MSVC and Windows SDK, plus internet access for dependencies on first build. On a fresh checkout, run `powershell -ExecutionPolicy Bypass -File scripts/prepare-lockfile.ps1` once and commit the generated `Cargo.lock`. When deliberately updating the dependency graph, run `scripts/prepare-lockfile.ps1 -Update` and review the lockfile diff. Then run `BUILD_NOVA.bat` or `scripts/build-portable.ps1` on Windows. The build script tests and compiles `NOVA.exe`, creates the portable folder and writes build metadata plus SHA-256 checksums. It deliberately builds unsigned; signing is a separate post-build step so PFX secrets never enter Cargo or dependency build scripts. `scripts/finalize-portable.ps1` refreshes metadata and the ZIP after a signature is applied. The target USB PC does not need developer tools.
 
-GitHub Actions uses `.github/workflows/rust.yml` on `windows-latest`, runs `cargo test --locked`, builds Release and uploads `NOVA-OS-Native-v0.5.6-USB`. The workflow generates or refreshes `Cargo.lock` when the root package version changes; the GitHub Actions token must be allowed to write `contents` for that lockfile commit.
+GitHub Actions uses `.github/workflows/rust.yml` on `windows-latest` for pushes, pull requests and manual dispatch. It validates the committed lockfile, runs Clippy and Windows-target tests, builds Release and uploads the USB folder, ZIP and checksum. It has read-only repository permissions and does not modify the branch. Code-signing secrets are exposed only to a dedicated post-build signing step on a push to `main`; the Cargo build and dependency build scripts never receive them. Pull requests and manual runs build unsigned packages. For signed main-branch releases, configure `NOVA_SIGN_CERT_BASE64` (base64-encoded code-signing PFX) and `NOVA_SIGN_CERT_PASSWORD`; without both secrets, the EXE is intentionally unsigned.
+
+## Performance sampling
+
+Run NOVA on a Windows machine, then in PowerShell execute `powershell -ExecutionPolicy Bypass -File scripts/measure-performance.ps1 -DurationSeconds 120`. The script records whole-machine-normalized CPU usage, working set, private memory, handles and thread count once per second to `perf-results/*.csv`. For multiple NOVA instances, pass `-ProcessId`. Compare an idle sample, a sample with System Monitor open and a sample with several workspaces open; do not treat one machine's numbers as universal limits.
+
+## Security policy
+
+Read `SECURITY.md` for the host/Sandbox threat boundaries, release integrity checks and private vulnerability-reporting guidance.
 
 ## Source layout
 
@@ -90,27 +98,21 @@ src/unikey.rs           Official UniKey discovery, signature validation and laun
 src/wifi.rs             Windows WLAN profile operations and protected TEMP XML
 src/windows_process.rs  Windows Job Object, process timeout and bounded output
 scripts/Download-UniKey.ps1  Official UniKey download and Authenticode verification
-.github/workflows/      Windows CI build and packaging
+scripts/prepare-lockfile.ps1  Controlled Cargo.lock generation/verification
+scripts/sign-executable.ps1   Optional post-build PFX-based Authenticode signing
+scripts/finalize-portable.ps1  Build provenance, lock hash, checksums and ZIP finalizer
+scripts/measure-performance.ps1  Windows CPU/RAM/handle/thread sampler
+.github/workflows/      Windows CI, tests, dependency lock checks and packaging
+.github/dependabot.yml  Weekly Cargo and Actions update PRs
 .cargo/                 Windows static CRT target flags
-docs/                   Architecture, security, research and roadmap
 ```
 
 ## Documentation
 
-- [Vietnamese guide](HUONG_DAN_VI.md)
-- [Portable USB guide](README_PORTABLE.txt)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Security boundary and threat model](docs/SECURITY_0.5.0.md)
-- [Research references](docs/RESEARCH_REFERENCES_0.5.0.md)
-- [Release notes](RELEASE_NOTES_0.5.0.md)
-- [0.5.1 Security Center and GUI tool references](docs/RESEARCH_REFERENCES_0.5.1.md)
-- [0.5.1 GUI tool integration and security boundary](docs/SECURITY_GUI_TOOLS_0.5.1.md)
-- [0.5.1 release notes](RELEASE_NOTES_0.5.1.md)
-- [0.5.2 Windows-style desktop refresh](RELEASE_NOTES_0.5.2.md)
-- [0.5.2 UI research references](docs/RESEARCH_REFERENCES_0.5.2.md)
-- [0.5.5 UI Polish](RELEASE_NOTES_0.5.5.md)
-- [0.5.6 audit fixes](RELEASE_NOTES_0.5.6.md)
+- [Vietnamese user guide](HUONG_DAN_VI.md)
+- [Current release notes](RELEASE_NOTES_0.5.7.md)
+- [Security policy](SECURITY.md)
 
 ## Validation status
 
-This package can be structurally checked (TOML/YAML parsing, source invariants, Windows workflow contents, version/manifest checks and ZIP integrity). The packaging environment used here does not have `rustc` or `cargo`, so it cannot claim that Rust compilation or `cargo test` passed. A successful GitHub Actions run on the exact 0.5.6 commit is required before treating the EXE as build-verified. Real Windows tests are still needed for UniKey signing/typing, Sandbox edition and launch behavior, Chrome mapped-folder operation, USB persistence and Windows security boundaries.
+The Windows CI workflow is the authoritative compile/test gate for this project. It requires a committed `Cargo.lock`, runs Clippy and the Windows-target test suite (including junction/reparse-point and Job Object descendant-process tests), and only then packages the executable. The editing environment for this source update has no `rustc`, `cargo`, PowerShell or Windows runtime, and cannot reach the Rust distribution servers. Therefore this source archive has only received static TOML/YAML, path-reference, version and ZIP checks here; no compile, Clippy, Rust unit test, Windows integration test, EXE signing or runtime performance result is claimed. Run the lockfile preparation script on Windows and review the GitHub Actions result for the exact commit before treating the EXE as build-verified.
