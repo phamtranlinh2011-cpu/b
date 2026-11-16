@@ -912,7 +912,7 @@ impl NovaApp {
             if response.hovered() { 1.0 } else { 0.0 }
         } else {
             ui.ctx().animate_bool_with_time(
-                ui.id().with(("app-shortcut-hover", app.name)),
+                ui.scope_id().with(("app-shortcut-hover", app.name)),
                 response.hovered(),
                 0.12,
             )
@@ -936,7 +936,7 @@ impl NovaApp {
                 egui::StrokeKind::Inside,
             );
         }
-        let icon_size = if desktop { 31.0 } else { 27.0 };
+        let icon_size: f32 = if desktop { 31.0 } else { 27.0 };
         let text_color = if dark { Color32::from_rgb(238, 243, 252) } else { Color32::from_rgb(35, 45, 63) };
         let icon_color = if dark { Color32::from_rgb(225, 234, 252) } else { Color32::from_rgb(45, 66, 100) };
         let cache_key = (app.icon, icon_size.to_bits(), ui.ctx().pixels_per_point().to_bits(), dark);
@@ -944,7 +944,7 @@ impl NovaApp {
             std::sync::Arc::clone(cached)
         } else {
             let galley = ui.painter().layout_no_wrap(
-                app.icon,
+                app.icon.to_owned(),
                 FontId::proportional(icon_size),
                 icon_color,
             );
@@ -1120,7 +1120,7 @@ impl NovaApp {
         if !self.notification_open { return; }
         let dark = self.is_dark_mode(ctx);
         let fill = if dark { Color32::from_rgb(25, 32, 49) } else { Color32::from_rgb(249, 251, 255) };
-        egui::Area::new(egui::Id::new("nova-quick-settings-panel"))
+        egui::Area::new(egui::Id::unique("nova-quick-settings-panel"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -66.0))
             .show(ctx, |ui| {
@@ -1160,7 +1160,7 @@ impl NovaApp {
         let visibility = if self.settings.reduce_motion {
             if self.start_open { 1.0 } else { 0.0 }
         } else {
-            ctx.animate_bool_with_time(egui::Id::new("nova-windows-start-menu"), self.start_open, 0.20)
+            ctx.animate_bool_with_time(egui::Id::unique("nova-windows-start-menu"), self.start_open, 0.20)
         };
         if visibility <= 0.001 {
             return;
@@ -1183,7 +1183,7 @@ impl NovaApp {
         };
         let border = if dark { Color32::from_white_alpha(30) } else { Color32::from_black_alpha(22) };
 
-        egui::Area::new(egui::Id::new("nova-start-menu-panel"))
+        egui::Area::new(egui::Id::unique("nova-start-menu-panel"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -66.0 + slide_up))
             .fade_in(!self.settings.reduce_motion)
@@ -1296,7 +1296,7 @@ impl NovaApp {
                                 let quick = ["Files", "Terminal", "Settings"];
                                 ui.horizontal(|ui| {
                                     for name in quick {
-                                        if let Some(app) = START_APPS.iter().find(|app| app.name == name.as_str()).copied() {
+                                        if let Some(app) = START_APPS.iter().find(|app| app.name == name).copied() {
                                             if ui.add_sized([menu_width / 3.0 - 34.0, 43.0], egui::Button::new(format!("{}  {}\n      {}", app.icon, app.name, app.description)).corner_radius(egui::CornerRadius::same(9))).clicked() {
                                                 selected_app = Some(app.name);
                                             }
@@ -2251,7 +2251,7 @@ impl eframe::App for NovaApp {
                                     .spacing(egui::vec2(5.0, 6.0))
                                     .show(ui, |ui| {
                                         for (index, name) in desktop_apps.iter().enumerate() {
-                                            if let Some(app) = START_APPS.iter().find(|app| app.name == *name).copied() {
+                                            if let Some(app) = START_APPS.iter().find(|app| app.name == name).copied() {
                                                 if self.app_icon_button(ui, app, egui::vec2(94.0, 88.0), true) {
                                                     self.open_app(app.name);
                                                 }

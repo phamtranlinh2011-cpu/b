@@ -742,9 +742,16 @@ mod tests {
         assert!(loaded.reduce_motion);
         assert_eq!(loaded.accent, "blue");
 
-        let next = super::Settings { theme: "dark".to_owned(), reduce_motion: false, accent: "violet".to_owned() };
+        let next = super::Settings {
+            theme: "dark".to_owned(),
+            reduce_motion: false,
+            accent: "violet".to_owned(),
+            pinned_apps: vec!["Files".to_owned(), "Terminal".to_owned()],
+        };
         paths.save_settings(&next).unwrap();
-        assert_eq!(paths.load_settings().unwrap().accent, "violet");
+        let saved = paths.load_settings().unwrap();
+        assert_eq!(saved.accent, "violet");
+        assert_eq!(saved.pinned_apps, vec!["Files".to_owned(), "Terminal".to_owned()]);
         assert!(!std::fs::read_dir(&settings_dir).unwrap().any(|entry| {
             entry.ok().is_some_and(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
         }));

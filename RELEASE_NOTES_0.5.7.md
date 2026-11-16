@@ -28,3 +28,11 @@
 
 - Removed an obsolete `toolchain` input from the pinned `dtolnay/rust-toolchain` action. This commit pins Rust 1.95.0 internally; the workflow now supplies only supported `targets` and `components` inputs.
 - Rechecked Cargo/TOML and workflow YAML, source delimiters, declared test count and repository file references. These are static checks, not a substitute for `cargo check`, Clippy, or Windows runtime tests.
+
+## Compile fixes from Windows CI feedback
+
+- Replaced deprecated `Ui::id()` with `Ui::scope_id()` and deprecated `egui::Id::new` calls with `egui::Id::unique` while preserving the same stable salts.
+- Explicitly typed the shortcut icon font size as `f32` so `to_bits()` has an unambiguous receiver type.
+- Converted shortcut icon text from `&str` to the owned `String` required by egui 0.37's `Painter::layout_no_wrap`.
+- Compared the quick-access app name directly as `&str`, avoiding the unstable `str::as_str()` API.
+- Added `pinned_apps` to the storage test's `Settings` initializer and asserted that pinned apps survive save/load.
