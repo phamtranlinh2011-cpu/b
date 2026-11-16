@@ -93,3 +93,8 @@
 - Reworked File Manager List rows with explicit bounded name/size columns. Long names are shortened only for display, Unicode characters are not split into bytes, and the full filename remains unchanged on disk.
 - Changed remaining destructive-confirmation, UniKey, Security Center, Calculator and desktop status rows to wrap where practical; Security Center tool cards can now reflow into narrow snapped panes.
 - Added regression tests for Unicode-safe file-name shortening and Start Menu behavior at very small viewport sizes. The source declares 88 Rust tests; execution still requires the Rust 1.95/Windows build environment.
+
+
+## Windows CI follow-up compile fix
+
+- Explicitly typed the responsive Start Menu Quick Access column count as `usize`. This resolves E0689 when calling `saturating_sub` before passing the count to `egui::Grid::num_columns`.

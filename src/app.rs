@@ -1657,7 +1657,7 @@ impl NovaApp {
                                 ui.add_space(5.0);
                                 let quick = ["Files", "Terminal", "Settings"];
                                 let quick_available = ui.available_width().max(1.0);
-                                let quick_columns = if quick_available < 310.0 { 1 } else if quick_available < 470.0 { 2 } else { 3 };
+                                let quick_columns: usize = if quick_available < 310.0 { 1 } else if quick_available < 470.0 { 2 } else { 3 };
                                 let quick_button_width = (quick_available
                                     - (quick_columns.saturating_sub(1) as f32 * 8.0))
                                     / quick_columns as f32;
