@@ -2948,6 +2948,24 @@ fn format_number(value: f64) -> String {
     value.to_string()
 }
 
+fn format_matrix_number(value: f64) -> String {
+    if !value.is_finite() || value == 0.0 || value.abs() > 1.0e12 {
+        return format_number(value);
+    }
+
+    // Gauss-Jordan elimination can produce values such as -1.9999999999999996.
+    // Clean only values within a few ULPs of a 12-decimal display value. Avoid
+    // rounding to zero so genuinely small matrix entries remain visible.
+    const DISPLAY_SCALE: f64 = 1.0e12;
+    let rounded = (value * DISPLAY_SCALE).round() / DISPLAY_SCALE;
+    let tolerance = value.abs().max(1.0) * f64::EPSILON * 2.0;
+    if rounded != 0.0 && (value - rounded).abs() <= tolerance {
+        format_number(rounded)
+    } else {
+        format_number(value)
+    }
+}
+
 fn parse_number_list(input: &str) -> Result<Vec<f64>, String> {
     let values = input.split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
         .filter(|part| !part.trim().is_empty())
@@ -3023,7 +3041,7 @@ fn matrix_inverse(input: &str) -> Result<String, String> {
         for col in 0..n*2 { augmented[pivot][col] /= divisor; }
         for row in 0..n { if row != pivot { let factor=augmented[row][pivot]; for col in 0..n*2 { augmented[row][col] -= factor*augmented[pivot][col]; } } }
     }
-    Ok((0..n).map(|row| (0..n).map(|col| format_number(augmented[row][n+col])).collect::<Vec<_>>().join(", ")).collect::<Vec<_>>().join("\n"))
+    Ok((0..n).map(|row| (0..n).map(|col| format_matrix_number(augmented[row][n+col])).collect::<Vec<_>>().join(", ")).collect::<Vec<_>>().join("\n"))
 }
 
 fn matrix_multiply(a: &str, b: &str) -> Result<String, String> {
@@ -3032,7 +3050,7 @@ fn matrix_multiply(a: &str, b: &str) -> Result<String, String> {
     let n=a.len(); let mut out=vec![vec![0.0;n];n];
     for row in 0..n { for col in 0..n { for k in 0..n { out[row][col] += a[row][k]*b[k][col]; } } }
     if out.iter().flatten().any(|v|!v.is_finite()) { return Err("Matrix result is outside the supported range".to_owned()); }
-    Ok(out.iter().map(|row|row.iter().map(|v|format_number(*v)).collect::<Vec<_>>().join(", ")).collect::<Vec<_>>().join("\n"))
+    Ok(out.iter().map(|row|row.iter().map(|v|format_matrix_number(*v)).collect::<Vec<_>>().join(", ")).collect::<Vec<_>>().join("\n"))
 }
 
 fn vector_calculate(a: &str, b: &str) -> String {
@@ -3140,7 +3158,7 @@ mod tests {
     fn calculator_matrix_inverse_and_determinant_are_consistent() {
         assert_eq!(super::matrix_determinant("1,2;3,4").unwrap(), -2.0);
         let inverse = super::matrix_inverse("1,2;3,4").unwrap();
-        assert!(inverse.contains("-2"));
+        assert_eq!(inverse, "-2, 1\n1.5, -0.5");
         assert!(super::matrix_inverse("1,2;2,4").is_err());
     }
 
@@ -3154,8 +3172,18 @@ mod tests {
     #[test]
     fn calculator_format_does_not_round_small_values_to_zero() {
         assert_eq!(format_number(0.000000001), "0.000000001");
+        assert_eq!(format_number(-0.0000000000000001), "-0.0000000000000001");
         assert_eq!(format_number(15.0), "15");
         assert_eq!(format_number(-0.0), "0");
+    }
+
+    #[test]
+    fn matrix_display_removes_roundoff_without_hiding_small_values() {
+        assert_eq!(super::format_matrix_number(-1.9999999999999996), "-2");
+        assert_eq!(super::format_matrix_number(0.9999999999999998), "1");
+        assert_eq!(super::format_matrix_number(1.2345678901234), "1.2345678901234");
+        assert_eq!(super::format_matrix_number(-0.0000000000000001), "-0.0000000000000001");
+        assert_eq!(format_number(1.000000000000001), "1.000000000000001");
     }
 
     #[test]

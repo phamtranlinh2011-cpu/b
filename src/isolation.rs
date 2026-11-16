@@ -39,7 +39,8 @@ fn create_session_id() -> String {
     format!("{}-{time}-{counter}", std::process::id())
 }
 
-#[cfg(windows)]
+// XML escaping is platform-independent; expose it on Windows and to unit tests on other targets.
+#[cfg(any(windows, test))]
 fn xml_escape(value: &str) -> String {
     value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
         .replace('"', "&quot;").replace('\'', "&apos;")
@@ -334,13 +335,21 @@ mod tests {
         assert!(!is_nova_sandbox_config_name(OsStr::new("Browser-.wsb.bak")));
     }
 
-    #[cfg(windows)]
-    use super::{base64_encode, powershell_encoded_command, xml_escape};
+    use super::xml_escape;
 
     #[cfg(windows)]
+    use super::{base64_encode, powershell_encoded_command};
+
     #[test]
-    fn xml_escape_protects_windows_paths() {
-        assert_eq!(xml_escape(r"C:\NOVA & Data\Workspace"), r"C:\NOVA &amp; Data\Chrome");
+    fn xml_escape_protects_windows_paths_and_xml_metacharacters() {
+        assert_eq!(
+            xml_escape(r#"C:\NOVA & <Data>\Workspace"#),
+            r#"C:\NOVA &amp; &lt;Data&gt;\Workspace"#,
+        );
+        assert_eq!(
+            xml_escape(r#"A&B <C> "D" 'E'"#),
+            "A&amp;B &lt;C&gt; &quot;D&quot; &apos;E&apos;",
+        );
     }
 
     #[cfg(windows)]
