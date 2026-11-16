@@ -59,6 +59,11 @@ const START_PINS: [&str; 12] = [
     "UniKey", "Security Center", "Settings", "Trash", "Network Discovery", "Packet Analyzer",
 ];
 
+const DESKTOP_SHORTCUTS: [&str; 9] = [
+    "Files", "Terminal", "Editor", "Calculator", "Google Chrome", "UniKey",
+    "Trash", "Security Center", "Settings",
+];
+
 pub struct NovaApp {
     paths: AppPaths,
     settings: Settings,
@@ -2240,18 +2245,13 @@ impl eframe::App for NovaApp {
                                 ui.label(RichText::new("Desktop").small().strong().color(if dark { Color32::from_rgb(194, 207, 229) } else { Color32::from_rgb(74, 91, 119) }));
                                 ui.add_space(7.0);
 
-                                let desktop_apps = [
-                                    "Files", "Terminal", "Editor",
-                                    "Calculator", "Google Chrome", "UniKey",
-                                    "Trash", "Security Center", "Settings",
-                                ];
                                 let desktop_columns = ((ui.available_width() / 108.0).floor() as usize).clamp(2, 7);
                                 egui::Grid::new("nova-desktop-shortcuts")
                                     .num_columns(desktop_columns)
                                     .spacing(egui::vec2(5.0, 6.0))
                                     .show(ui, |ui| {
-                                        for (index, name) in desktop_apps.iter().enumerate() {
-                                            if let Some(app) = START_APPS.iter().find(|app| app.name == name).copied() {
+                                        for (index, name) in DESKTOP_SHORTCUTS.iter().enumerate() {
+                                            if let Some(app) = START_APPS.iter().find(|app| app.name == *name).copied() {
                                                 if self.app_icon_button(ui, app, egui::vec2(94.0, 88.0), true) {
                                                     self.open_app(app.name);
                                                 }
@@ -2347,6 +2347,14 @@ mod tests {
         for (index, name) in START_PINS.iter().enumerate() {
             assert!(START_APPS.iter().any(|app| app.name == *name));
             assert!(!START_PINS[..index].contains(name));
+        }
+    }
+
+    #[test]
+    fn desktop_shortcuts_reference_only_catalog_apps_without_duplicates() {
+        for (index, name) in super::DESKTOP_SHORTCUTS.iter().enumerate() {
+            assert!(START_APPS.iter().any(|app| app.name == *name));
+            assert!(!super::DESKTOP_SHORTCUTS[..index].contains(name));
         }
     }
 

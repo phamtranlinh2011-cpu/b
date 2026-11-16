@@ -26,7 +26,7 @@
 
 ## Follow-up source audit
 
-- Removed an obsolete `toolchain` input from the pinned `dtolnay/rust-toolchain` action. This commit pins Rust 1.95.0 internally; the workflow now supplies only supported `targets` and `components` inputs.
+- Confirmed the pinned `dtolnay/rust-toolchain` revision hard-codes Rust 1.95.0 in its action metadata and does not declare a `toolchain` input. The workflow intentionally supplies only its supported `targets` and `components` inputs.
 - Rechecked Cargo/TOML and workflow YAML, source delimiters, declared test count and repository file references. These are static checks, not a substitute for `cargo check`, Clippy, or Windows runtime tests.
 
 ## Compile fixes from Windows CI feedback
@@ -36,3 +36,9 @@
 - Converted shortcut icon text from `&str` to the owned `String` required by egui 0.37's `Painter::layout_no_wrap`.
 - Compared the quick-access app name directly as `&str`, avoiding the unstable `str::as_str()` API.
 - Added `pinned_apps` to the storage test's `Settings` initializer and asserted that pinned apps survive save/load.
+
+
+## Additional desktop-shortcut compile fix
+
+- Corrected the iterator predicate for desktop shortcut lookup: `.iter()` passes `&&str` to `find`, so the comparison now dereferences the name to `&str` (`app.name == *name`).
+- Promoted the desktop shortcut list to a shared catalogue constant and added a test ensuring every desktop shortcut maps to a unique app-catalog entry.
