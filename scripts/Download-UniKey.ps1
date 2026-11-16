@@ -146,7 +146,7 @@ try {
 
     Write-Host 'UniKey was copied to NOVA USB and its Authenticode signature is valid.' -ForegroundColor Green
     Write-Host "Path: $(Join-Path $Destination 'UniKeyNT.exe')"
-    Write-Host 'Return to NOVA > UniKey and choose Start UniKey.'
+    Write-Host 'Open NOVA and select UniKey; NOVA starts the bundled input method automatically.'
 }
 finally {
     if ($TempTarget -and (Test-Path -LiteralPath $TempTarget)) {

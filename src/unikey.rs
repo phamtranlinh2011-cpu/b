@@ -1,18 +1,10 @@
 //! Portable integration with the official UniKey Windows Vietnamese input app.
 //!
-//! The official helper is embedded into NOVA at compile time so a replaced
-//! PowerShell file on the USB cannot change the code behind the Download action.
-//! It fetches the official x64 ZIP, verifies Authenticode, and places UniKeyNT.exe
-//! under Apps/UniKey on the USB drive.
+//! UniKey is bundled into each portable package by the Windows release script.
+//! Runtime discovery and launch always verify the official Authenticode publisher.
 
 use std::io;
 use std::path::{Path, PathBuf};
-
-pub const OFFICIAL_DOWNLOAD_PAGE: &str = "https://www.unikey.org/download.html";
-
-// Embed the helper into NOVA so a modified PowerShell file on the USB cannot
-// replace the code executed by the Download button.
-const DOWNLOAD_HELPER: &str = include_str!("../scripts/Download-UniKey.ps1");
 
 pub fn find_portable(app_dir: &Path) -> Option<PathBuf> {
     let root = app_dir.canonicalize().ok()?;
@@ -95,67 +87,6 @@ pub fn launch_verified(_path: &Path) -> io::Result<std::process::Child> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "UniKey integration is available in the Windows build of NOVA."))
 }
 
-#[cfg(windows)]
-fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let a = chunk[0] as u32;
-        let b = chunk.get(1).copied().unwrap_or(0) as u32;
-        let c = chunk.get(2).copied().unwrap_or(0) as u32;
-        let bits = (a << 16) | (b << 8) | c;
-        output.push(TABLE[((bits >> 18) & 0x3f) as usize] as char);
-        output.push(TABLE[((bits >> 12) & 0x3f) as usize] as char);
-        output.push(if chunk.len() > 1 { TABLE[((bits >> 6) & 0x3f) as usize] as char } else { '=' });
-        output.push(if chunk.len() > 2 { TABLE[(bits & 0x3f) as usize] as char } else { '=' });
-    }
-    output
-}
-
-#[cfg(windows)]
-fn powershell_encoded_command(script: &str) -> String {
-    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    base64_encode(&bytes)
-}
-
-#[cfg(windows)]
-pub fn start_download_helper(app_dir: &Path) -> io::Result<std::process::Child> {
-    use std::process::Command;
-    let powershell = crate::windows_process::system_binary("WindowsPowerShell\\v1.0\\powershell.exe")?;
-    let encoded = powershell_encoded_command(DOWNLOAD_HELPER);
-    Command::new(powershell)
-        .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
-        .env("NOVA_APP_ROOT", app_dir)
-        .spawn()
-}
-
-#[cfg(not(windows))]
-pub fn start_download_helper(_app_dir: &Path) -> io::Result<std::process::Child> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "UniKey download helper is available on Windows."))
-}
-
-#[cfg(windows)]
-pub fn open_official_download_page() -> io::Result<()> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    let operation: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
-    let target: Vec<u16> = OsStr::new(OFFICIAL_DOWNLOAD_PAGE).encode_wide().chain(Some(0)).collect();
-    #[link(name = "shell32")]
-    unsafe extern "system" {
-        fn ShellExecuteW(window: *mut std::ffi::c_void, operation: *const u16, file: *const u16,
-            parameters: *const u16, directory: *const u16, show_command: i32) -> *mut std::ffi::c_void;
-    }
-    let result = unsafe { ShellExecuteW(std::ptr::null_mut(), operation.as_ptr(), target.as_ptr(),
-        std::ptr::null(), std::ptr::null(), 1) as isize };
-    if result <= 32 { return Err(io::Error::other(format!("Could not open official UniKey site (ShellExecute code {result})."))); }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-pub fn open_official_download_page() -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "UniKey website launch is available on Windows."))
-}
-
 #[cfg(test)]
 mod tests {
     use super::find_portable;
@@ -196,12 +127,5 @@ mod tests {
         assert_eq!(find_portable(&root), None);
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn powershell_encoding_is_utf16le_base64() {
-        let encoded = super::powershell_encoded_command("Write-Output 'Tiếng Việt'");
-        assert!(!encoded.contains(' '));
-        assert!(encoded.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '+' || ch == '/' || ch == '='));
-    }
 
 }

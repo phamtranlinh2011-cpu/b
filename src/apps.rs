@@ -70,53 +70,21 @@ pub(crate) fn verify_google_chrome_signature(chrome: &std::path::Path) -> io::Re
 }
 
 #[cfg(windows)]
-pub fn launch_chrome(chrome: &std::path::Path, url: &str) -> io::Result<()> {
+pub fn launch_chrome(chrome: &std::path::Path) -> io::Result<()> {
     use std::process::Command;
     if !chrome.is_file() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "Google Chrome executable was not found."));
     }
     verify_google_chrome_signature(chrome)?;
-    let url = normalized_browser_target(url)?;
-    Command::new(chrome).arg("--new-window").arg(url).spawn()?;
+    // Launch the user's installed Chrome with its normal Windows profile,
+    // extensions, bookmarks, cookies, native frame and default new-tab page.
+    Command::new(chrome).arg("--new-window").spawn()?;
     Ok(())
 }
 
 #[cfg(not(windows))]
-pub fn launch_chrome(_chrome: &std::path::Path, _url: &str) -> io::Result<()> {
+pub fn launch_chrome(_chrome: &std::path::Path) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "Google Chrome integration is available in the Windows build of NOVA."))
-}
-
-pub fn normalized_browser_target(value: &str) -> io::Result<String> {
-    let trimmed = value.trim();
-    if let Some((scheme, rest)) = trimmed.split_once("://") {
-        let normalized = format!("{}://{rest}", scheme.to_ascii_lowercase());
-        validate_browser_target(&normalized)?;
-        Ok(normalized)
-    } else {
-        let candidate = format!("https://{trimmed}");
-        validate_browser_target(&candidate)?;
-        Ok(candidate)
-    }
-}
-
-pub fn validate_browser_target(value: &str) -> io::Result<&str> {
-    let value = value.trim();
-    if value.is_empty() || value.len() > 2048 || value.chars().any(char::is_whitespace) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Enter a valid web address or Chrome internal URL without spaces."));
-    }
-    let scheme = value.split_once("://").map(|(scheme, _)| scheme.to_ascii_lowercase()).unwrap_or_default();
-    let allowed = matches!(scheme.as_str(), "http" | "https" | "chrome" | "chrome-extension");
-    if !allowed {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Only http://, https://, chrome:// and chrome-extension:// addresses are supported.",
-        ));
-    }
-    let host_or_path = value.split_once("://").map(|(_, rest)| rest).unwrap_or_default();
-    if host_or_path.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "The address is missing its host or Chrome page."));
-    }
-    Ok(value)
 }
 
 #[cfg(windows)]
@@ -160,7 +128,7 @@ pub fn open_chrome_download_page() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalized_browser_target, validate_browser_target};
+    
 
     #[test]
     fn trusted_google_publisher_names_are_explicit() {
@@ -170,19 +138,7 @@ mod tests {
         assert!(!super::is_trusted_google_publisher("Unknown Publisher"));
     }
 
-    #[test]
-    fn browser_target_accepts_web_and_chrome_internal_urls() {
-        assert_eq!(validate_browser_target("https://example.com").unwrap(), "https://example.com");
-        assert_eq!(validate_browser_target("chrome://settings").unwrap(), "chrome://settings");
-        assert_eq!(normalized_browser_target("example.com").unwrap(), "https://example.com");
-        assert_eq!(normalized_browser_target("HTTPS://example.com").unwrap(), "https://example.com");
-    }
 
-    #[test]
-    fn browser_target_rejects_untrusted_schemes_and_control_characters() {
-        assert!(validate_browser_target("file:///C:/secret.txt").is_err());
-        assert!(validate_browser_target("javascript:alert(1)").is_err());
-        assert!(validate_browser_target("https://example.com\n--incognito").is_err());
-        assert!(validate_browser_target("").is_err());
-    }
+
+
 }

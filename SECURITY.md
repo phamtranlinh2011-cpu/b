@@ -5,8 +5,7 @@
 NOVA is a regular Windows desktop application running with the current user's permissions. It is not an operating system, hypervisor, antivirus engine, or security boundary.
 
 - Only the explicit **Inspect in Windows Sandbox** path stages a copy of one NOVA workspace file into a read-only mapped folder with networking and clipboard redirection disabled.
-- The isolated Chrome path is disposable but has networking enabled. Do not use it as an offline malware-analysis environment.
-- Terminal/CMD, host Chrome, UniKey, Wi-Fi management, normal filesystem actions and third-party security GUIs execute on the Windows host.
+- Terminal/CMD, Google Chrome, UniKey, Wi-Fi management, normal filesystem actions and third-party security GUIs execute on the Windows host.
 - The scope acknowledgement in Security Center is a workflow reminder; it does not technically restrict external scanners.
 - Data folders reject symlinks and Windows reparse points, and recursive deletion is designed not to traverse them. This does not eliminate every filesystem race or protect against a compromised Windows account, kernel, driver or hypervisor.
 

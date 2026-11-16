@@ -2,6 +2,7 @@ use crate::storage::{canonical_user_path, create_user_directories, safe_user_pat
 use crate::terminal::{TerminalState, TerminalTask};
 use crate::trash::{self, TrashEntry};
 use crate::apps;
+use crate::calculator::{self, AngleUnit, EvalContext};
 use crate::{isolation, unikey, unicode, security_tools::{self, SecurityTool}};
 use eframe::egui::{self, Color32, FontId, RichText, TextEdit};
 use std::collections::HashMap;
@@ -14,10 +15,19 @@ use std::process::Child;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UniKeyProcessKind { Download, Running }
+enum UniKeyProcessKind { Running }
 
 #[derive(Clone, Copy)]
 enum SnapSide { Left, Right, Maximize }
+
+#[derive(Clone, Copy)]
+struct WindowMotion {
+    from_pos: egui::Pos2,
+    from_size: egui::Vec2,
+    to_pos: egui::Pos2,
+    to_size: egui::Vec2,
+    started: Instant,
+}
 
 /// Single source of truth for desktop shortcuts, Start pins and the All apps view.
 #[derive(Clone)]
@@ -40,11 +50,11 @@ const START_APPS: [StartApp; 15] = [
     StartApp { name: "Files", icon: "▦", description: "Browse your portable workspace", category: "Workspace" },
     StartApp { name: "Terminal", icon: "⌘", description: "Commands and Wi-Fi tools", category: "Workspace" },
     StartApp { name: "Editor", icon: "✎", description: "Write and edit text files", category: "Productivity" },
-    StartApp { name: "Calculator", icon: "∑", description: "Quick calculations", category: "Productivity" },
+    StartApp { name: "Calculator", icon: "∑", description: "Scientific calculator and Casio-style calculation modes", category: "Productivity" },
     StartApp { name: "Monitor", icon: "◉", description: "CPU, memory and processes", category: "System" },
     StartApp { name: "Trash", icon: "▤", description: "Restore deleted NOVA files", category: "System" },
-    StartApp { name: "Google Chrome", icon: "🌐", description: "Normal or isolated browser", category: "Internet" },
-    StartApp { name: "UniKey", icon: "文", description: "Vietnamese Telex and VNI", category: "Productivity" },
+    StartApp { name: "Google Chrome", icon: "🌐", description: "Open the real Google Chrome Windows app", category: "Internet" },
+    StartApp { name: "UniKey", icon: "文", description: "Bundled Vietnamese Telex and VNI input", category: "Productivity" },
     StartApp { name: "Security Center", icon: "🛡", description: "Sandbox and security workspaces", category: "Security" },
     StartApp { name: "Network Discovery", icon: "◎", description: "Zenmap visual discovery", category: "Security" },
     StartApp { name: "Vulnerability Management", icon: "◈", description: "Greenbone management console", category: "Security" },
@@ -64,6 +74,46 @@ const DESKTOP_SHORTCUTS: [&str; 9] = [
     "Trash", "Security Center", "Settings",
 ];
 
+/// Compute balanced taskbar rails without ever allocating more than the viewport.
+fn taskbar_rail_widths(available_width: f32) -> (f32, f32, f32, bool, bool) {
+    let available = available_width.max(0.0);
+    let ultra_compact = available < 440.0;
+    let medium = available < 720.0;
+    // Equal rails keep the middle app group geometrically centered.
+    let side_width = if ultra_compact { 38.0 } else if medium { 136.0 } else { 170.0 };
+    let desired_left = side_width;
+    let desired_right = side_width;
+    let scale = ((available - 72.0).max(0.0) / (desired_left + desired_right)).clamp(0.0, 1.0);
+    let left = desired_left * scale;
+    let right = desired_right * scale;
+    let center = (available - left - right).max(0.0);
+    (left, center, right, ultra_compact, medium)
+}
+
+/// Compute the Start surface from the actual viewport, including small windows.
+fn start_menu_dimensions(screen_width: f32, screen_height: f32) -> (f32, f32, usize) {
+    let width = screen_width.max(1.0);
+    let height = screen_height.max(1.0);
+    let menu_width = (width - 24.0).clamp(1.0, 680.0).min(width);
+    let scroll_height = (height - 240.0).clamp(80.0, 330.0).min((height - 16.0).max(1.0));
+    let menu_margin = ((menu_width - 1.0) * 0.5).clamp(0.0, 19.0);
+    let inner_width = (menu_width - menu_margin * 2.0).max(1.0);
+    let pinned_columns = ((inner_width / 96.0).floor() as usize).clamp(1, 6);
+    (menu_width, scroll_height, pinned_columns)
+}
+
+/// Keep long filenames readable in the compact List view without pushing the size column off-screen.
+fn compact_file_name(name: &str, max_chars: usize) -> String {
+    if name.chars().count() <= max_chars {
+        return name.to_owned();
+    }
+    if max_chars <= 1 {
+        return "…".to_owned();
+    }
+    let prefix: String = name.chars().take(max_chars - 1).collect();
+    format!("{prefix}…")
+}
+
 pub struct NovaApp {
     paths: AppPaths,
     settings: Settings,
@@ -79,7 +129,6 @@ pub struct NovaApp {
     start_open: bool,
     start_show_all: bool,
     trash_open: bool,
-    chrome_open: bool,
     unikey_open: bool,
     security_open: bool,
     security_tool_open: [bool; 5],
@@ -92,7 +141,6 @@ pub struct NovaApp {
     security_scope_confirmed: bool,
     greenbone_url: String,
     security_confirm_clear_quarantine: bool,
-    chrome_confirm_host: bool,
     trash_confirm_empty: bool,
     trash_confirm_delete: bool,
     trash_entries: Vec<TrashEntry>,
@@ -106,6 +154,8 @@ pub struct NovaApp {
     notification_open: bool,
     settings_page: usize,
     window_snap_requests: HashMap<String, SnapSide>,
+    window_motions: HashMap<String, WindowMotion>,
+    window_rects: HashMap<String, egui::Rect>,
     icon_galleys: HashMap<(&'static str, u32, u32, bool), std::sync::Arc<egui::Galley>>,
     start_search: String,
     chrome_path: Option<PathBuf>,
@@ -117,16 +167,39 @@ pub struct NovaApp {
     unikey_process_kind: Option<UniKeyProcessKind>,
     unikey_status: String,
     quarantine_count: usize,
-    chrome_url: String,
     files_dir: PathBuf,
     files_new_folder: String,
     editor_path: String,
     editor_text: String,
     editor_status: String,
-    calc_left: String,
-    calc_right: String,
-    calc_operator: String,
+    calc_mode: String,
+    calc_expression: String,
     calc_result: String,
+    calc_angle: AngleUnit,
+    calc_answer: f64,
+    calc_history: Vec<String>,
+    calc_stats_data: String,
+    calc_stats_y: String,
+    calc_equation_a: String,
+    calc_equation_b: String,
+    calc_equation_c: String,
+    calc_table_start: String,
+    calc_table_end: String,
+    calc_table_step: String,
+    calc_calculus_x: String,
+    calc_integral_start: String,
+    calc_integral_end: String,
+    calc_integral_steps: String,
+    calc_inequality_operator: String,
+    calc_base_input: String,
+    calc_base_from: u32,
+    calc_matrix_a: String,
+    calc_matrix_b: String,
+    calc_vector_a: String,
+    calc_vector_b: String,
+    calc_ratio_a: String,
+    calc_ratio_b: String,
+    calc_ratio_c: String,
     monitor: Option<System>,
     monitor_error: Option<String>,
     last_monitor_refresh: Instant,
@@ -162,7 +235,6 @@ impl NovaApp {
             start_open: false,
             start_show_all: false,
             trash_open: false,
-            chrome_open: false,
             unikey_open: false,
             security_open: false,
             security_tool_open: [false; 5],
@@ -175,7 +247,6 @@ impl NovaApp {
             security_scope_confirmed: false,
             greenbone_url: "https://127.0.0.1:9392".to_owned(),
             security_confirm_clear_quarantine: false,
-            chrome_confirm_host: false,
             trash_confirm_empty: false,
             trash_confirm_delete: false,
             trash_entries: Vec::new(),
@@ -189,11 +260,12 @@ impl NovaApp {
             notification_open: false,
             settings_page: 0,
             window_snap_requests: HashMap::new(),
+            window_motions: HashMap::new(),
+            window_rects: HashMap::new(),
             icon_galleys: HashMap::new(),
             start_search: String::new(),
             chrome_path: None,
             chrome_checked: false,
-            chrome_url: "https://www.google.com".to_owned(),
             unikey_path: None,
             unikey_checked: false,
             quarantine_count_loaded: false,
@@ -205,10 +277,34 @@ impl NovaApp {
             editor_path: "Documents/Note.txt".to_owned(),
             editor_text: String::new(),
             editor_status: "Ready".to_owned(),
-            calc_left: "12".to_owned(),
-            calc_right: "3".to_owned(),
-            calc_operator: "+".to_owned(),
-            calc_result: "15".to_owned(),
+            calc_mode: "Calculate".to_owned(),
+            calc_expression: "sin(30)+sqrt(16)".to_owned(),
+            calc_result: "Ready".to_owned(),
+            calc_angle: AngleUnit::Degree,
+            calc_answer: 0.0,
+            calc_history: Vec::new(),
+            calc_stats_data: "12, 15, 18, 20, 25".to_owned(),
+            calc_stats_y: String::new(),
+            calc_equation_a: "1".to_owned(),
+            calc_equation_b: "-3".to_owned(),
+            calc_equation_c: "2".to_owned(),
+            calc_table_start: "-5".to_owned(),
+            calc_table_end: "5".to_owned(),
+            calc_table_step: "1".to_owned(),
+            calc_calculus_x: "1".to_owned(),
+            calc_integral_start: "0".to_owned(),
+            calc_integral_end: "1".to_owned(),
+            calc_integral_steps: "100".to_owned(),
+            calc_inequality_operator: ">".to_owned(),
+            calc_base_input: "255".to_owned(),
+            calc_base_from: 10,
+            calc_matrix_a: "1,2,3;4,5,6;7,8,9".to_owned(),
+            calc_matrix_b: "9,8,7;6,5,4;3,2,1".to_owned(),
+            calc_vector_a: "1,2,3".to_owned(),
+            calc_vector_b: "4,5,6".to_owned(),
+            calc_ratio_a: "2".to_owned(),
+            calc_ratio_b: "3".to_owned(),
+            calc_ratio_c: "8".to_owned(),
             monitor: None,
             monitor_error: None,
             last_monitor_refresh: Instant::now() - Duration::from_secs(2),
@@ -252,10 +348,14 @@ impl NovaApp {
             visuals.panel_fill = Color32::from_rgb(17, 23, 38);
             visuals.window_fill = Color32::from_rgb(23, 31, 49);
             visuals.extreme_bg_color = Color32::from_rgb(10, 15, 27);
+            visuals.faint_bg_color = Color32::from_rgb(27, 35, 53);
+            visuals.code_bg_color = Color32::from_rgb(13, 19, 31);
         } else {
             visuals.panel_fill = Color32::from_rgb(242, 245, 250);
             visuals.window_fill = Color32::from_rgb(255, 255, 255);
             visuals.extreme_bg_color = Color32::from_rgb(233, 237, 244);
+            visuals.faint_bg_color = Color32::from_rgb(247, 249, 253);
+            visuals.code_bg_color = Color32::from_rgb(239, 243, 250);
         }
         let accent = match self.settings.accent.as_str() {
             "violet" => Color32::from_rgb(151, 120, 255),
@@ -266,20 +366,60 @@ impl NovaApp {
         };
         visuals.selection.bg_fill = accent;
         visuals.hyperlink_color = accent;
-        visuals.window_corner_radius = egui::CornerRadius::same(15);
-        visuals.menu_corner_radius = egui::CornerRadius::same(12);
+        visuals.window_corner_radius = egui::CornerRadius::same(17);
+        visuals.menu_corner_radius = egui::CornerRadius::same(13);
+        visuals.window_stroke = egui::Stroke::new(
+            1.0,
+            if effective_dark { Color32::from_white_alpha(26) } else { Color32::from_black_alpha(20) },
+        );
+        visuals.window_highlight_topmost = true;
         visuals.window_shadow = egui::Shadow {
-            offset: [0, 12],
-            blur: 28,
+            offset: [0, 14],
+            blur: 34,
             spread: 0,
-            color: Color32::from_black_alpha(86),
+            color: Color32::from_black_alpha(92),
         };
+        visuals.popup_shadow = egui::Shadow {
+            offset: [0, 8],
+            blur: 22,
+            spread: 0,
+            color: Color32::from_black_alpha(70),
+        };
+        let (surface, surface_hover, surface_active, border) = if effective_dark {
+            (
+                Color32::from_rgb(30, 39, 59),
+                Color32::from_rgb(43, 55, 80),
+                Color32::from_rgb(53, 68, 98),
+                Color32::from_white_alpha(22),
+            )
+        } else {
+            (
+                Color32::from_rgb(247, 249, 253),
+                Color32::from_rgb(235, 241, 251),
+                Color32::from_rgb(222, 233, 250),
+                Color32::from_black_alpha(18),
+            )
+        };
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border);
+        visuals.widgets.inactive.bg_fill = surface;
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
+        visuals.widgets.hovered.bg_fill = surface_hover;
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent.gamma_multiply(0.55));
+        visuals.widgets.active.bg_fill = surface_active;
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
+        visuals.widgets.open.bg_fill = surface_hover;
+        visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, accent.gamma_multiply(0.7));
+        visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(10);
+        visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(10);
+        visuals.widgets.active.corner_radius = egui::CornerRadius::same(10);
+        visuals.widgets.open.corner_radius = egui::CornerRadius::same(10);
         ctx.set_visuals(visuals);
         ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = egui::vec2(10.0, 8.0);
             style.spacing.button_padding = egui::vec2(12.0, 8.0);
-            style.visuals.window_corner_radius = egui::CornerRadius::same(15);
-            style.spacing.window_margin = egui::Margin::same(14);
+            style.spacing.interact_size = egui::vec2(38.0, 32.0);
+            style.spacing.window_margin = egui::Margin::same(16);
+            style.visuals.window_corner_radius = egui::CornerRadius::same(17);
         });
         self.applied_theme.clone_from(&self.settings.theme);
         self.applied_effective_theme = effective_theme.to_owned();
@@ -310,12 +450,13 @@ impl NovaApp {
                 self.refresh_trash();
             }
             "Google Chrome" => {
-                self.chrome_open = true;
                 self.detect_chrome_if_needed();
+                self.launch_chrome();
             },
             "UniKey" => {
                 self.unikey_open = true;
                 self.detect_unikey_if_needed();
+                if self.unikey_path.is_some() && self.unikey_child.is_none() { self.start_unikey(); }
             },
             "Security Center" => {
                 self.security_open = true;
@@ -350,12 +491,15 @@ impl NovaApp {
                 if self.trash_open { self.refresh_trash(); }
             }
             "Google Chrome" => {
-                self.chrome_open = !self.chrome_open;
-                if self.chrome_open { self.detect_chrome_if_needed(); }
+                self.detect_chrome_if_needed();
+                self.launch_chrome();
             },
             "UniKey" => {
                 self.unikey_open = !self.unikey_open;
-                if self.unikey_open { self.detect_unikey_if_needed(); }
+                if self.unikey_open {
+                    self.detect_unikey_if_needed();
+                    if self.unikey_path.is_some() && self.unikey_child.is_none() { self.start_unikey(); }
+                }
             },
             "Security Center" => {
                 self.security_open = !self.security_open;
@@ -367,6 +511,28 @@ impl NovaApp {
             "Packet Analyzer" => { let i = SecurityTool::PacketAnalyzer.index(); self.security_tool_open[i] = !self.security_tool_open[i]; },
             "Web / API Inspector" => { let i = SecurityTool::WebApiInspector.index(); self.security_tool_open[i] = !self.security_tool_open[i]; },
             _ => {}
+        }
+    }
+
+    fn app_is_open(&self, app: &str) -> bool {
+        match app {
+            "Files" => self.files_open,
+            "Terminal" => self.terminal_open,
+            "Editor" => self.editor_open,
+            "Settings" => self.settings_open,
+            "Calculator" => self.calculator_open,
+            "Monitor" => self.monitor_open,
+            "Trash" => self.trash_open,
+            "UniKey" => self.unikey_open,
+            "Security Center" => self.security_open,
+            "Network Discovery" => self.security_tool_open[SecurityTool::NetworkDiscovery.index()],
+            "Vulnerability Management" => self.security_tool_open[SecurityTool::VulnerabilityManagement.index()],
+            "Web Security" => self.security_tool_open[SecurityTool::WebSecurity.index()],
+            "Packet Analyzer" => self.security_tool_open[SecurityTool::PacketAnalyzer.index()],
+            "Web / API Inspector" => self.security_tool_open[SecurityTool::WebApiInspector.index()],
+            // Chrome is a native host window; NOVA does not own its window state.
+            "Google Chrome" => false,
+            _ => false,
         }
     }
 
@@ -476,11 +642,16 @@ impl NovaApp {
 
     fn launch_chrome(&mut self) {
         match self.chrome_path.as_ref() {
-            Some(path) => match apps::launch_chrome(path, &self.chrome_url) {
-                Ok(()) => self.status_message = "Opened the address in Google Chrome on the Windows host.".to_owned(),
+            Some(path) => match apps::launch_chrome(path) {
+                Ok(()) => self.status_message = "Opened the installed Google Chrome in its native Windows window.".to_owned(),
                 Err(error) => self.status_message = format!("Could not launch Google Chrome: {error}"),
             },
-            None => self.status_message = "Google Chrome is not installed on this Windows user or machine. Use the official download page below.".to_owned(),
+            None => {
+                self.status_message = "Google Chrome is not installed. Install it from google.com/chrome; NOVA will open the real Chrome application when available.".to_owned();
+                if let Err(error) = apps::open_chrome_download_page() {
+                    self.status_message = format!("Chrome was not found and its official download page could not be opened: {error}");
+                }
+            }
         }
     }
 
@@ -499,12 +670,6 @@ impl NovaApp {
             self.unikey_path = unikey::find_portable(&self.paths.app_dir);
             self.unikey_checked = true;
             match (kind, result) {
-                (Some(UniKeyProcessKind::Download), Ok(true)) if self.unikey_path.is_some() => {
-                    self.unikey_status = "UniKey downloaded and its digital signature was verified. Choose Start UniKey.".to_owned();
-                }
-                (Some(UniKeyProcessKind::Download), Ok(_)) => {
-                    self.unikey_status = "UniKey download did not complete. Review the PowerShell window and try again.".to_owned();
-                }
                 (Some(UniKeyProcessKind::Running), Ok(true)) => {
                     self.unikey_status = "UniKey has exited.".to_owned();
                 }
@@ -517,26 +682,12 @@ impl NovaApp {
         }
     }
 
-    fn download_unikey(&mut self) {
-        if self.unikey_child.is_some() {
-            self.unikey_status = "A UniKey-related process is already running.".to_owned();
-            return;
-        }
-        match unikey::start_download_helper(&self.paths.app_dir) {
-            Ok(child) => {
-                self.unikey_child = Some(child);
-                self.unikey_process_kind = Some(UniKeyProcessKind::Download);
-                self.unikey_status = "Downloading UniKey from unikey.org and verifying its publisher…".to_owned();
-            }
-            Err(error) => self.unikey_status = format!("Could not start UniKey download helper: {error}"),
-        }
-    }
 
     fn start_unikey(&mut self) {
         self.unikey_path = unikey::find_portable(&self.paths.app_dir);
         self.unikey_checked = true;
         let Some(path) = self.unikey_path.clone() else {
-            self.unikey_status = "UniKey is not on this USB yet. Use Download UniKey first.".to_owned();
+            self.unikey_status = "UniKey is not bundled. Rebuild the portable package with internet access.".to_owned();
             return;
         };
         if self.unikey_child.is_some() {
@@ -562,20 +713,6 @@ impl NovaApp {
         self.unikey_status = "NOVA stopped the UniKey process it started.".to_owned();
     }
 
-    fn launch_chrome_in_sandbox(&mut self) {
-        let Some(chrome) = self.chrome_path.clone() else {
-            self.status_message = "Install Google Chrome on the Windows host first; the isolated launcher maps only its read-only application folder.".to_owned();
-            return;
-        };
-        let url = match apps::normalized_browser_target(&self.chrome_url) {
-            Ok(url) => url,
-            Err(error) => { self.status_message = format!("Invalid browser address: {error}"); return; }
-        };
-        match isolation::launch_isolated_chrome(&self.paths, &chrome, &url) {
-            Ok(_) => self.status_message = "Started isolated Chrome. Its profile and downloads live only inside Windows Sandbox; close Sandbox to discard them.".to_owned(),
-            Err(error) => self.status_message = format!("Could not start isolated Chrome: {error}"),
-        }
-    }
 
     fn security_window(&mut self, ctx: &egui::Context) {
         if self.security_open {
@@ -595,13 +732,16 @@ impl NovaApp {
         let mut refresh_detection = false;
         let mut selected_tool: Option<SecurityTool> = None;
 
-        egui::Window::new("NOVA Security Center")
+        let snap = self.take_window_snap("Security Center", ctx);
+        let mut window = egui::Window::new("NOVA Security Center")
             .open(&mut open)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
-            .default_size([820.0, 690.0])
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+            .collapsible(false)
+            .default_size([820.0, 690.0]);
+        if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
+        let shown = window.show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.vertical(|ui| {
                         ui.heading(RichText::new("Security Center").size(25.0).strong());
                         ui.label(RichText::new("A guided control room for authorized security work.").weak());
@@ -615,29 +755,25 @@ impl NovaApp {
                     refresh_detection = true;
                 }
 
+                let overview_columns = if ui.available_width() < 560.0 { 1 } else if ui.available_width() < 760.0 { 2 } else { 3 };
                 egui::Grid::new("nova-security-overview-cards")
-                    .num_columns(3)
+                    .num_columns(overview_columns)
                     .spacing(egui::vec2(10.0, 8.0))
                     .show(ui, |ui| {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_width(175.0);
-                            ui.label(RichText::new("GUI TOOLS").small().weak().strong());
-                            ui.heading(format!("{installed_count}/4"));
-                            ui.label(RichText::new("local desktop engines detected").small().weak());
-                        });
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_width(175.0);
-                            ui.label(RichText::new("WINDOWS SANDBOX").small().weak().strong());
-                            ui.heading(if sandbox_available { "Detected" } else { "Unavailable" });
-                            ui.label(RichText::new("feature + virtualization required").small().weak());
-                        });
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_width(175.0);
-                            ui.label(RichText::new("TEST SCOPE").small().weak().strong());
-                            ui.heading(if scope_ready { "Confirmed" } else { "Not confirmed" });
-                            ui.label(RichText::new("operator acknowledgement").small().weak());
-                        });
-                        ui.end_row();
+                        let cards = [
+                            ("GUI TOOLS", format!("{installed_count}/4"), "local desktop engines detected"),
+                            ("WINDOWS SANDBOX", if sandbox_available { "Detected".to_owned() } else { "Unavailable".to_owned() }, "feature + virtualization required"),
+                            ("TEST SCOPE", if scope_ready { "Confirmed".to_owned() } else { "Not confirmed".to_owned() }, "operator acknowledgement"),
+                        ];
+                        for (index, (label, value, description)) in cards.iter().enumerate() {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(175.0);
+                                ui.label(RichText::new(*label).small().weak().strong());
+                                ui.heading(value.as_str());
+                                ui.label(RichText::new(*description).small().weak());
+                            });
+                            if (index + 1) % overview_columns == 0 { ui.end_row(); }
+                        }
                     });
 
                 ui.add_space(8.0);
@@ -668,16 +804,17 @@ impl NovaApp {
                 ui.add_space(8.0);
                 ui.heading("2. GUI security applications");
                 ui.label(RichText::new("Open a dedicated NOVA workspace for each tool. Engines are installed separately and are not bundled in the USB image.").small().weak());
+                let tool_columns = if ui.available_width() < 660.0 { 1 } else { 2 };
                 egui::Grid::new("nova-security-tool-cards")
-                    .num_columns(2)
+                    .num_columns(tool_columns)
                     .spacing(egui::vec2(12.0, 10.0))
                     .show(ui, |ui| {
                         for (position, info) in security_tools::TOOLS.iter().enumerate() {
                             let installed = self.security_tool_installed[info.tool.index()];
                             egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.set_min_width(310.0);
+                                ui.set_min_width(220.0);
                                 ui.set_min_height(112.0);
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.heading(RichText::new(match position {
                                         0 => "◎",
                                         1 => "◈",
@@ -691,7 +828,7 @@ impl NovaApp {
                                     });
                                 });
                                 ui.label(RichText::new(info.description).small());
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     if info.requires_local_executable && installed {
                                         ui.colored_label(Color32::from_rgb(87, 190, 140), "Installed");
                                     } else if info.requires_local_executable {
@@ -704,7 +841,7 @@ impl NovaApp {
                                     }
                                 });
                             });
-                            if position % 2 == 1 { ui.end_row(); }
+                            if (position + 1) % tool_columns == 0 { ui.end_row(); }
                         }
                     });
 
@@ -718,9 +855,9 @@ impl NovaApp {
                             ui.colored_label(Color32::from_rgb(225, 166, 86), "Windows Sandbox is not available on this Windows installation.");
                         }
                         ui.label("Requires Windows Pro, Enterprise or Education (not Home), hardware virtualization enabled, at least 4 GB RAM (8 GB recommended), 1 GB free disk space and 2 CPU cores.");
-                        ui.label("Inspect in Sandbox stages a copy of one file, maps it read-only, disables networking and clipboard, then opens Explorer. Isolated Chrome uses a new disposable profile and networking; it may reach local-network services.");
-                        ui.label("NOVA, Terminal/CMD, UniKey, Wi-Fi and ordinary host applications still run on Windows itself. No isolation feature can promise protection against every Windows, hypervisor or firmware vulnerability.");
-                        ui.horizontal(|ui| {
+                        ui.label("Inspect in Sandbox stages a copy of one file, maps it read-only, disables networking and clipboard, then opens Explorer. Google Chrome runs as the normal Windows host application and is not sandboxed.");
+                        ui.label("NOVA, Terminal/CMD, Google Chrome, UniKey, Wi-Fi and ordinary host applications still run on Windows itself. No isolation feature can promise protection against every Windows, hypervisor or firmware vulnerability.");
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(format!("Staged sample/config items: {}", self.quarantine_count));
                             if ui.add_enabled(self.quarantine_count > 0, egui::Button::new("Clear staged copies…")).clicked() {
                                 clear_requested = true;
@@ -728,6 +865,7 @@ impl NovaApp {
                         });
                     });
             });
+        if let Some(shown) = shown { self.window_rects.insert("Security Center".to_owned(), shown.response.rect); }
 
         self.security_open = open;
         if refresh_detection {
@@ -741,30 +879,39 @@ impl NovaApp {
             self.security_confirm_clear_quarantine = true;
         }
         if self.security_confirm_clear_quarantine {
+            let mut confirm_open = true;
+            let mut close_requested = false;
+            let mut clear_confirmed = false;
             egui::Window::new("Clear NOVA quarantine staging?")
+                .open(&mut confirm_open)
                 .collapsible(false)
                 .resizable(false)
+                .fade_in(!self.settings.reduce_motion)
+                .fade_out(!self.settings.reduce_motion)
                 .show(ctx, |ui| {
                     ui.label("Close every Windows Sandbox window before removing staged copies and NOVA .wsb launch files. Original workspace files are not deleted.");
-                    ui.horizontal(|ui| {
-                        if ui.button("Clear staged copies").clicked() {
-                            match isolation::clear_quarantine(&self.paths) {
-                                Ok(count) => self.status_message = format!("Removed {count} staged sample/config item(s). Original workspace files were not changed."),
-                                Err(error) => self.status_message = format!("Could not clear staged samples: {error}"),
-                            }
-                            self.quarantine_count = isolation::quarantine_item_count(&self.paths).unwrap_or(0);
-                            self.quarantine_count_loaded = true;
-                            self.security_confirm_clear_quarantine = false;
-                        }
-                        if ui.button("Cancel").clicked() { self.security_confirm_clear_quarantine = false; }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Clear staged copies").clicked() { clear_confirmed = true; }
+                        if ui.button("Cancel").clicked() { close_requested = true; }
                     });
                 });
+            self.security_confirm_clear_quarantine = confirm_open && !close_requested;
+            if clear_confirmed {
+                match isolation::clear_quarantine(&self.paths) {
+                    Ok(count) => self.status_message = format!("Removed {count} staged sample/config item(s). Original workspace files were not changed."),
+                    Err(error) => self.status_message = format!("Could not clear staged samples: {error}"),
+                }
+                self.quarantine_count = isolation::quarantine_item_count(&self.paths).unwrap_or(0);
+                self.quarantine_count_loaded = true;
+                self.security_confirm_clear_quarantine = false;
+            }
         }
     }
 
     fn security_tool_window(&mut self, ctx: &egui::Context, tool: SecurityTool) {
         let index = tool.index();
-        if !self.security_tool_open[index] { return; }
+        // Preserve lazy host detection until a security workspace has actually been opened.
+        if !self.security_tool_open[index] && !self.security_tools_checked { return; }
         self.load_security_detection_if_needed();
 
         let info = tool.info();
@@ -775,12 +922,15 @@ impl NovaApp {
         let mut status = self.security_tool_status[index].clone();
         let scope_ready = security_tools::validate_authorized_scope(&self.security_scope, self.security_scope_confirmed).is_ok();
 
-        egui::Window::new(format!("NOVA · {}", info.name))
+        let snap = self.take_window_snap(info.name, ctx);
+        let mut window = egui::Window::new(format!("NOVA · {}", info.name))
             .open(&mut open)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
-            .default_size([590.0, 410.0])
-            .show(ctx, |ui| {
+            .collapsible(false)
+            .default_size([590.0, 410.0]);
+        if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
+        let shown = window.show(ctx, |ui| {
                 ui.heading(info.name);
                 ui.label(RichText::new(info.description).weak());
                 ui.separator();
@@ -811,7 +961,7 @@ impl NovaApp {
                 }
 
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Official download / project page").clicked() { requested_url = Some(info.website); }
                     if ui.button("Documentation").clicked() { requested_url = Some(info.documentation); }
                 });
@@ -819,6 +969,7 @@ impl NovaApp {
                 ui.separator();
                 ui.label(RichText::new("Safety: these third-party apps run on the Windows host, not inside Windows Sandbox. The scope acknowledgement is a reminder, not an enforced network boundary. Use only approved assets; start with passive or non-invasive features and use active testing only with explicit authorization.").small().weak());
             });
+        if let Some(shown) = shown { self.window_rects.insert(info.name.to_owned(), shown.response.rect); }
 
         self.security_tool_open[index] = open;
         if launch_requested {
@@ -848,8 +999,6 @@ impl NovaApp {
 
     fn unikey_window(&mut self, ctx: &egui::Context) {
         if self.unikey_open { self.detect_unikey_if_needed(); }
-        let mut download_requested = false;
-        let mut start_requested = false;
         let mut stop_requested = false;
         let snap = self.take_window_snap("UniKey", ctx);
         let mut window = egui::Window::new("UniKey — Vietnamese Input")
@@ -858,7 +1007,7 @@ impl NovaApp {
             .resizable(false)
             .default_width(540.0);
         if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        window.open(&mut self.unikey_open).show(ctx, |ui| {
+        let shown = window.open(&mut self.unikey_open).show(ctx, |ui| {
                 ui.heading("Vietnamese typing for NOVA and Windows");
                 ui.label("NOVA uses Unicode text fields and system-font fallback for installed glyphs. UniKey adds Vietnamese Telex/VNI input on the Windows host, including NOVA Editor and Terminal.");
                 ui.separator();
@@ -866,48 +1015,31 @@ impl NovaApp {
                     ui.colored_label(Color32::from_rgb(87, 190, 140), "Portable UniKey executable found on this USB");
                     ui.label(RichText::new(path.display().to_string()).small().weak());
                 } else {
-                    ui.colored_label(Color32::from_rgb(225, 166, 86), "UniKey is not on this USB yet");
-                    ui.label("Download the official 64-bit UniKey build. NOVA verifies the Authenticode signature publisher before launching it.");
+                    ui.colored_label(Color32::from_rgb(225, 166, 86), "UniKey was not bundled in this build.");
+                    ui.label("Rebuild the USB package with internet access so the official UniKey x64 binary can be downloaded and signature-verified automatically.");
                 }
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(self.unikey_child.is_none(), egui::Button::new("Download UniKey to USB")).clicked() {
-                        download_requested = true;
-                    }
-                    if ui.add_enabled(self.unikey_path.is_some() && self.unikey_child.is_none(), egui::Button::new("Start UniKey")).clicked() {
-                        start_requested = true;
-                    }
-                    if self.unikey_process_kind == Some(UniKeyProcessKind::Running)
-                        && ui.button("Stop UniKey").clicked()
-                    {
-                        stop_requested = true;
+                ui.horizontal_wrapped(|ui| {
+                    if self.unikey_process_kind == Some(UniKeyProcessKind::Running) {
+                        ui.colored_label(Color32::from_rgb(87, 190, 140), "UniKey is running");
+                        if ui.button("Stop UniKey").clicked() { stop_requested = true; }
+                    } else if self.unikey_path.is_some() && self.unikey_child.is_none() {
+                        ui.label("UniKey is bundled. Reopen the UniKey shortcut to retry startup.");
+                    } else {
+                        ui.label("UniKey is unavailable in this package.");
                     }
                 });
-                if self.unikey_process_kind == Some(UniKeyProcessKind::Download) {
-                    ui.label(RichText::new("Download is running. Wait for signature verification to finish; NOVA keeps the temporary download cleanup handler active.").small().weak());
-                }
                 ui.label(RichText::new(&self.unikey_status).small().weak());
                 ui.separator();
                 ui.heading("Recommended UniKey settings");
                 ui.label("1. Open the UniKey tray menu.");
                 ui.label("2. Character set: Unicode.");
                 ui.label("3. Input method: Telex or VNI.");
-                ui.label("4. Keep UniKey running while typing. UniKey is a separate Windows-host process, not part of the disposable Sandbox. Closing NOVA stops the UniKey process that NOVA started when it can do so cleanly.");
+                ui.label("4. Keep UniKey running while typing. UniKey is a separate Windows-host process, not part of NOVA or Windows Sandbox. Closing NOVA stops the UniKey process that NOVA started when it can do so cleanly.");
                 ui.label(RichText::new("Official source: unikey.org · Publisher must be PHAM KIM LONG · NOVA verifies Authenticode before launch · No Windows service or startup task is installed.").small().weak());
-                if ui.button("Open official UniKey download page").clicked() {
-                    match unikey::open_official_download_page() {
-                        Ok(()) => self.unikey_status = "Opened the official UniKey download page.".to_owned(),
-                        Err(error) => self.unikey_status = format!("Could not open UniKey website: {error}"),
-                    }
-                }
             });
+        if let Some(shown) = shown { self.window_rects.insert("UniKey".to_owned(), shown.response.rect); }
         // Defer whole-self methods until egui releases the `.open(&mut self.unikey_open)` borrow.
-        if download_requested {
-            self.download_unikey();
-        } else if start_requested {
-            self.start_unikey();
-        } else if stop_requested {
-            self.stop_unikey();
-        }
+        if stop_requested { self.stop_unikey(); }
     }
 
     /// Paint a compact Windows-style desktop/Start shortcut using the shared app catalog.
@@ -924,20 +1056,29 @@ impl NovaApp {
         };
         let dark = self.is_dark_mode(ui.ctx());
         let base_alpha = if desktop { 0 } else if dark { 16 } else { 24 };
-        let hover_alpha = if desktop { 42 } else { 42 };
-        let fill_alpha = (base_alpha as f32 + hover * hover_alpha as f32).round() as u8;
+        let fill_alpha = (base_alpha as f32 + hover * 42.0).round() as u8;
         if fill_alpha > 0 {
+            let fill = if dark {
+                Color32::from_rgba_unmultiplied(255, 255, 255, fill_alpha)
+            } else {
+                Color32::from_rgba_unmultiplied(75, 112, 171, fill_alpha)
+            };
             ui.painter().rect_filled(
                 rect,
                 egui::CornerRadius::same(if desktop { 8 } else { 11 }),
-                Color32::from_rgba_unmultiplied(255, 255, 255, fill_alpha),
+                fill,
             );
         }
-        if response.hovered() && !desktop {
+        if response.hovered() {
+            let stroke = if dark {
+                Color32::from_white_alpha((hover * 70.0).round() as u8)
+            } else {
+                Color32::from_rgb(135, 166, 215).gamma_multiply(hover)
+            };
             ui.painter().rect_stroke(
                 rect,
-                egui::CornerRadius::same(11),
-                egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(145, 178, 245, 95)),
+                egui::CornerRadius::same(if desktop { 8 } else { 11 }),
+                egui::Stroke::new(1.0, stroke),
                 egui::StrokeKind::Inside,
             );
         }
@@ -1000,152 +1141,358 @@ impl NovaApp {
     }
 
     fn take_window_snap(&mut self, app: &str, ctx: &egui::Context) -> Option<(egui::Pos2, egui::Vec2)> {
-        let side = self.window_snap_requests.remove(app)?;
-        let rect = ctx.content_rect();
-        let half_width = (rect.width() * 0.5).max(220.0);
-        let (x, width) = match side {
-            SnapSide::Left => (rect.left(), half_width),
-            SnapSide::Right => (rect.right() - half_width, half_width),
-            SnapSide::Maximize => (rect.left(), (rect.width() - 8.0).max(220.0)),
+        if let Some(side) = self.window_snap_requests.remove(app) {
+            let content = ctx.content_rect();
+            // Reserve the bottom dock and a small safety margin so snapped windows
+            // never cover the taskbar or sit directly against the viewport edge.
+            // Respect the real viewport instead of forcing a desktop-sized snap
+            // rectangle on smaller windows. The old 460/220 px minimums could
+            // push snapped apps beyond the visible work area.
+            let work = egui::Rect::from_min_max(
+                content.min + egui::vec2(10.0, 10.0),
+                content.max - egui::vec2(10.0, 76.0),
+            );
+            let work_width = work.width().max(1.0);
+            let half_width = ((work_width - 8.0) * 0.5).max(1.0);
+            let (x, width) = match side {
+                SnapSide::Left => (work.left(), half_width),
+                SnapSide::Right => (work.right() - half_width, half_width),
+                SnapSide::Maximize => (work.left(), work_width),
+            };
+            let height = work.height().max(1.0);
+            let to_pos = egui::pos2(x, work.top());
+            let to_size = egui::vec2(width, height);
+            if self.settings.reduce_motion {
+                self.window_motions.remove(app);
+                return Some((to_pos, to_size));
+            }
+            let current_rect = self.window_rects.get(app).copied().unwrap_or_else(|| {
+                let fallback_size = egui::vec2(
+                    (width * 0.84).max(320.0).min(width),
+                    (height * 0.88).max(240.0).min(height),
+                );
+                egui::Rect::from_center_size(content.center(), fallback_size)
+            });
+            let from_size = egui::vec2(
+                current_rect.width().clamp(220.0, content.width().max(220.0)),
+                current_rect.height().clamp(220.0, content.height().max(220.0)),
+            );
+            let from_pos = current_rect.min;
+            self.window_motions.insert(app.to_owned(), WindowMotion {
+                from_pos,
+                from_size,
+                to_pos,
+                to_size,
+                started: Instant::now(),
+            });
+        }
+
+        let motion = self.window_motions.get(app).copied()?;
+        let t = (motion.started.elapsed().as_secs_f32() / 0.24).clamp(0.0, 1.0);
+        let eased = t * t * (3.0 - 2.0 * t);
+        let lerp = |a: f32, b: f32| a + (b - a) * eased;
+        let position = egui::pos2(lerp(motion.from_pos.x, motion.to_pos.x), lerp(motion.from_pos.y, motion.to_pos.y));
+        let size = egui::vec2(lerp(motion.from_size.x, motion.to_size.x), lerp(motion.from_size.y, motion.to_size.y));
+        if t >= 1.0 {
+            self.window_motions.remove(app);
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        Some((position, size))
+    }
+
+    fn taskbar_app_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        glyph: &str,
+        name: &str,
+        active: bool,
+        dark: bool,
+    ) -> bool {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, 42.0), egui::Sense::click());
+        let hover = if self.settings.reduce_motion {
+            if response.hovered() { 1.0 } else { 0.0 }
+        } else {
+            ui.ctx().animate_bool_with_time(ui.scope_id().with(("taskbar-hover", name)), response.hovered(), 0.13)
         };
-        let height = (rect.height() - 20.0).max(220.0);
-        Some((egui::pos2(x, rect.top() + 4.0), egui::vec2(width, height)))
+        let idle = if active {
+            if dark { Color32::from_rgb(48, 62, 91) } else { Color32::from_rgb(224, 235, 252) }
+        } else if dark {
+            Color32::from_rgba_unmultiplied(255, 255, 255, 0)
+        } else {
+            Color32::from_rgba_unmultiplied(20, 42, 78, 0)
+        };
+        let hover_fill = if dark { Color32::from_rgb(55, 70, 99) } else { Color32::from_rgb(232, 240, 252) };
+        let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * hover).round() as u8;
+        let fill = Color32::from_rgba_unmultiplied(
+            mix(idle.r(), hover_fill.r()),
+            mix(idle.g(), hover_fill.g()),
+            mix(idle.b(), hover_fill.b()),
+            mix(idle.a(), hover_fill.a()),
+        );
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(12), fill);
+        if active || hover > 0.01 {
+            ui.painter().rect_stroke(
+                rect,
+                egui::CornerRadius::same(12),
+                egui::Stroke::new(1.0, if dark { Color32::from_white_alpha((hover * 22.0) as u8) } else { Color32::from_black_alpha((hover * 16.0) as u8) }),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let icon_color = if dark { Color32::from_rgb(235, 241, 252) } else { Color32::from_rgb(35, 49, 71) };
+        ui.painter().text(
+            rect.center() + egui::vec2(0.0, -hover * 1.6),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            FontId::proportional(20.0 + hover * 1.0),
+            icon_color,
+        );
+        if active {
+            let marker_width = 15.0 + hover * 5.0;
+            let marker = egui::Rect::from_center_size(
+                egui::pos2(rect.center().x, rect.bottom() - 2.2),
+                egui::vec2(marker_width, 3.0),
+            );
+            let accent = ui.style().visuals.selection.bg_fill;
+            ui.painter().rect_filled(marker, egui::CornerRadius::same(2), accent);
+        }
+        if name != "Google Chrome" {
+            response.context_menu(|ui| {
+                ui.label(RichText::new(format!("Arrange {name}")).small().weak());
+                if ui.button("Snap to left half").clicked() {
+                    self.open_app(name);
+                    self.window_snap_requests.insert(name.to_owned(), SnapSide::Left);
+                    ui.close();
+                }
+                if ui.button("Snap to right half").clicked() {
+                    self.open_app(name);
+                    self.window_snap_requests.insert(name.to_owned(), SnapSide::Right);
+                    ui.close();
+                }
+                if ui.button("Fill desktop").clicked() {
+                    self.open_app(name);
+                    self.window_snap_requests.insert(name.to_owned(), SnapSide::Maximize);
+                    ui.close();
+                }
+            });
+        }
+        response.on_hover_text(name).clicked()
     }
 
     fn taskbar(&mut self, ui: &mut egui::Ui) {
         let dark = self.is_dark_mode(ui.ctx());
+        let dock_width = ui.ctx().content_rect().width().max(1.0);
+        let horizontal_padding = if dock_width < 440.0 { 4.0 } else if dock_width < 760.0 { 8.0 } else { 12.0 };
         let taskbar_fill = if dark {
-            Color32::from_rgba_unmultiplied(20, 27, 43, 238)
+            Color32::from_rgba_unmultiplied(22, 30, 47, 242)
         } else {
-            Color32::from_rgba_unmultiplied(248, 250, 255, 244)
+            Color32::from_rgba_unmultiplied(250, 252, 255, 246)
         };
+        let border = if dark { Color32::from_white_alpha(28) } else { Color32::from_black_alpha(20) };
         egui::Frame::new()
             .fill(taskbar_fill)
-            .stroke(egui::Stroke::new(1.0, if dark { Color32::from_white_alpha(24) } else { Color32::from_black_alpha(18) }))
-            .corner_radius(egui::CornerRadius::same(14))
-            .inner_margin(egui::Margin::symmetric(12, 6))
+            .stroke(egui::Stroke::new(1.0, border))
+            .shadow(egui::Shadow { offset: [0, 5], blur: 24, spread: 0, color: Color32::from_black_alpha(55) })
+            .corner_radius(egui::CornerRadius::same(18))
+            .inner_margin(egui::Margin::symmetric(horizontal_padding as i8, 5))
             .show(ui, |ui| {
                 ui.set_min_height(48.0);
                 ui.horizontal_centered(|ui| {
-                    if ui.add_sized(
-                        [38.0, 38.0],
-                        egui::Button::new(RichText::new("⊞").size(27.0).color(Color32::from_rgb(105, 157, 245)))
-                            .corner_radius(egui::CornerRadius::same(10)),
-                    ).on_hover_text("Start").clicked() {
-                        self.start_open = !self.start_open;
-                        self.start_show_all = false;
-                    }
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let (left_width, center_width, right_width, ultra_compact, medium) =
+                        taskbar_rail_widths(ui.available_width());
+                    // Keep the app group visually centered while allowing it to scroll.
 
-                    let search_width = ui.available_width().clamp(78.0, 132.0);
-                    if ui.add_sized(
-                        [search_width, 34.0],
-                        egui::Button::new(RichText::new("⌕   Search").size(13.0))
-                            .corner_radius(egui::CornerRadius::same(18)),
-                    ).clicked() {
-                        self.start_open = true;
-                        self.start_show_all = false;
-                    }
-                    ui.add_space(5.0);
-                    ui.separator();
-                    ui.add_space(3.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(left_width, 44.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            if left_width >= 24.0 {
+                                let logo_text = if ultra_compact || medium { "✦" } else { "✦  NOVA" };
+                                let logo_width = if ultra_compact { left_width.min(34.0) } else if medium { left_width.min(44.0) } else { left_width.min(90.0) };
+                                let accent = ui.style().visuals.selection.bg_fill;
+                                let logo = egui::Button::new(RichText::new(logo_text).size(13.0).strong().color(accent))
+                                    .min_size(egui::vec2(logo_width, 38.0))
+                                    .corner_radius(egui::CornerRadius::same(12));
+                                if ui.add_sized([logo_width, 38.0], logo).on_hover_text("NOVA desktop workspace · Open Settings").clicked() {
+                                    self.settings_open = true;
+                                }
+                            }
+                        },
+                    );
 
-                    let task_apps = [
-                        ("▦", "Files", self.files_open),
-                        ("⌘", "Terminal", self.terminal_open),
-                        ("✎", "Editor", self.editor_open),
-                        ("∑", "Calculator", self.calculator_open),
-                        ("◉", "Monitor", self.monitor_open),
-                        ("▤", "Trash", self.trash_open),
-                        ("🛡", "Security Center", self.security_open),
-                        ("◎", "Network Discovery", self.security_tool_open[SecurityTool::NetworkDiscovery.index()]),
-                        ("◈", "Vulnerability Management", self.security_tool_open[SecurityTool::VulnerabilityManagement.index()]),
-                        ("⌁", "Web Security", self.security_tool_open[SecurityTool::WebSecurity.index()]),
-                        ("▥", "Packet Analyzer", self.security_tool_open[SecurityTool::PacketAnalyzer.index()]),
-                        ("⇄", "Web / API Inspector", self.security_tool_open[SecurityTool::WebApiInspector.index()]),
-                        ("🌐", "Google Chrome", self.chrome_open),
-                        ("文", "UniKey", self.unikey_open),
-                        ("⚙", "Settings", self.settings_open),
-                    ];
-                    let app_strip_width = (ui.available_width() - 108.0).max(112.0);
-                    let task_icon_width = if app_strip_width < 420.0 { 30.0 } else { 34.0 };
-                    egui::ScrollArea::horizontal()
-                        .id_salt("nova-taskbar-running-apps")
-                        .max_width(app_strip_width)
-                        .max_height(42.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                for (glyph, name, active) in task_apps {
-                                    let active_fill = if dark { Color32::from_rgb(47, 61, 88) } else { Color32::from_rgb(224, 234, 250) };
-                                    let button = egui::Button::new(RichText::new(glyph).size(if task_icon_width < 34.0 { 17.0 } else { 20.0 }))
-                                        .min_size(egui::vec2(task_icon_width, 36.0))
-                                        .corner_radius(egui::CornerRadius::same(9))
-                                        .fill(if active { active_fill } else { Color32::TRANSPARENT });
-                                    let response = ui.add(button).on_hover_text(name);
-                                    if response.clicked() { self.toggle_app(name); }
-                                    response.context_menu(|ui| {
-                                        ui.label(RichText::new(format!("Arrange {name}")).small().weak());
-                                        if ui.button("Snap to left half").clicked() {
-                                            self.open_app(name);
-                                            self.window_snap_requests.insert(name.to_owned(), SnapSide::Left);
-                                            ui.close();
-                                        }
-                                        if ui.button("Snap to right half").clicked() {
-                                            self.open_app(name);
-                                            self.window_snap_requests.insert(name.to_owned(), SnapSide::Right);
-                                            ui.close();
-                                        }
-                                        if ui.button("Fill desktop").clicked() {
-                                            self.open_app(name);
-                                            self.window_snap_requests.insert(name.to_owned(), SnapSide::Maximize);
-                                            ui.close();
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(center_width, 44.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let mut task_apps: Vec<(&'static str, &'static str, bool)> = self.settings.pinned_apps
+                                .iter()
+                                .filter_map(|name| START_APPS.iter().find(|app| app.name == name.as_str()))
+                                .map(|app| (app.icon, app.name, self.app_is_open(app.name)))
+                                .collect();
+                            for app in &START_APPS {
+                                if self.app_is_open(app.name)
+                                    && !task_apps.iter().any(|(_, name, _)| *name == app.name)
+                                {
+                                    task_apps.push((app.icon, app.name, true));
+                                }
+                            }
+                            let show_search = center_width >= 520.0;
+                            let search_width = if show_search { 88.0 } else { 0.0 };
+                            let estimated = 40.0 + search_width + if show_search { 8.0 } else { 4.0 }
+                                + task_apps.len() as f32 * 40.0
+                                + task_apps.len().saturating_sub(1) as f32 * 4.0;
+                            ui.add_space(((center_width - estimated).max(0.0)) * 0.5);
+
+                            let accent = ui.style().visuals.selection.bg_fill;
+                            if center_width >= 24.0 {
+                                let start_button_width = center_width.min(40.0);
+                                if ui.add_sized(
+                                    [start_button_width, 38.0],
+                                    egui::Button::new(RichText::new("⊞").size((start_button_width * 0.68).min(27.0)).color(accent))
+                                        .corner_radius(egui::CornerRadius::same(12)),
+                                ).on_hover_text("Start · Ctrl+Space").clicked() {
+                                    self.start_open = !self.start_open;
+                                    self.start_show_all = false;
+                                    self.notification_open = false;
+                                }
+                            }
+                            if show_search && ui.add_sized(
+                                [search_width, 34.0],
+                                egui::Button::new(RichText::new("⌕  Search").size(13.0))
+                                    .corner_radius(egui::CornerRadius::same(18)),
+                            ).clicked() {
+                                self.start_open = true;
+                                self.start_show_all = false;
+                                self.notification_open = false;
+                            }
+                            ui.add_space(4.0);
+                            egui::ScrollArea::horizontal()
+                                .id_salt("nova-taskbar-centered-apps")
+                                .max_width(ui.available_width().max(0.0))
+                                .max_height(44.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.horizontal_centered(|ui| {
+                                        for (glyph, name, active) in task_apps {
+                                            if self.taskbar_app_button(ui, glyph, name, active, dark) {
+                                                self.toggle_app(name);
+                                            }
                                         }
                                     });
-                                }
-                            });
-                        });
+                                });
+                        },
+                    );
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_sized([34.0, 36.0], egui::Button::new("☰").corner_radius(egui::CornerRadius::same(9)))
-                            .on_hover_text("Quick Settings and recent NOVA activity").clicked() {
-                            self.notification_open = !self.notification_open;
-                        }
-                        if ui.add_sized([34.0, 36.0], egui::Button::new("◉").corner_radius(egui::CornerRadius::same(9)))
-                            .on_hover_text("System Monitor").clicked() {
-                            self.monitor_open = true;
-                        }
-                        let mode = if self.paths.portable { "USB" } else { "LOCAL" };
-                        ui.label(RichText::new(format!("● {mode}")).small().color(Color32::from_rgb(105, 190, 158)));
-                    });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(right_width, 44.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            if right_width >= 34.0
+                                && ui.add_sized([30.0, 36.0], egui::Button::new("☰").corner_radius(egui::CornerRadius::same(10)))
+                                    .on_hover_text("Quick Settings and recent activity").clicked() {
+                                self.notification_open = !self.notification_open;
+                                self.start_open = false;
+                            }
+                            if !ultra_compact {
+                                let (clock, date) = local_clock_strings();
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(if medium { 58.0 } else { 64.0 }, 36.0),
+                                    egui::Layout::top_down(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(RichText::new(clock).size(12.0).strong().color(if dark { Color32::from_rgb(231, 237, 248) } else { Color32::from_rgb(40, 52, 72) }));
+                                        ui.label(RichText::new(date).size(10.0).color(if dark { Color32::from_rgb(166, 180, 204) } else { Color32::from_rgb(91, 105, 128) }));
+                                    },
+                                );
+                                if !medium && ui.add_sized([30.0, 36.0], egui::Button::new("◉").corner_radius(egui::CornerRadius::same(10)))
+                                    .on_hover_text("System Monitor").clicked() {
+                                    self.monitor_open = true;
+                                }
+                                if ui.add_sized([30.0, 36.0], egui::Button::new("⌁").corner_radius(egui::CornerRadius::same(10)))
+                                    .on_hover_text("Network settings").clicked() {
+                                    self.settings_page = 3;
+                                    self.settings_open = true;
+                                }
+                            }
+                        },
+                    );
                 });
             });
+        // Keep the taskbar clock fresh without polling every frame.
+        ui.ctx().request_repaint_after(Duration::from_secs(20));
     }
 
     fn notification_center(&mut self, ctx: &egui::Context) {
-        if !self.notification_open { return; }
+        let visibility = if self.settings.reduce_motion {
+            if self.notification_open { 1.0 } else { 0.0 }
+        } else {
+            ctx.animate_bool_with_time(egui::Id::unique("nova-quick-settings-visibility"), self.notification_open, 0.19)
+        };
+        if visibility <= 0.001 { return; }
+        let eased = visibility * visibility * (3.0 - 2.0 * visibility);
+        if eased < 0.999 { ctx.request_repaint_after(Duration::from_millis(16)); }
+        let slide = if self.settings.reduce_motion { 0.0 } else { (1.0 - eased) * 13.0 };
         let dark = self.is_dark_mode(ctx);
+        let content_width = ctx.content_rect().width().max(1.0);
+        let panel_width = (content_width - 24.0).max(1.0).min(320.0);
+        let panel_margin = ((panel_width - 1.0) * 0.5).clamp(0.0, 17.0) as i8;
+        let panel_inner_width = (panel_width - panel_margin as f32 * 2.0).max(1.0);
         let fill = if dark { Color32::from_rgb(25, 32, 49) } else { Color32::from_rgb(249, 251, 255) };
         egui::Area::new(egui::Id::unique("nova-quick-settings-panel"))
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -66.0))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -66.0 + slide))
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).fill(fill).corner_radius(egui::CornerRadius::same(16))
-                    .inner_margin(egui::Margin::same(16)).show(ui, |ui| {
-                        ui.set_min_width(270.0);
-                        ui.set_max_width(320.0);
-                        ui.horizontal(|ui| {
-                            ui.heading("Quick settings");
+                ui.set_opacity(eased);
+                egui::Frame::popup(ui.style()).fill(fill).stroke(egui::Stroke::new(1.0, if dark { Color32::from_white_alpha(25) } else { Color32::from_black_alpha(20) })).corner_radius(egui::CornerRadius::same(18))
+                    .shadow(egui::Shadow { offset: [0, 12], blur: 28, spread: 0, color: Color32::from_black_alpha(75) })
+                    .inner_margin(egui::Margin::same(panel_margin)).show(ui, |ui| {
+                        // The inner width plus dynamic frame padding always equals
+                        // the bounded outer panel width.
+                        ui.set_min_width(panel_inner_width);
+                        ui.set_max_width(panel_inner_width);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Quick settings").size(16.0).strong());
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button("✕").clicked() { self.notification_open = false; }
                             });
                         });
                         ui.label(RichText::new(if self.paths.portable { "USB portable workspace" } else { "Local workspace" }).small().weak());
                         ui.separator();
-                        ui.horizontal(|ui| {
-                            if ui.button("⚙ Settings").clicked() { self.settings_open = true; self.notification_open = false; }
-                            if ui.button("◉ Monitor").clicked() { self.monitor_open = true; self.notification_open = false; }
+                        ui.label(RichText::new("Quick controls").small().strong().weak());
+                        ui.horizontal_wrapped(|ui| {
+                            let compact_controls = panel_width < 280.0;
+                            let control_gap = ui.spacing().item_spacing.x;
+                            let control_width = ((ui.available_width() - control_gap) * 0.5).max(1.0);
+                            let theme_label = if compact_controls {
+                                if dark { "☀ Light" } else { "☾ Dark" }
+                            } else if dark { "☀  Light mode" } else { "☾  Dark mode" };
+                            let motion_label = if compact_controls {
+                                if self.settings.reduce_motion { "Motion On" } else { "Motion Off" }
+                            } else if self.settings.reduce_motion { "Motion: reduced" } else { "Motion: full" };
+                            if ui.add_sized([control_width, 40.0], egui::Button::new(theme_label)).clicked() {
+                                self.settings.theme = if dark { "light".to_owned() } else { "dark".to_owned() };
+                                self.applied_theme.clear();
+                                self.status_message = match self.paths.save_settings(&self.settings) {
+                                    Ok(()) => format!("Theme changed to {} mode.", self.settings.theme),
+                                    Err(error) => format!("Theme changed for this session but could not be saved: {error}"),
+                                };
+                            }
+                            if ui.add_sized([control_width, 40.0], egui::Button::new(motion_label)).clicked() {
+                                self.settings.reduce_motion = !self.settings.reduce_motion;
+                                self.status_message = match self.paths.save_settings(&self.settings) {
+                                    Ok(()) => if self.settings.reduce_motion { "Reduced motion enabled.".to_owned() } else { "Full motion enabled.".to_owned() },
+                                    Err(error) => format!("Motion setting changed for this session but could not be saved: {error}"),
+                                };
+                            }
                         });
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("⌁ Network").clicked() { self.settings_page = 3; self.settings_open = true; self.notification_open = false; }
+                            if ui.button("⚙ Settings").clicked() { self.settings_open = true; self.notification_open = false; }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("◉ Monitor").clicked() { self.monitor_open = true; self.notification_open = false; }
                             if ui.button("▦ Files").clicked() { self.files_open = true; self.ensure_files_loaded(); self.notification_open = false; }
                             if ui.button("⌘ Terminal").clicked() { self.terminal_open = true; self.notification_open = false; }
                         });
@@ -1162,24 +1509,28 @@ impl NovaApp {
         if self.start_open && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.start_open = false;
         }
-        let visibility = if self.settings.reduce_motion {
+        let raw_visibility = if self.settings.reduce_motion {
             if self.start_open { 1.0 } else { 0.0 }
         } else {
-            ctx.animate_bool_with_time(egui::Id::unique("nova-windows-start-menu"), self.start_open, 0.20)
+            ctx.animate_bool_with_time(egui::Id::unique("nova-windows-start-menu"), self.start_open, 0.22)
         };
-        if visibility <= 0.001 {
+        if raw_visibility <= 0.001 {
             return;
+        }
+        let visibility = raw_visibility * raw_visibility * (3.0 - 2.0 * raw_visibility);
+        if visibility < 0.999 && !self.settings.reduce_motion {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
 
         let mut selected_app: Option<&'static str> = None;
         let mut show_pinned = false;
         let mut show_all = false;
         let content_rect = ctx.content_rect();
-        let screen_width = content_rect.width();
-        let menu_height = (content_rect.height() - 190.0).clamp(160.0, 390.0);
-        let menu_width = (screen_width - 20.0).clamp(300.0, 680.0);
-        let pinned_columns = (((menu_width - 40.0) / 91.0).floor() as usize).clamp(2, 6);
-        let slide_up = if self.settings.reduce_motion { 0.0 } else { (1.0 - visibility) * 16.0 };
+        let (menu_width, menu_height, pinned_columns) =
+            start_menu_dimensions(content_rect.width(), content_rect.height());
+        let menu_margin = ((menu_width - 1.0) * 0.5).clamp(0.0, 19.0) as i8;
+        let menu_inner_width = (menu_width - menu_margin as f32 * 2.0).max(1.0);
+        let slide_up = if self.settings.reduce_motion { 0.0 } else { (1.0 - visibility) * 18.0 };
         let dark = self.is_dark_mode(ctx);
         let surface = if dark {
             Color32::from_rgba_unmultiplied(25, 32, 49, 246)
@@ -1191,7 +1542,6 @@ impl NovaApp {
         egui::Area::new(egui::Id::unique("nova-start-menu-panel"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -66.0 + slide_up))
-            .fade_in(!self.settings.reduce_motion)
             .show(ctx, |ui| {
                 ui.set_opacity(visibility);
                 egui::Frame::new()
@@ -1204,10 +1554,10 @@ impl NovaApp {
                         color: Color32::from_black_alpha(90),
                     })
                     .corner_radius(egui::CornerRadius::same(18))
-                    .inner_margin(egui::Margin::same(19))
+                    .inner_margin(egui::Margin::same(menu_margin))
                     .show(ui, |ui| {
-                        ui.set_min_width(menu_width - 38.0);
-                        ui.set_max_width(menu_width - 38.0);
+                        ui.set_min_width(menu_inner_width);
+                        ui.set_max_width(menu_inner_width);
 
                         ui.add(
                             TextEdit::singleline(&mut self.start_search)
@@ -1218,7 +1568,7 @@ impl NovaApp {
                         ui.add_space(13.0);
 
                         if self.start_show_all {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.heading(RichText::new("All apps").size(19.0).strong());
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.button("← Pinned").clicked() { show_pinned = true; }
@@ -1237,16 +1587,19 @@ impl NovaApp {
                                     if items.is_empty() { continue; }
                                     ui.label(RichText::new(category.to_uppercase()).small().strong().weak());
                                     ui.add_space(4.0);
+                                    let columns = if ui.available_width() < 390.0 { 1 } else { 2 };
+                                    let gap = 8.0;
+                                    let button_width = ((ui.available_width() - gap * (columns - 1) as f32) / columns as f32).max(1.0);
                                     egui::Grid::new(("nova-start-category", category))
-                                        .num_columns(2)
-                                        .spacing(egui::vec2(8.0, 5.0))
+                                        .num_columns(columns)
+                                        .spacing(egui::vec2(gap, 5.0))
                                         .show(ui, |ui| {
                                             for (index, app) in items.iter().enumerate() {
                                                 let label = format!("{}   {}\n       {}", app.icon, app.name, app.description);
-                                                if ui.add_sized([menu_width * 0.5 - 39.0, 47.0], egui::Button::new(RichText::new(label).size(12.0)).corner_radius(egui::CornerRadius::same(9))).clicked() {
+                                                if ui.add_sized([button_width, 47.0], egui::Button::new(RichText::new(label).size(12.0)).corner_radius(egui::CornerRadius::same(9))).clicked() {
                                                     selected_app = Some(app.name);
                                                 }
-                                                if index % 2 == 1 { ui.end_row(); }
+                                                if (index + 1) % columns == 0 { ui.end_row(); }
                                             }
                                         });
                                     ui.add_space(9.0);
@@ -1258,13 +1611,17 @@ impl NovaApp {
                                 }
                             });
                         } else {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.heading(RichText::new(if query.is_empty() { "Pinned" } else { "Search results" }).size(19.0).strong());
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.button("All apps  →").clicked() { show_all = true; }
                                 });
                             });
                             ui.add_space(7.0);
+                            egui::ScrollArea::vertical()
+                                .max_height(menu_height)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
                             let matching: Vec<StartApp> = if query.is_empty() {
                                 self.settings.pinned_apps.iter().filter_map(|name| START_APPS.iter().find(|app| app.name == name.as_str()).copied()).collect()
                             } else {
@@ -1291,7 +1648,7 @@ impl NovaApp {
                                 ui.add_space(11.0);
                                 ui.separator();
                                 ui.add_space(7.0);
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.heading(RichText::new("Recommended").size(17.0).strong());
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         ui.label(RichText::new("Quick access").small().weak());
@@ -1299,22 +1656,36 @@ impl NovaApp {
                                 });
                                 ui.add_space(5.0);
                                 let quick = ["Files", "Terminal", "Settings"];
-                                ui.horizontal(|ui| {
-                                    for name in quick {
-                                        if let Some(app) = START_APPS.iter().find(|app| app.name == name).copied() {
-                                            if ui.add_sized([menu_width / 3.0 - 34.0, 43.0], egui::Button::new(format!("{}  {}\n      {}", app.icon, app.name, app.description)).corner_radius(egui::CornerRadius::same(9))).clicked() {
-                                                selected_app = Some(app.name);
+                                let quick_available = ui.available_width().max(1.0);
+                                let quick_columns = if quick_available < 310.0 { 1 } else if quick_available < 470.0 { 2 } else { 3 };
+                                let quick_button_width = (quick_available
+                                    - (quick_columns.saturating_sub(1) as f32 * 8.0))
+                                    / quick_columns as f32;
+                                egui::Grid::new("nova-start-quick-access")
+                                    .num_columns(quick_columns)
+                                    .spacing(egui::vec2(8.0, 6.0))
+                                    .show(ui, |ui| {
+                                        for (index, name) in quick.iter().enumerate() {
+                                            if let Some(app) = START_APPS.iter().find(|app| app.name == *name).copied() {
+                                                if ui.add_sized(
+                                                    [quick_button_width, 43.0],
+                                                    egui::Button::new(format!("{}  {}\n      {}", app.icon, app.name, app.description))
+                                                        .corner_radius(egui::CornerRadius::same(9)),
+                                                ).clicked() {
+                                                    selected_app = Some(app.name);
+                                                }
                                             }
+                                            if (index + 1) % quick_columns == 0 { ui.end_row(); }
                                         }
-                                    }
-                                });
+                                    });
                             }
+                                });
                         }
 
                         ui.add_space(9.0);
                         ui.separator();
                         ui.add_space(5.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("◉  NOVA User").size(12.0).strong());
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.label(RichText::new(if self.paths.portable { "Portable workspace" } else { "Local workspace" }).small().weak());
@@ -1384,13 +1755,17 @@ impl NovaApp {
         let mut clear_output = false;
         let snap = self.take_window_snap("Terminal", ctx);
         let mut window = egui::Window::new("NOVA Terminal — Windows CMD")
+            .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
-            .default_size([760.0, 490.0])
-            .min_width(420.0);
-        if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        window.open(&mut self.terminal_open).show(ctx, |ui| {
-                ui.horizontal(|ui| {
+            .default_size([760.0, 490.0]);
+        if let Some((position, size)) = snap {
+            window = window.current_pos(position).fixed_size(size);
+        } else {
+            window = window.min_width(220.0);
+        }
+        let shown = window.open(&mut self.terminal_open).show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(self.terminal.prompt()).monospace().color(Color32::from_rgb(117, 203, 172)));
                     if self.terminal.wifi_mode.is_some() {
                         ui.label(RichText::new("Wi-Fi setup mode · input hidden").small().weak());
@@ -1405,7 +1780,7 @@ impl NovaApp {
                 });
                 egui::ScrollArea::vertical()
                     .stick_to_bottom(true)
-                    .max_height(ui.available_height() - 82.0)
+                    .max_height((ui.available_height() - 82.0).max(80.0))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for line in &self.terminal.output {
@@ -1413,7 +1788,7 @@ impl NovaApp {
                         }
                     });
                 ui.separator();
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let prompt = self.terminal.prompt();
                     ui.label(RichText::new(prompt).monospace().color(Color32::from_rgb(117, 203, 172)));
                     let hide_input = self.terminal.password_entry();
@@ -1434,6 +1809,7 @@ impl NovaApp {
                 });
                 ui.label(RichText::new("CMD runs on the Windows host with your account permissions. It is NOT isolated; never run unknown commands here.").small().weak());
             });
+        if let Some(shown) = shown { self.window_rects.insert("Terminal".to_owned(), shown.response.rect); }
         if clear_output { self.terminal.clear(); }
         if submit && !self.terminal_busy {
             let line = std::mem::take(&mut self.terminal.input);
@@ -1454,13 +1830,17 @@ impl NovaApp {
         let mut refresh = false;
         let snap = self.take_window_snap("Files", ctx);
         let mut window = egui::Window::new("▦  NOVA Files")
+            .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
-            .default_size([760.0, 520.0])
-            .min_width(420.0);
-        if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        window.open(&mut self.files_open).show(ctx, |ui| {
-                ui.horizontal(|ui| {
+            .default_size([760.0, 520.0]);
+        if let Some((position, size)) = snap {
+            window = window.current_pos(position).fixed_size(size);
+        } else {
+            window = window.min_width(220.0);
+        }
+        let shown = window.open(&mut self.files_open).show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("↑  Up").clicked() && self.files_dir != self.paths.user_dir {
                         navigate_to = self.files_dir.parent().map(Path::to_path_buf);
                     }
@@ -1470,16 +1850,19 @@ impl NovaApp {
                     ui.label(RichText::new(format!("Home  /  {}", relative.display())).weak());
                 });
                 ui.separator();
-                ui.horizontal(|ui| {
-                    ui.add(TextEdit::singleline(&mut self.files_new_folder).hint_text("New folder name").desired_width(170.0));
+                let toolbar_width = ui.available_width();
+                let folder_input_width = (toolbar_width * 0.30).clamp(96.0, 170.0);
+                let filter_input_width = (toolbar_width * 0.26).clamp(96.0, 150.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(TextEdit::singleline(&mut self.files_new_folder).hint_text("New folder name").desired_width(folder_input_width));
                     if ui.button("＋ New folder").clicked() { create_folder = true; }
                     ui.separator();
-                    ui.add(TextEdit::singleline(&mut self.files_search).hint_text("Filter this folder…").desired_width(150.0));
+                    ui.add(TextEdit::singleline(&mut self.files_search).hint_text("Filter this folder…").desired_width(filter_input_width));
                     ui.selectable_value(&mut self.files_grid_view, false, "☷ List");
                     ui.selectable_value(&mut self.files_grid_view, true, "▦ Grid");
                 });
                 if self.files_selected.is_some() {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button("Open selected").clicked() {
                             if let Some(selected) = self.files_selected.as_ref() {
                                 if selected.is_dir() { navigate_to = Some(selected.clone()); }
@@ -1528,17 +1911,25 @@ impl NovaApp {
                         });
                     } else {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("NAME").small().strong().weak());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.label(RichText::new("SIZE").small().strong().weak()); });
+                            let name_width = (ui.available_width() - 64.0 - ui.spacing().item_spacing.x).max(24.0);
+                            ui.add_sized([name_width, 20.0], egui::Label::new(RichText::new("NAME").small().strong().weak()));
+                            ui.add_sized([64.0, 20.0], egui::Label::new(RichText::new("SIZE").small().strong().weak()));
                         });
                         for entry in &visible_entries {
                             let path = entry.path.clone();
                             let selected = self.files_selected.as_ref() == Some(&path);
+                            let row_width = ui.available_width().max(1.0);
+                            let size_width = 64.0_f32.min(row_width * 0.42).max(42.0_f32.min(row_width));
+                            let name_width = (row_width - size_width - ui.spacing().item_spacing.x).max(1.0);
+                            let max_chars = ((name_width - 28.0).max(8.0) / 7.2).floor() as usize;
+                            let display_name = compact_file_name(&entry.name, max_chars);
                             ui.horizontal(|ui| {
-                                let response = ui.selectable_label(selected, format!("{}  {}", if entry.is_dir { "▰" } else { "▤" }, entry.name));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.label(RichText::new(&entry.display_size).small().weak());
-                                });
+                                let response = ui.add_sized(
+                                    [name_width, 27.0],
+                                    egui::Button::selectable(selected, format!("{}  {}", if entry.is_dir { "▰" } else { "▤" }, display_name))
+                                        .corner_radius(egui::CornerRadius::same(7)),
+                                );
+                                ui.add_sized([size_width, 27.0], egui::Label::new(RichText::new(&entry.display_size).small().weak()));
                                 if response.clicked() { self.files_selected = Some(path.clone()); }
                                 if response.double_clicked() {
                                     if entry.is_dir { navigate_to = Some(path.clone()); } else { open_file = Some(path.clone()); }
@@ -1557,6 +1948,7 @@ impl NovaApp {
                 ui.separator();
                 ui.label(RichText::new("Single-click to select · Double-click to open · Deleted items stay in NOVA Trash until permanently removed").small().weak());
             });
+        if let Some(shown) = shown { self.window_rects.insert("Files".to_owned(), shown.response.rect); }
 
         if refresh {
             self.files_selected = None;
@@ -1650,14 +2042,16 @@ impl NovaApp {
         let mut new_document = false;
         let snap = self.take_window_snap("Editor", ctx);
         let mut window = egui::Window::new("NOVA Text Editor")
+            .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
             .default_size([700.0, 520.0]);
         if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        window.open(&mut self.editor_open).show(ctx, |ui| {
-                ui.horizontal(|ui| {
+        let shown = window.open(&mut self.editor_open).show(ctx, |ui| {
+                let path_width = (ui.available_width() * 0.48).clamp(110.0, 330.0);
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Path (inside NOVA user folder):");
-                    ui.add(TextEdit::singleline(&mut self.editor_path).desired_width(330.0));
+                    ui.add(TextEdit::singleline(&mut self.editor_path).desired_width(path_width));
                     if ui.button("New").clicked() { new_document = true; }
                     if ui.button("Save").clicked() { save = true; }
                 });
@@ -1667,14 +2061,13 @@ impl NovaApp {
                         .desired_rows(20)
                         .desired_width(f32::INFINITY),
                 );
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(&self.editor_status).small().weak());
-                    ui.label(RichText::new("Unicode: UTF-8 / UTF-16 files · Vietnamese input via UniKey (Unicode mode)").small().weak());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(format!("{} chars · {} words", self.editor_text.chars().count(), self.editor_text.split_whitespace().count())).small().weak());
-                    });
+                    ui.label(RichText::new("Unicode: UTF-8 / UTF-16 · UniKey input").small().weak());
+                    ui.label(RichText::new(format!("{} chars · {} words", self.editor_text.chars().count(), self.editor_text.split_whitespace().count())).small().weak());
                 });
             });
+        if let Some(shown) = shown { self.window_rects.insert("Editor".to_owned(), shown.response.rect); }
         if new_document {
             self.editor_path = "Documents/Untitled.txt".to_owned();
             self.editor_text.clear();
@@ -1740,13 +2133,17 @@ impl NovaApp {
         let mut open_files_requested = false;
         let snap = self.take_window_snap("Settings", ctx);
         let mut window = egui::Window::new("⚙  NOVA Settings")
+            .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
-            .default_size([620.0, 460.0])
-            .min_width(480.0);
-        if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        window.open(&mut self.settings_open).show(ctx, |ui| {
-                ui.horizontal(|ui| {
+            .default_size([620.0, 460.0]);
+        if let Some((position, size)) = snap {
+            window = window.current_pos(position).fixed_size(size);
+        } else {
+            window = window.min_width(220.0);
+        }
+        let shown = window.open(&mut self.settings_open).show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.vertical(|ui| {
                         ui.heading("Settings");
                         ui.label(RichText::new("Personalize your NOVA workspace").small().weak());
@@ -1766,39 +2163,70 @@ impl NovaApp {
                 ui.separator();
                 match self.settings_page {
                     0 => {
-                        ui.columns(2, |columns| {
-                            columns[0].heading("Theme");
-                            columns[0].horizontal(|ui| {
-                                changed |= ui.selectable_value(&mut self.settings.theme, "system".to_owned(), "System").changed();
-                                changed |= ui.selectable_value(&mut self.settings.theme, "dark".to_owned(), "Dark").changed();
-                                changed |= ui.selectable_value(&mut self.settings.theme, "light".to_owned(), "Light").changed();
-                            });
-                            columns[0].add_space(10.0);
-                            columns[0].heading("Accent color");
-                            egui::ComboBox::from_id_salt("nova-accent")
-                                .selected_text(self.settings.accent.to_uppercase())
-                                .show_ui(&mut columns[0], |ui| {
-                                    for accent in ["blue", "violet", "teal", "rose", "amber"] {
-                                        changed |= ui.selectable_value(&mut self.settings.accent, accent.to_owned(), accent.to_uppercase()).changed();
-                                    }
+                        let accent_color = match self.settings.accent.as_str() {
+                            "violet" => Color32::from_rgb(151, 120, 255),
+                            "teal" => Color32::from_rgb(50, 190, 174),
+                            "rose" => Color32::from_rgb(238, 112, 151),
+                            "amber" => Color32::from_rgb(232, 171, 76),
+                            _ => Color32::from_rgb(92, 139, 245),
+                        };
+                        if ui.available_width() < 560.0 {
+                            ui.vertical(|ui| {
+                                ui.heading("Theme");
+                                ui.horizontal_wrapped(|ui| {
+                                    changed |= ui.selectable_value(&mut self.settings.theme, "system".to_owned(), "System").changed();
+                                    changed |= ui.selectable_value(&mut self.settings.theme, "dark".to_owned(), "Dark").changed();
+                                    changed |= ui.selectable_value(&mut self.settings.theme, "light".to_owned(), "Light").changed();
                                 });
-                            columns[1].heading("Preview");
-                            columns[1].group(|ui| {
-                                ui.label(RichText::new("NOVA OS").size(20.0).strong());
-                                ui.label("Portable desktop workspace");
                                 ui.add_space(8.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("●  Accent");
-                                    ui.label(RichText::new("Active").color(match self.settings.accent.as_str() {
-                                        "violet" => Color32::from_rgb(151, 120, 255),
-                                        "teal" => Color32::from_rgb(50, 190, 174),
-                                        "rose" => Color32::from_rgb(238, 112, 151),
-                                        "amber" => Color32::from_rgb(232, 171, 76),
-                                        _ => Color32::from_rgb(92, 139, 245),
-                                    }));
+                                ui.heading("Accent color");
+                                egui::ComboBox::from_id_salt("nova-accent")
+                                    .selected_text(self.settings.accent.to_uppercase())
+                                    .show_ui(ui, |ui| {
+                                        for accent in ["blue", "violet", "teal", "rose", "amber"] {
+                                            changed |= ui.selectable_value(&mut self.settings.accent, accent.to_owned(), accent.to_uppercase()).changed();
+                                        }
+                                    });
+                                ui.add_space(8.0);
+                                ui.heading("Preview");
+                                ui.group(|ui| {
+                                    ui.label(RichText::new("NOVA OS").size(20.0).strong());
+                                    ui.label("Portable desktop workspace");
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("●  Accent");
+                                        ui.label(RichText::new("Active").color(accent_color));
+                                    });
                                 });
                             });
-                        });
+                        } else {
+                            ui.columns(2, |columns| {
+                                columns[0].heading("Theme");
+                                columns[0].horizontal_wrapped(|ui| {
+                                    changed |= ui.selectable_value(&mut self.settings.theme, "system".to_owned(), "System").changed();
+                                    changed |= ui.selectable_value(&mut self.settings.theme, "dark".to_owned(), "Dark").changed();
+                                    changed |= ui.selectable_value(&mut self.settings.theme, "light".to_owned(), "Light").changed();
+                                });
+                                columns[0].add_space(10.0);
+                                columns[0].heading("Accent color");
+                                egui::ComboBox::from_id_salt("nova-accent")
+                                    .selected_text(self.settings.accent.to_uppercase())
+                                    .show_ui(&mut columns[0], |ui| {
+                                        for accent in ["blue", "violet", "teal", "rose", "amber"] {
+                                            changed |= ui.selectable_value(&mut self.settings.accent, accent.to_owned(), accent.to_uppercase()).changed();
+                                        }
+                                    });
+                                columns[1].heading("Preview");
+                                columns[1].group(|ui| {
+                                    ui.label(RichText::new("NOVA OS").size(20.0).strong());
+                                    ui.label("Portable desktop workspace");
+                                    ui.add_space(8.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("●  Accent");
+                                        ui.label(RichText::new("Active").color(accent_color));
+                                    });
+                                });
+                            });
+                        }
                         ui.separator();
                         changed |= ui.checkbox(&mut self.settings.reduce_motion, "Reduce animations and visual effects").changed();
                     }
@@ -1807,11 +2235,11 @@ impl NovaApp {
                         ui.label("Choose how NOVA behaves on this Windows computer.");
                         changed |= ui.checkbox(&mut self.settings.reduce_motion, "Reduce animations and visual effects").changed();
                         ui.separator();
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("Open System Monitor").clicked() { self.monitor_open = true; }
                             if ui.button("Open File Manager").clicked() { open_files_requested = true; }
                         });
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("Open UniKey input").clicked() { self.unikey_open = true; }
                             if ui.button("Open Security Center").clicked() { self.security_open = true; }
                         });
@@ -1821,7 +2249,7 @@ impl NovaApp {
                         ui.label(RichText::new("Choose an app to open. Optional host applications are detected only when needed.").small().weak());
                         egui::ScrollArea::vertical().max_height(285.0).show(ui, |ui| {
                             for app in START_APPS {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.label(RichText::new(app.icon).size(20.0));
                                     ui.vertical(|ui| {
                                         ui.label(RichText::new(app.name).strong());
@@ -1838,7 +2266,7 @@ impl NovaApp {
                     3 => {
                         ui.heading("Network & connectivity");
                         ui.label("NOVA provides tools for inspecting and configuring the Windows host network. It does not replace Windows network settings.");
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("Open Terminal / Wi-Fi tools").clicked() { self.terminal_open = true; }
                             if ui.button("Network Discovery").clicked() { launch_app = Some("Network Discovery"); }
                         });
@@ -1866,6 +2294,7 @@ impl NovaApp {
                 ui.separator();
                 ui.label(RichText::new("Settings are stored in the NOVA user data folder. NOVA does not install Windows services or startup tasks.").small().weak());
             });
+        if let Some(shown) = shown { self.window_rects.insert("Settings".to_owned(), shown.response.rect); }
         if open_files_requested { self.files_open = true; self.ensure_files_loaded(); }
         if let Some(app) = launch_app { self.open_app(app); }
         if changed {
@@ -1883,12 +2312,13 @@ impl NovaApp {
         let mut refresh_requested = false;
         let snap = self.take_window_snap("Trash", ctx);
         let mut window = egui::Window::new("▤  NOVA Trash")
+            .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
             .default_size([690.0, 450.0]);
         if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        window.open(&mut self.trash_open).show(ctx, |ui| {
-                ui.horizontal(|ui| {
+        let shown = window.open(&mut self.trash_open).show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(format!("{} item(s)", self.trash_entries.len()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add_enabled(!self.trash_entries.is_empty(), egui::Button::new("Empty Trash…")).clicked() {
@@ -1926,6 +2356,7 @@ impl NovaApp {
                 ui.separator();
                 ui.label(RichText::new("NOVA Trash is stored in the Data folder on this USB. Emptying Trash permanently deletes these items.").small().weak());
             });
+        if let Some(shown) = shown { self.window_rects.insert("Trash".to_owned(), shown.response.rect); }
 
         if refresh_requested { self.refresh_trash(); }
         if let Some(id) = restore_id {
@@ -1940,165 +2371,281 @@ impl NovaApp {
         }
 
         if self.trash_confirm_delete {
+            let mut confirm_open = true;
+            let mut close_requested = false;
+            let mut confirmed_id: Option<String> = None;
             egui::Window::new("Delete permanently?")
+                .open(&mut confirm_open)
                 .collapsible(false)
                 .resizable(false)
                 .fade_in(!self.settings.reduce_motion)
+                .fade_out(!self.settings.reduce_motion)
                 .show(ctx, |ui| {
                     ui.label("This item will be permanently deleted from NOVA Trash.");
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button("Delete permanently").clicked() {
-                            if let Some(id) = self.trash_selected.clone() {
-                                match trash::delete_permanently(&self.paths, &id) {
-                                    Ok(()) => self.status_message = "Item permanently deleted.".to_owned(),
-                                    Err(error) => self.status_message = format!("Permanent delete failed: {error}"),
-                                }
-                                self.refresh_trash();
-                            }
-                            self.trash_confirm_delete = false;
+                            confirmed_id = self.trash_selected.clone();
+                            close_requested = true;
                         }
-                        if ui.button("Cancel").clicked() { self.trash_confirm_delete = false; }
+                        if ui.button("Cancel").clicked() { close_requested = true; }
                     });
                 });
+            self.trash_confirm_delete = confirm_open && !close_requested;
+            if let Some(id) = confirmed_id {
+                match trash::delete_permanently(&self.paths, &id) {
+                    Ok(()) => self.status_message = "Item permanently deleted.".to_owned(),
+                    Err(error) => self.status_message = format!("Permanent delete failed: {error}"),
+                }
+                self.refresh_trash();
+            }
         }
 
         if self.trash_confirm_empty {
+            let mut confirm_open = true;
+            let mut close_requested = false;
+            let mut empty_confirmed = false;
             egui::Window::new("Empty NOVA Trash?")
+                .open(&mut confirm_open)
                 .collapsible(false)
                 .resizable(false)
                 .fade_in(!self.settings.reduce_motion)
+                .fade_out(!self.settings.reduce_motion)
                 .show(ctx, |ui| {
                     ui.label("All items in NOVA Trash will be permanently deleted. This cannot be undone.");
-                    ui.horizontal(|ui| {
-                        if ui.button("Empty Trash").clicked() {
-                            match trash::empty_trash(&self.paths) {
-                                Ok(count) => self.status_message = format!("Permanently deleted {count} item(s) from NOVA Trash."),
-                                Err(error) => self.status_message = format!("Could not empty Trash: {error}"),
-                            }
-                            self.refresh_trash();
-                            self.trash_confirm_empty = false;
-                        }
-                        if ui.button("Cancel").clicked() { self.trash_confirm_empty = false; }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Empty Trash").clicked() { empty_confirmed = true; }
+                        if ui.button("Cancel").clicked() { close_requested = true; }
                     });
                 });
+            self.trash_confirm_empty = confirm_open && !close_requested;
+            if empty_confirmed {
+                match trash::empty_trash(&self.paths) {
+                    Ok(count) => self.status_message = format!("Permanently deleted {count} item(s) from NOVA Trash."),
+                    Err(error) => self.status_message = format!("Could not empty Trash: {error}"),
+                }
+                self.refresh_trash();
+                self.trash_confirm_empty = false;
+            }
         }
     }
 
-    fn chrome_window(&mut self, ctx: &egui::Context) {
-        if self.chrome_open { self.detect_chrome_if_needed(); }
-        let mut open_host_now = false;
-        let mut open_isolated_now = false;
-        let snap = self.take_window_snap("Google Chrome", ctx);
-        let mut window = egui::Window::new("🌐  Google Chrome")
-            .fade_in(!self.settings.reduce_motion)
-            .fade_out(!self.settings.reduce_motion)
-            .resizable(false)
-            .default_width(540.0);
-        if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        window.open(&mut self.chrome_open).show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Open a website in Google Chrome").strong());
-                    if ui.small_button("↻ Detect").on_hover_text("Search common Chrome installation paths again").clicked() {
-                        self.chrome_path = apps::find_chrome();
-                        self.chrome_checked = true;
-                    }
-                });
-                ui.add(TextEdit::singleline(&mut self.chrome_url)
-                    .hint_text("https://example.com")
-                    .desired_width(f32::INFINITY));
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(self.chrome_path.is_some(), egui::Button::new("Open isolated (recommended)")).clicked() {
-                        open_isolated_now = true;
-                    }
-                    if ui.add_enabled(self.chrome_path.is_some(), egui::Button::new("Open on Windows host…")).clicked() {
-                        self.chrome_confirm_host = true;
-                    }
-                });
-                if self.chrome_confirm_host {
-                    ui.separator();
-                    ui.colored_label(Color32::from_rgb(225, 166, 86), "This opens normal Chrome on the real Windows host. Downloads, extensions, cookies and browser exploits are NOT isolated by NOVA.");
-                    ui.horizontal(|ui| {
-                        if ui.button("I understand — open on host").clicked() {
-                            self.chrome_confirm_host = false;
-                            open_host_now = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.chrome_confirm_host = false;
-                        }
-                    });
-                }
-                ui.separator();
-                if let Some(path) = &self.chrome_path {
-                    ui.colored_label(Color32::from_rgb(91, 190, 145), "Google Chrome detected on the Windows host");
-                    ui.label(RichText::new(path.display().to_string()).small().weak());
-                    ui.label("Open isolated uses a fresh Chrome profile in Windows Sandbox. Its downloaded files disappear when Sandbox closes. Use the offline Inspect in Sandbox action for a file you already saved to NOVA Downloads.");
-                } else {
-                    ui.colored_label(Color32::from_rgb(225, 166, 86), "Google Chrome was not found on this PC.");
-                    ui.label("Chrome is not bundled or installed by NOVA. Download it from Google, then choose Detect.");
-                    if ui.button("Open official Google Chrome download page").clicked() {
-                        match apps::open_chrome_download_page() {
-                            Ok(()) => self.status_message = "Opened Google's official Chrome download page.".to_owned(),
-                            Err(error) => self.status_message = format!("Could not open download page: {error}"),
-                        }
-                    }
-                }
-                ui.label(RichText::new("The isolated browser requires Windows Sandbox (Pro/Enterprise/Education + hardware virtualization). Network is enabled for browsing and may reach local-network services; vGPU, clipboard and writable host folders are disabled.").small().weak());
-            });
-        if open_isolated_now { self.launch_chrome_in_sandbox(); }
-        if open_host_now { self.launch_chrome(); }
-    }
 
     fn calculator_window(&mut self, ctx: &egui::Context) {
-        let mut calculate = false;
         let snap = self.take_window_snap("Calculator", ctx);
-        let mut window = egui::Window::new("NOVA Calculator")
+        let mut window = egui::Window::new("NOVA Scientific Calculator")
+            .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
-            .resizable(false)
-            .default_width(340.0);
-        if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        window.open(&mut self.calculator_open).show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(TextEdit::singleline(&mut self.calc_left).desired_width(90.0));
-                    egui::ComboBox::from_label("")
-                        .selected_text(&self.calc_operator)
-                        .show_ui(ui, |ui| {
-                            for op in ["+", "−", "×", "÷"] {
-                                ui.selectable_value(&mut self.calc_operator, op.to_owned(), op);
-                            }
-                        });
-                    ui.add(TextEdit::singleline(&mut self.calc_right).desired_width(90.0));
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Calculate").clicked() { calculate = true; }
-                    if ui.button("Clear").clicked() {
-                        self.calc_left.clear();
-                        self.calc_right.clear();
-                        self.calc_result = "0".to_owned();
-                    }
-                    if ui.button("Swap").clicked() { std::mem::swap(&mut self.calc_left, &mut self.calc_right); }
-                });
-                ui.heading(RichText::new(&self.calc_result).size(26.0).color(Color32::from_rgb(126, 184, 255)));
-            });
-        if calculate {
-            self.calculate();
+            .default_size([590.0, 650.0]);
+        if let Some((position, size)) = snap {
+            window = window.current_pos(position).fixed_size(size);
+        } else {
+            window = window.min_size([220.0, 220.0]);
         }
-    }
-
-    fn calculate(&mut self) {
-        let left = self.calc_left.trim().parse::<f64>();
-        let right = self.calc_right.trim().parse::<f64>();
-        self.calc_result = match (left, right) {
-            (Ok(a), Ok(b)) => match self.calc_operator.as_str() {
-                "+" => format_number(a + b),
-                "−" => format_number(a - b),
-                "×" => format_number(a * b),
-                "÷" if b != 0.0 => format_number(a / b),
-                "÷" => "Cannot divide by zero".to_owned(),
-                _ => "Unknown operator".to_owned(),
-            },
-            _ => "Enter valid numbers".to_owned(),
-        };
+        let mut evaluate_now = false;
+        let mut clear_now = false;
+        let mut inserted: Option<&'static str> = None;
+        let shown = window.open(&mut self.calculator_open).show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("CLASSWIZ-INSPIRED SCIENTIFIC WORKSPACE").small().strong().color(Color32::from_rgb(104, 167, 245)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("nova-calc-angle")
+                        .selected_text(self.calc_angle.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.calc_angle, AngleUnit::Degree, "Degree (DEG)");
+                            ui.selectable_value(&mut self.calc_angle, AngleUnit::Radian, "Radian (RAD)");
+                            ui.selectable_value(&mut self.calc_angle, AngleUnit::Gradian, "Gradian (GRA)");
+                        });
+                });
+            });
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("nova-calc-mode")
+                    .selected_text(&self.calc_mode)
+                    .show_ui(ui, |ui| {
+                        for mode in ["Calculate", "Statistics", "Equation", "Inequality", "Table", "Calculus", "Distribution", "Base-N", "Matrix", "Vector", "Ratio"] {
+                            ui.selectable_value(&mut self.calc_mode, mode.to_owned(), mode);
+                        }
+                    });
+                ui.label(RichText::new("Ans stores the previous numeric result").small().weak());
+            });
+            ui.separator();
+            match self.calc_mode.as_str() {
+                "Calculate" => {
+                    ui.label("Expression");
+                    let response = ui.add(TextEdit::singleline(&mut self.calc_expression)
+                        .font(egui::TextStyle::Heading).desired_width(f32::INFINITY)
+                        .hint_text("Example: sin(30)+sqrt(16)+nCr(8,2)"));
+                    if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) { evaluate_now = true; }
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, value) in [("sin", "sin("), ("cos", "cos("), ("tan", "tan("), ("√", "sqrt("), ("x²", "^2"), ("xʸ", "^"), ("π", "pi"), ("e", "e"), ("ln", "ln("), ("log", "log("), ("!", "!"), ("nCr", "nCr("), ("nPr", "nPr("), ("Ans", "ans")] {
+                            if ui.button(label).clicked() { inserted = Some(value); }
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Calculate  ↵").clicked() { evaluate_now = true; }
+                        if ui.button("Clear").clicked() { clear_now = true; }
+                        if ui.button("⌫").clicked() { let _ = self.calc_expression.pop(); }
+                    });
+                    ui.add_space(5.0);
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.label(RichText::new("RESULT").small().weak());
+                        ui.heading(RichText::new(&self.calc_result).size(29.0).color(Color32::from_rgb(105, 183, 255)));
+                    });
+                    if !self.calc_history.is_empty() {
+                        ui.collapsing("Calculation history", |ui| {
+                            for item in self.calc_history.iter().rev().take(8) { ui.label(RichText::new(item).monospace().small()); }
+                        });
+                    }
+                    ui.label(RichText::new("Functions: trig/inverse trig, hyperbolic, log/ln, powers, roots, factorial, %, nCr/nPr, gcd/lcm, min/max, rounding, constants π/e/φ, implicit multiplication.").small().weak());
+                }
+                "Statistics" => {
+                    ui.label("X data (separate values with commas or spaces)");
+                    ui.add(TextEdit::multiline(&mut self.calc_stats_data).desired_rows(2).desired_width(f32::INFINITY));
+                    ui.label("Y data (optional; same number of values for linear regression)");
+                    ui.add(TextEdit::multiline(&mut self.calc_stats_y).desired_rows(2).desired_width(f32::INFINITY));
+                    if ui.button("Analyze data").clicked() {
+                        self.calc_result = match parse_number_list(&self.calc_stats_data).and_then(|values| calculator::statistics(&values).map(|stats|(values,stats))) {
+                            Ok((values,s)) => {
+                                let mut report=format!("n={}   Σx={}   x̄={}\nMedian={}   Min={}   Max={}\nσx={}   sx={}", s.count, format_number(s.sum), format_number(s.mean), format_number(s.median), format_number(s.min), format_number(s.max), format_number(s.population_sd), s.sample_sd.map(format_number).unwrap_or_else(|| "—".to_owned()));
+                                if !self.calc_stats_y.trim().is_empty() { report.push_str("\n"); report.push_str(&linear_regression_report(&values,&self.calc_stats_y)); }
+                                report
+                            }
+                            Err(error) => error,
+                        };
+                    }
+                    ui.label(RichText::new("Includes one-variable statistics and optional two-variable linear regression (slope, intercept and correlation). ").small().weak());
+                }
+                "Equation" => {
+                    ui.label("Solve a·x² + b·x + c = 0 (linear if a = 0)");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("a"); ui.add(TextEdit::singleline(&mut self.calc_equation_a).desired_width(90.0));
+                        ui.label("b"); ui.add(TextEdit::singleline(&mut self.calc_equation_b).desired_width(90.0));
+                        ui.label("c"); ui.add(TextEdit::singleline(&mut self.calc_equation_c).desired_width(90.0));
+                    });
+                    if ui.button("Solve equation").clicked() {
+                        self.calc_result = match (self.calc_equation_a.parse::<f64>(), self.calc_equation_b.parse::<f64>(), self.calc_equation_c.parse::<f64>()) {
+                            (Ok(a),Ok(b),Ok(c)) => calculator::solve_quadratic(a,b,c).map(|roots| roots.iter().enumerate().map(|(i,x)| format!("x{} = {}",i+1,format_number(*x))).collect::<Vec<_>>().join("\n")).unwrap_or_else(|e|e),
+                            _ => "Enter valid finite coefficients".to_owned(),
+                        };
+                    }
+                }
+                "Inequality" => {
+                    ui.label("Solve a·x² + b·x + c  [operator]  0");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("a"); ui.add(TextEdit::singleline(&mut self.calc_equation_a).desired_width(75.0));
+                        ui.label("b"); ui.add(TextEdit::singleline(&mut self.calc_equation_b).desired_width(75.0));
+                        ui.label("c"); ui.add(TextEdit::singleline(&mut self.calc_equation_c).desired_width(75.0));
+                        egui::ComboBox::from_id_salt("nova-calc-inequality-op").selected_text(&self.calc_inequality_operator).show_ui(ui, |ui| { for op in [">",">=","<","<="] { ui.selectable_value(&mut self.calc_inequality_operator,op.to_owned(),op); } });
+                    });
+                    if ui.button("Solve inequality").clicked() {
+                        self.calc_result = match (self.calc_equation_a.parse::<f64>(),self.calc_equation_b.parse::<f64>(),self.calc_equation_c.parse::<f64>()) {
+                            (Ok(a),Ok(b),Ok(c)) => calculator::solve_quadratic_inequality(a,b,c,&self.calc_inequality_operator).unwrap_or_else(|e|e),
+                            _ => "Enter valid finite coefficients".to_owned(),
+                        };
+                    }
+                }
+                "Calculus" => {
+                    ui.label("Function f(x)");
+                    ui.add(TextEdit::singleline(&mut self.calc_expression).desired_width(f32::INFINITY));
+                    ui.horizontal_wrapped(|ui| { ui.label("Derivative at x"); ui.add(TextEdit::singleline(&mut self.calc_calculus_x).desired_width(80.0)); });
+                    if ui.button("Differentiate numerically").clicked() {
+                        self.calc_result = match self.calc_calculus_x.parse::<f64>() {
+                            Ok(x) => calculator::numerical_derivative(&self.calc_expression,x,self.calc_angle,self.calc_answer).map(format_number).unwrap_or_else(|e|e),
+                            Err(_) => "Enter a valid x value".to_owned(),
+                        };
+                    }
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Integral from"); ui.add(TextEdit::singleline(&mut self.calc_integral_start).desired_width(70.0));
+                        ui.label("to"); ui.add(TextEdit::singleline(&mut self.calc_integral_end).desired_width(70.0));
+                        ui.label("Steps"); ui.add(TextEdit::singleline(&mut self.calc_integral_steps).desired_width(70.0));
+                    });
+                    if ui.button("Integrate (Simpson)").clicked() {
+                        self.calc_result = match (self.calc_integral_start.parse::<f64>(),self.calc_integral_end.parse::<f64>(),self.calc_integral_steps.parse::<usize>()) {
+                            (Ok(a),Ok(b),Ok(n)) => calculator::numerical_integral(&self.calc_expression,a,b,n,self.calc_angle,self.calc_answer).map(format_number).unwrap_or_else(|e|e),
+                            _ => "Enter valid integration bounds and an even step count".to_owned(),
+                        };
+                    }
+                }
+                "Distribution" => {
+                    ui.label("Enter a distribution expression in Calculate syntax:");
+                    ui.label(RichText::new("normalpdf(value,mean,sigma) · normalcdf(lower,upper,mean,sigma) · binompdf(n,p,k) · binomcdf(n,p,k) · poissonpdf(lambda,k) · poissoncdf(lambda,k)").monospace().small());
+                    ui.label(RichText::new("Example: normalcdf(-1,1,0,1) or binompdf(10,0.5,4)").small().weak());
+                    ui.add(TextEdit::singleline(&mut self.calc_expression).desired_width(f32::INFINITY));
+                    if ui.button("Evaluate distribution").clicked() {
+                        self.calc_result = calculator::evaluate(&self.calc_expression,EvalContext{angle:self.calc_angle,ans:self.calc_answer,x:0.0}).map(format_number).unwrap_or_else(|e|e);
+                    }
+                }
+                "Table" => {
+                    ui.label("Function f(x)");
+                    ui.add(TextEdit::singleline(&mut self.calc_expression).desired_width(f32::INFINITY));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Start"); ui.add(TextEdit::singleline(&mut self.calc_table_start).desired_width(70.0));
+                        ui.label("End"); ui.add(TextEdit::singleline(&mut self.calc_table_end).desired_width(70.0));
+                        ui.label("Step"); ui.add(TextEdit::singleline(&mut self.calc_table_step).desired_width(70.0));
+                    });
+                    if ui.button("Generate table").clicked() {
+                        self.calc_result = generate_table(&self.calc_expression, &self.calc_table_start, &self.calc_table_end, &self.calc_table_step, self.calc_angle, self.calc_answer);
+                    }
+                }
+                "Base-N" => {
+                    ui.label("Integer input");
+                    ui.add(TextEdit::singleline(&mut self.calc_base_input).desired_width(f32::INFINITY));
+                    egui::ComboBox::from_label("Input base").selected_text(self.calc_base_from.to_string()).show_ui(ui, |ui| {
+                        for base in [2_u32,8,10,16] { ui.selectable_value(&mut self.calc_base_from,base,base.to_string()); }
+                    });
+                    if ui.button("Convert BIN / OCT / DEC / HEX").clicked() {
+                        self.calc_result = calculator::convert_base(&self.calc_base_input,self.calc_base_from).unwrap_or_else(|e|e);
+                    }
+                }
+                "Matrix" => {
+                    ui.label("Matrix A (up to 3×3; rows separated by semicolons, values by commas)");
+                    ui.add(TextEdit::multiline(&mut self.calc_matrix_a).desired_rows(2).desired_width(f32::INFINITY));
+                    ui.label("Matrix B (for A × B)");
+                    ui.add(TextEdit::multiline(&mut self.calc_matrix_b).desired_rows(2).desired_width(f32::INFINITY));
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("det(A)").clicked() { self.calc_result = matrix_determinant(&self.calc_matrix_a).map(format_number).unwrap_or_else(|e|e); }
+                        if ui.button("inverse(A)").clicked() { self.calc_result = matrix_inverse(&self.calc_matrix_a).unwrap_or_else(|e|e); }
+                        if ui.button("A × B").clicked() { self.calc_result = matrix_multiply(&self.calc_matrix_a,&self.calc_matrix_b).unwrap_or_else(|e|e); }
+                    });
+                }
+                "Vector" => {
+                    ui.label("Vector A (2D or 3D; comma-separated)"); ui.add(TextEdit::singleline(&mut self.calc_vector_a).desired_width(f32::INFINITY));
+                    ui.label("Vector B (same dimension)"); ui.add(TextEdit::singleline(&mut self.calc_vector_b).desired_width(f32::INFINITY));
+                    if ui.button("Calculate dot / cross / magnitudes").clicked() { self.calc_result = vector_calculate(&self.calc_vector_a,&self.calc_vector_b); }
+                }
+                "Ratio" => {
+                    ui.label("Solve a : b = c : x");
+                    ui.horizontal_wrapped(|ui| { ui.add(TextEdit::singleline(&mut self.calc_ratio_a).desired_width(75.0)); ui.label(":"); ui.add(TextEdit::singleline(&mut self.calc_ratio_b).desired_width(75.0)); ui.label("="); ui.add(TextEdit::singleline(&mut self.calc_ratio_c).desired_width(75.0)); ui.label(": x"); });
+                    if ui.button("Solve ratio").clicked() {
+                        self.calc_result = match (self.calc_ratio_a.parse::<f64>(),self.calc_ratio_b.parse::<f64>(),self.calc_ratio_c.parse::<f64>()) { (Ok(a),Ok(b),Ok(c)) if a!=0.0 => format!("x = {}",format_number(b*c/a)), (Ok(_),_,_) => "The first ratio value cannot be zero".to_owned(), _ => "Enter valid ratio values".to_owned() };
+                    }
+                }
+                _ => {}
+            }
+            if self.calc_mode != "Calculate" {
+                ui.add_space(6.0);
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(RichText::new("RESULT").small().weak());
+                    ui.label(RichText::new(&self.calc_result).monospace().color(Color32::from_rgb(105, 183, 255)));
+                });
+            }
+        });
+        if let Some(shown) = shown { self.window_rects.insert("Calculator".to_owned(), shown.response.rect); }
+        if let Some(value) = inserted { self.calc_expression.push_str(value); }
+        if clear_now { self.calc_expression.clear(); self.calc_result = "0".to_owned(); }
+        if evaluate_now {
+            let context = EvalContext { angle: self.calc_angle, ans: self.calc_answer, x: 0.0 };
+            match calculator::evaluate(&self.calc_expression, context) {
+                Ok(value) => {
+                    self.calc_answer = value;
+                    self.calc_result = format_number(value);
+                    self.calc_history.push(format!("{} = {}",self.calc_expression,self.calc_result));
+                    if self.calc_history.len()>30 { self.calc_history.remove(0); }
+                }
+                Err(error) => self.calc_result = error,
+            }
+        }
     }
 
     fn monitor_window(&mut self, ctx: &egui::Context) {
@@ -2140,13 +2687,14 @@ impl NovaApp {
 
         let snap = self.take_window_snap("Monitor", ctx);
         let mut window = egui::Window::new("NOVA System Monitor")
+            .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
             .default_size([430.0, 300.0]);
         if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        window.open(&mut self.monitor_open).show(ctx, |ui| {
+        let shown = window.open(&mut self.monitor_open).show(ctx, |ui| {
                 if let Some((cpu, used, total, processes)) = metrics {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.vertical(|ui| {
                             ui.label(RichText::new("CPU LOAD").small().weak().strong());
                             ui.heading(format!("{cpu:.1}%"));
@@ -2159,7 +2707,7 @@ impl NovaApp {
                     });
                     ui.add(egui::ProgressBar::new((cpu / 100.0).clamp(0.0, 1.0)).show_percentage());
                     ui.add_space(12.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("MEMORY").small().weak().strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(format!("{used:.2} / {total:.2} GB"));
@@ -2175,6 +2723,7 @@ impl NovaApp {
                 ui.separator();
                 ui.label(RichText::new("Metrics are provided by the Windows host; NOVA is a desktop environment, not a separate kernel.").small().weak());
             });
+        if let Some(shown) = shown { self.window_rects.insert("Monitor".to_owned(), shown.response.rect); }
     }
 }
 
@@ -2196,7 +2745,18 @@ impl eframe::App for NovaApp {
         if toggle_start { self.start_open = !self.start_open; self.notification_open = false; }
         if open_files { self.files_open = true; self.ensure_files_loaded(); }
         if open_monitor { self.monitor_open = true; }
-        if close_panels { self.start_open = false; self.notification_open = false; }
+        if close_panels {
+            if self.security_confirm_clear_quarantine {
+                self.security_confirm_clear_quarantine = false;
+            } else if self.trash_confirm_delete {
+                self.trash_confirm_delete = false;
+            } else if self.trash_confirm_empty {
+                self.trash_confirm_empty = false;
+            } else {
+                self.start_open = false;
+                self.notification_open = false;
+            }
+        }
 
         let dark = self.is_dark_mode(&ctx);
         let desktop_fill = if dark { Color32::from_rgb(12, 20, 36) } else { Color32::from_rgb(222, 232, 247) };
@@ -2206,9 +2766,10 @@ impl eframe::App for NovaApp {
             .show(ui, |ui| {
                 ui.vertical(|ui| {
                     let taskbar_height = 60.0;
-                    let desktop_outer_height = (ui.available_height() - taskbar_height - 8.0).max(270.0);
-                    // The desktop frame adds 18 pt of top and bottom inner margin.
-                    let desktop_content_height = (desktop_outer_height - 36.0).max(220.0);
+                    let available_height = ui.available_height().max(1.0);
+                    let desktop_outer_height = (available_height - taskbar_height - 8.0).max(120.0);
+                    // Keep the dock visible and let the desktop contract on smaller viewports.
+                    let desktop_content_height = (desktop_outer_height - 36.0).max(84.0);
                     egui::Frame::new()
                         .fill(desktop_fill)
                         .stroke(egui::Stroke::new(1.0, if dark { Color32::from_white_alpha(18) } else { Color32::from_black_alpha(14) }))
@@ -2231,7 +2792,7 @@ impl eframe::App for NovaApp {
                             }
 
                             ui.vertical(|ui| {
-                                ui.horizontal(|ui| {
+                                ui.horizontal_wrapped(|ui| {
                                     ui.vertical(|ui| {
                                         ui.label(RichText::new("NOVA OS").size(22.0).strong().color(if dark { Color32::WHITE } else { Color32::from_rgb(30, 48, 76) }));
                                         ui.label(RichText::new("Portable desktop workspace").small().color(if dark { Color32::from_rgb(173, 190, 218) } else { Color32::from_rgb(82, 101, 132) }));
@@ -2245,7 +2806,7 @@ impl eframe::App for NovaApp {
                                 ui.label(RichText::new("Desktop").small().strong().color(if dark { Color32::from_rgb(194, 207, 229) } else { Color32::from_rgb(74, 91, 119) }));
                                 ui.add_space(7.0);
 
-                                let desktop_columns = ((ui.available_width() / 108.0).floor() as usize).clamp(2, 7);
+                                let desktop_columns = ((ui.available_width() / 108.0).floor() as usize).clamp(1, 7);
                                 egui::Grid::new("nova-desktop-shortcuts")
                                     .num_columns(desktop_columns)
                                     .spacing(egui::vec2(5.0, 6.0))
@@ -2272,13 +2833,14 @@ impl eframe::App for NovaApp {
                             });
                         });
 
+                    // Reserve the dock's footprint. It is painted in a foreground Area
+                    // after workspace windows so large windows cannot cover the taskbar.
                     ui.add_space(8.0);
-                    self.taskbar(ui);
                 });
             });
 
-        self.start_menu(&ctx);
-        self.notification_center(&ctx);
+        // Draw app windows first. Shell surfaces are rendered afterward so Start,
+        // Quick Settings and the floating dock stay above every workspace window.
         self.terminal_window(&ctx);
         self.files_window(&ctx);
         self.editor_window(&ctx);
@@ -2286,17 +2848,77 @@ impl eframe::App for NovaApp {
         self.calculator_window(&ctx);
         self.monitor_window(&ctx);
         self.trash_window(&ctx);
-        self.chrome_window(&ctx);
         self.unikey_window(&ctx);
         self.security_window(&ctx);
         for info in &security_tools::TOOLS {
             self.security_tool_window(&ctx, info.tool);
         }
+        self.notification_center(&ctx);
+        self.start_menu(&ctx);
+        egui::Area::new(egui::Id::unique("nova-taskbar-floating-dock"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -8.0))
+            .show(&ctx, |ui| {
+                let dock_width = (ui.ctx().content_rect().width() - 16.0).max(1.0);
+                ui.set_width(dock_width);
+                self.taskbar(ui);
+            });
         if self.monitor_open {
             // The monitor data is refreshed once per second; faster frames add no information.
             ctx.request_repaint_after(Duration::from_secs(1));
         }
     }
+}
+
+
+#[cfg(windows)]
+fn local_clock_strings() -> (String, String) {
+    #[repr(C)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLocalTime(time: *mut SystemTime);
+    }
+    let mut value = SystemTime {
+        year: 0, month: 0, day_of_week: 0, day: 0,
+        hour: 0, minute: 0, second: 0, milliseconds: 0,
+    };
+    // Windows supplies local time using the host's configured time zone and locale settings.
+    unsafe { GetLocalTime(&mut value); }
+    (format!("{:02}:{:02}", value.hour, value.minute), format!("{:02}/{:02}/{:04}", value.day, value.month, value.year))
+}
+
+#[cfg(not(windows))]
+fn local_clock_strings() -> (String, String) {
+    // Non-Windows development builds still render a stable UTC clock without adding a date dependency.
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let minute = (seconds / 60) % 1440;
+    let hour = minute / 60;
+    let min = minute % 60;
+    let days = (seconds / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += if month <= 2 { 1 } else { 0 };
+    (format!("{:02}:{:02}", hour, min), format!("{:02}/{:02}/{:04} UTC", month, day, year))
 }
 
 fn format_size(bytes: u64) -> String {
@@ -2326,9 +2948,105 @@ fn format_number(value: f64) -> String {
     value.to_string()
 }
 
+fn parse_number_list(input: &str) -> Result<Vec<f64>, String> {
+    let values = input.split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| part.trim().parse::<f64>().map_err(|_| format!("Invalid number: {part}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+        return Err("Enter at least one finite number".to_owned());
+    }
+    Ok(values)
+}
+
+fn linear_regression_report(x:&[f64], y_input:&str)->String {
+    let y=match parse_number_list(y_input){Ok(values)=>values,Err(error)=>return error};
+    if x.len()!=y.len()||x.len()<2{return "Regression requires equally sized X/Y lists with at least two pairs".to_owned();}
+    let n=x.len() as f64;let mean_x=x.iter().sum::<f64>()/n;let mean_y=y.iter().sum::<f64>()/n;
+    let sxx=x.iter().map(|v|(v-mean_x).powi(2)).sum::<f64>();let syy=y.iter().map(|v|(v-mean_y).powi(2)).sum::<f64>();
+    let sxy=x.iter().zip(&y).map(|(a,b)|(a-mean_x)*(b-mean_y)).sum::<f64>();
+    if sxx==0.0||syy==0.0{return "Regression is undefined when X or Y has zero variance".to_owned();}
+    let slope=sxy/sxx;let intercept=mean_y-slope*mean_x;let correlation=sxy/(sxx*syy).sqrt();
+    if !slope.is_finite()||!intercept.is_finite()||!correlation.is_finite(){return "Regression result is outside the supported range".to_owned();}
+    format!("Linear regression\ny = {}x + {}\nr = {}",format_number(slope),format_number(intercept),format_number(correlation))
+}
+
+fn generate_table(expression: &str, start: &str, end: &str, step: &str, angle: AngleUnit, ans: f64) -> String {
+    let parsed = (start.parse::<f64>(), end.parse::<f64>(), step.parse::<f64>());
+    let (Ok(start), Ok(end), Ok(step)) = parsed else { return "Enter valid start, end and step values".to_owned(); };
+    if !start.is_finite() || !end.is_finite() || !step.is_finite() || step == 0.0 {
+        return "Start/end/step must be finite and step cannot be zero".to_owned();
+    }
+    if (end - start).signum() != step.signum() && end != start {
+        return "Step direction must move from start toward end".to_owned();
+    }
+    let count = ((end - start) / step).floor().abs() as usize + 1;
+    if count > 101 { return "Table is limited to 101 rows per calculation".to_owned(); }
+    let mut output = String::from("       x                 f(x)\n");
+    for index in 0..count {
+        let x = start + index as f64 * step;
+        if (step > 0.0 && x > end + step.abs() * 1e-10) || (step < 0.0 && x < end - step.abs() * 1e-10) { break; }
+        let value = calculator::evaluate(expression, EvalContext { angle, ans, x });
+        match value {
+            Ok(value) => output.push_str(&format!("{:>12}   {:>16}\n", format_number(x), format_number(value))),
+            Err(error) => output.push_str(&format!("{:>12}   {error}\n", format_number(x))),
+        }
+    }
+    output
+}
+
+fn parse_square_matrix(input: &str) -> Result<Vec<Vec<f64>>, String> {
+    let rows = input.split(';').map(parse_number_list).collect::<Result<Vec<_>, _>>()?;
+    if rows.len() < 2 || rows.len() > 3 || rows.iter().any(|row| row.len() != rows.len()) {
+        return Err("Matrix must be square, either 2×2 or 3×3".to_owned());
+    }
+    Ok(rows)
+}
+
+fn matrix_determinant(input: &str) -> Result<f64, String> {
+    let m = parse_square_matrix(input)?;
+    let det = if m.len() == 2 { m[0][0] * m[1][1] - m[0][1] * m[1][0] }
+        else { m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1]) - m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0]) + m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]) };
+    if det.is_finite() { Ok(det) } else { Err("Matrix determinant is outside the supported range".to_owned()) }
+}
+
+fn matrix_inverse(input: &str) -> Result<String, String> {
+    let matrix = parse_square_matrix(input)?;
+    let n = matrix.len();
+    let mut augmented = vec![vec![0.0; n * 2]; n];
+    for row in 0..n { for col in 0..n { augmented[row][col] = matrix[row][col]; } augmented[row][n + row] = 1.0; }
+    for pivot in 0..n {
+        let best = (pivot..n).max_by(|&a,&b| augmented[a][pivot].abs().total_cmp(&augmented[b][pivot].abs())).unwrap_or(pivot);
+        if augmented[best][pivot].abs() < 1e-12 { return Err("Matrix is singular and has no inverse".to_owned()); }
+        augmented.swap(pivot,best);
+        let divisor = augmented[pivot][pivot];
+        for col in 0..n*2 { augmented[pivot][col] /= divisor; }
+        for row in 0..n { if row != pivot { let factor=augmented[row][pivot]; for col in 0..n*2 { augmented[row][col] -= factor*augmented[pivot][col]; } } }
+    }
+    Ok((0..n).map(|row| (0..n).map(|col| format_number(augmented[row][n+col])).collect::<Vec<_>>().join(", ")).collect::<Vec<_>>().join("\n"))
+}
+
+fn matrix_multiply(a: &str, b: &str) -> Result<String, String> {
+    let a = parse_square_matrix(a)?; let b = parse_square_matrix(b)?;
+    if a.len() != b.len() { return Err("Matrices must have the same dimension".to_owned()); }
+    let n=a.len(); let mut out=vec![vec![0.0;n];n];
+    for row in 0..n { for col in 0..n { for k in 0..n { out[row][col] += a[row][k]*b[k][col]; } } }
+    if out.iter().flatten().any(|v|!v.is_finite()) { return Err("Matrix result is outside the supported range".to_owned()); }
+    Ok(out.iter().map(|row|row.iter().map(|v|format_number(*v)).collect::<Vec<_>>().join(", ")).collect::<Vec<_>>().join("\n"))
+}
+
+fn vector_calculate(a: &str, b: &str) -> String {
+    let (a,b) = match (parse_number_list(a),parse_number_list(b)) { (Ok(a),Ok(b)) if a.len()==b.len() && (2..=3).contains(&a.len()) => (a,b), _ => return "Enter two vectors with matching 2D or 3D dimensions".to_owned() };
+    let dot: f64 = a.iter().zip(&b).map(|(x,y)|x*y).sum();
+    let mag_a=a.iter().map(|v|v*v).sum::<f64>().sqrt(); let mag_b=b.iter().map(|v|v*v).sum::<f64>().sqrt();
+    let mut result=format!("A·B = {}\n|A| = {}\n|B| = {}",format_number(dot),format_number(mag_a),format_number(mag_b));
+    if a.len()==3 { let cross=[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]]; result.push_str(&format!("\nA×B = ({}, {}, {})",format_number(cross[0]),format_number(cross[1]),format_number(cross[2]))); }
+    result
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_number, START_APPS, START_PINS};
+    use super::{compact_file_name, format_number, start_menu_dimensions, taskbar_rail_widths, START_APPS, START_PINS};
     use crate::storage::Settings;
 
     #[test]
@@ -2359,6 +3077,44 @@ mod tests {
     }
 
     #[test]
+    fn taskbar_rails_never_exceed_available_width() {
+        for width in [0.0, 48.0, 160.0, 320.0, 440.0, 520.0, 760.0, 900.0, 1280.0, 2560.0] {
+            let (left, center, right, _, _) = taskbar_rail_widths(width);
+            assert!(left.is_finite() && center.is_finite() && right.is_finite());
+            assert!(left >= 0.0 && center >= 0.0 && right >= 0.0);
+            assert!((left + center + right - width.max(0.0)).abs() < 0.01);
+            assert!((left - right).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn start_menu_stays_within_the_viewport_and_uses_valid_columns() {
+        for (width, height) in [(1.0, 1.0), (16.0, 80.0), (200.0, 300.0), (320.0, 500.0), (800.0, 500.0), (1280.0, 800.0)] {
+            let (menu_width, scroll_height, columns) = start_menu_dimensions(width, height);
+            assert!(menu_width <= width && menu_width > 0.0);
+            assert!(scroll_height <= height && scroll_height > 0.0);
+            assert!((1..=6).contains(&columns));
+        }
+    }
+
+    #[test]
+    fn compact_file_names_truncate_without_splitting_unicode_scalars() {
+        assert_eq!(compact_file_name("report.txt", 20), "report.txt");
+        assert_eq!(compact_file_name("Báo cáo học kỳ.docx", 9), "Báo cáo …");
+        assert_eq!(compact_file_name("filename", 1), "…");
+        assert_eq!(compact_file_name("filename", 0), "…");
+    }
+
+    #[test]
+    fn start_menu_widths_remain_positive_for_tiny_viewports() {
+        for (width, height) in [(1.0, 1.0), (16.0, 80.0), (23.0, 120.0)] {
+            let (menu_width, scroll_height, _) = start_menu_dimensions(width, height);
+            assert!(menu_width >= 1.0 && menu_width <= width);
+            assert!(scroll_height >= 1.0 && scroll_height <= height);
+        }
+    }
+
+    #[test]
     fn default_start_pins_match_the_validated_app_catalog() {
         let settings = Settings::default();
         let expected: Vec<String> = START_PINS.iter().map(|name| (*name).to_owned()).collect();
@@ -2370,6 +3126,29 @@ mod tests {
         let legacy = r#"{"theme":"dark","reduce_motion":false,"accent":"blue"}"#;
         let settings: Settings = serde_json::from_str(legacy).expect("legacy settings should remain readable");
         assert_eq!(settings.pinned_apps, Settings::default().pinned_apps);
+    }
+
+    #[test]
+    fn calculator_table_is_bounded_and_evaluates_x() {
+        let table = super::generate_table("x^2", "-2", "2", "1", super::AngleUnit::Degree, 0.0);
+        assert!(table.contains("4"));
+        assert!(table.contains("0"));
+        assert!(super::generate_table("x", "0", "1000", "1", super::AngleUnit::Degree, 0.0).contains("limited to 101"));
+    }
+
+    #[test]
+    fn calculator_matrix_inverse_and_determinant_are_consistent() {
+        assert_eq!(super::matrix_determinant("1,2;3,4").unwrap(), -2.0);
+        let inverse = super::matrix_inverse("1,2;3,4").unwrap();
+        assert!(inverse.contains("-2"));
+        assert!(super::matrix_inverse("1,2;2,4").is_err());
+    }
+
+    #[test]
+    fn calculator_vector_dot_and_cross_are_computed() {
+        let result = super::vector_calculate("1,2,3", "4,5,6");
+        assert!(result.contains("A·B = 32"));
+        assert!(result.contains("A×B = (-3, 6, -3)"));
     }
 
     #[test]
@@ -2389,9 +3168,7 @@ mod tests {
 impl Drop for NovaApp {
     fn drop(&mut self) {
         // UniKey is a host process that NOVA explicitly started; stop it when
-        // NOVA closes. The downloader is a short-lived PowerShell helper with
-        // a `finally` cleanup block, so detach it and let cleanup finish rather
-        // than hard-killing it and leaving staging files in the host TEMP.
+        // NOVA closes so the portable workspace does not leave input hooks running.
         if self.unikey_process_kind == Some(UniKeyProcessKind::Running) {
             if let Some(mut child) = self.unikey_child.take() {
                 if child.try_wait().ok().flatten().is_none() {

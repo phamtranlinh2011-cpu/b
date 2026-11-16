@@ -29,11 +29,11 @@ if ($LASTEXITCODE -ne 0 -or $DetectedRust -notmatch "^rustc $([regex]::Escape($R
     throw "NOVA requires rustc $RustVersion. Detected: $DetectedRust"
 }
 
-Write-Host '[1/6] Checking pinned Rust toolchain...' -ForegroundColor Cyan
+Write-Host '[1/7] Checking pinned Rust toolchain...' -ForegroundColor Cyan
 & rustc --version
 & cargo --version
 
-Write-Host '[2/6] Preparing the dependency lockfile...' -ForegroundColor Cyan
+Write-Host '[2/7] Preparing the dependency lockfile...' -ForegroundColor Cyan
 $LockPath = Join-Path $ProjectRoot 'Cargo.lock'
 if (-not (Test-Path $LockPath)) {
     Write-Warning 'Cargo.lock is absent. Generating it once on this developer machine. Commit the new Cargo.lock before pushing.'
@@ -48,18 +48,18 @@ if (-not $RootPackage.Success -or $RootPackage.Groups[1].Value -ne $Version) {
 & cargo metadata --locked --format-version 1 --no-deps | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Cargo.lock is invalid or stale. Run scripts/prepare-lockfile.ps1 -Update.' }
 
-Write-Host '[3/6] Running Windows-target unit and integration tests...' -ForegroundColor Cyan
+Write-Host '[3/7] Running Windows-target unit and integration tests...' -ForegroundColor Cyan
 & cargo test --locked --target $Target
 if ($LASTEXITCODE -ne 0) { throw 'cargo test failed.' }
 
-Write-Host '[4/6] Building NOVA Native (x64 MSVC Release)...' -ForegroundColor Cyan
+Write-Host '[4/7] Building NOVA Native (x64 MSVC Release)...' -ForegroundColor Cyan
 & cargo build --locked --release --target $Target
 if ($LASTEXITCODE -ne 0) { throw 'cargo build failed.' }
 
 $BuiltExe = Join-Path $ProjectRoot "target\$Target\release\NOVA.exe"
 if (-not (Test-Path $BuiltExe)) { throw "Expected executable not found: $BuiltExe" }
 
-Write-Host '[5/6] Preparing the portable USB folder...' -ForegroundColor Cyan
+Write-Host '[5/7] Preparing the portable USB folder...' -ForegroundColor Cyan
 $ReleaseDirectory = Join-Path $ProjectRoot 'release'
 $PackageRoot = Join-Path $ReleaseDirectory "NOVA-OS-Native-v$Version-USB"
 if (Test-Path $PackageRoot) { Remove-Item $PackageRoot -Recurse -Force }
@@ -78,23 +78,38 @@ foreach ($Folder in $Folders) {
 }
 Copy-Item $BuiltExe (Join-Path $PackageRoot 'NOVA.exe')
 Copy-Item (Join-Path $ProjectRoot 'portable.flag') $PackageRoot
-New-Item -ItemType Directory -Path (Join-Path $PackageRoot 'scripts') -Force | Out-Null
-Copy-Item (Join-Path $PSScriptRoot 'Download-UniKey.ps1') (Join-Path $PackageRoot 'scripts\Download-UniKey.ps1')
 
 @"
 NOVA Native $Version - QUICK START
 
-1. Keep NOVA.exe, portable.flag, QUICK_START.txt, BUILD_INFO.txt, scripts and Data together on the USB drive.
+1. Keep NOVA.exe, portable.flag, QUICK_START.txt, BUILD_INFO.txt, Apps/UniKey and Data together on the USB drive.
 2. Open NOVA.exe on Windows 10/11 x64.
 3. Windows Sandbox requires a supported Windows edition with the feature enabled and hardware virtualization available.
 4. NOVA itself runs on the Windows host; only explicitly opened Sandbox tasks are isolated.
 5. Close NOVA and all Windows Sandbox windows before safely removing the USB drive.
-6. Data, settings, Trash and staged files are stored below Data/ in portable mode.
+6. Data, settings, Trash and security staging are stored below Data/ in portable mode.
+7. UniKey 4.6 RC2 x64 is bundled in Apps/UniKey and starts when you open UniKey in NOVA.
 
-Inspect the security boundaries and optional third-party tool requirements in README.md and HUONG_DAN_VI.md in the source repository.
+Inspect the third-party notices and security boundaries in README.md and HUONG_DAN_VI.md in the source repository.
 "@ | Set-Content (Join-Path $PackageRoot 'QUICK_START.txt') -Encoding UTF8
 
-Write-Host '[6/6] Finalizing build metadata, checksums and portable ZIP...' -ForegroundColor Cyan
+Write-Host '[6/7] Bundling official UniKey 4.6 RC2 x64...' -ForegroundColor Cyan
+$PreviousNovaAppRoot = $env:NOVA_APP_ROOT
+try {
+    $env:NOVA_APP_ROOT = $PackageRoot
+    & (Join-Path $PSScriptRoot 'Download-UniKey.ps1')
+    if (-not (Test-Path -LiteralPath (Join-Path $PackageRoot 'Apps\UniKey\UniKeyNT.exe') -PathType Leaf)) {
+        throw 'UniKey packaging completed without producing Apps/UniKey/UniKeyNT.exe.'
+    }
+}
+finally {
+    if ($null -eq $PreviousNovaAppRoot) { Remove-Item Env:NOVA_APP_ROOT -ErrorAction SilentlyContinue }
+    else { $env:NOVA_APP_ROOT = $PreviousNovaAppRoot }
+}
+
+Copy-Item (Join-Path $ProjectRoot 'THIRD_PARTY_NOTICES.md') (Join-Path $PackageRoot 'THIRD_PARTY_NOTICES.txt')
+
+Write-Host '[7/7] Finalizing build metadata, checksums and portable ZIP...' -ForegroundColor Cyan
 & (Join-Path $PSScriptRoot 'finalize-portable.ps1') -PackageDirectory $PackageRoot
 if (-not $?) { throw 'Portable package finalization failed.' }
 Write-Host '[SUCCESS] Unsigned portable package created. Trusted release signing, when configured, runs in a separate post-build step.' -ForegroundColor Green

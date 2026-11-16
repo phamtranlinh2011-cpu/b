@@ -114,58 +114,6 @@ fn launch_wsb(config_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn validate_browser_url(url: &str) -> io::Result<()> {
-    let Some((scheme, remainder)) = url.split_once("://") else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Only HTTP and HTTPS addresses are allowed in isolated Chrome."));
-    };
-    let authority = remainder.split(|ch| ch == '/' || ch == '?' || ch == '#').next().unwrap_or_default();
-    if url.len() > 2048
-        || !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-        || authority.is_empty()
-        || authority.contains('@')
-        || url.chars().any(|ch| ch.is_control() || ch.is_whitespace() || ch == '"' || ch == '\\')
-    {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "The browser address must be a valid-looking HTTP(S) URL without whitespace, user-info or control characters."));
-    }
-    Ok(())
-}
-
-/// Start Chrome inside a clean Windows Sandbox profile. The only host mapping
-/// is Chrome's application directory, mounted read-only. User profile, cookies,
-/// extensions, downloads and browser cache are created inside the disposable VM.
-#[cfg(windows)]
-pub fn launch_isolated_chrome(paths: &AppPaths, chrome_exe: &Path, url: &str) -> io::Result<PathBuf> {
-    validate_browser_url(url)?;
-    let chrome_exe = chrome_exe.canonicalize()?;
-    crate::apps::verify_google_chrome_signature(&chrome_exe)?;
-    if !chrome_exe.is_file() || !chrome_exe.file_name().is_some_and(|name| name.eq_ignore_ascii_case("chrome.exe")) {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "The selected browser executable is not chrome.exe."));
-    }
-    let chrome_dir = chrome_exe.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Chrome has no application directory."))?;
-    let escaped_host_dir = xml_escape(&chrome_dir.to_string_lossy());
-    let safe_url = url.replace('\'', "''");
-    let script = format!(
-        "$ErrorActionPreference='Stop'; $chrome='C:\\NOVAChrome\\chrome.exe'; $url='{}'; $argUrl='\"' + $url + '\"'; $args=@('--user-data-dir=C:\\NOVAProfile','--no-first-run','--no-default-browser-check','--disable-default-apps',$argUrl); if (Test-Path -LiteralPath $chrome) {{ Start-Process -FilePath $chrome -ArgumentList $args }} else {{ throw 'Read-only mapped Chrome executable is unavailable.' }}",
-        safe_url
-    );
-    let encoded = powershell_encoded_command(&script);
-    let config = format!(
-        "<Configuration>\n  <VGpu>Disable</VGpu>\n  <Networking>Enable</Networking>\n  <AudioInput>Disable</AudioInput>\n  <VideoInput>Disable</VideoInput>\n  <PrinterRedirection>Disable</PrinterRedirection>\n  <ClipboardRedirection>Disable</ClipboardRedirection>\n  <ProtectedClient>Enable</ProtectedClient>\n  <MappedFolders>\n    <MappedFolder>\n      <HostFolder>{escaped_host_dir}</HostFolder>\n      <SandboxFolder>C:\\NOVAChrome</SandboxFolder>\n      <ReadOnly>true</ReadOnly>\n    </MappedFolder>\n  </MappedFolders>\n  <LogonCommand>\n    <Command>powershell.exe -NoProfile -NonInteractive -EncodedCommand {encoded}</Command>\n  </LogonCommand>\n</Configuration>\n"
-    );
-    let config_path = create_wsb_file(paths, &format!("Browser-{}.wsb", create_session_id()), &config)?;
-    if let Err(error) = launch_wsb(&config_path) {
-        let _ = std::fs::remove_file(&config_path);
-        return Err(error);
-    }
-    Ok(config_path)
-}
-
-#[cfg(not(windows))]
-pub fn launch_isolated_chrome(_paths: &AppPaths, _chrome_exe: &Path, _url: &str) -> io::Result<PathBuf> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "Windows Sandbox integration is available only in the Windows build."))
-}
-
 /// Copy one selected NOVA workspace file into a unique staging folder and map
 /// only that folder read-only into an offline disposable Windows Sandbox.
 /// The original file is never mapped and cannot be changed by the sandbox.
@@ -391,27 +339,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn isolated_chrome_accepts_only_http_and_https_urls() {
-        use super::validate_browser_url;
-        assert!(validate_browser_url("https://example.com/path?q=1").is_ok());
-        assert!(validate_browser_url("HTTP://example.com").is_ok());
-        for unsafe_url in [
-            "file:///C:/Windows/win.ini",
-            "javascript:alert(1)",
-            "--user-data-dir=C:/Temp",
-            "https://",
-            "https://user@example.com",
-            "https://example.com/a b",
-            "https://example.com\\path",
-        ] {
-            assert!(validate_browser_url(unsafe_url).is_err(), "accepted {unsafe_url}");
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
     fn xml_escape_protects_windows_paths() {
-        assert_eq!(xml_escape(r"C:\NOVA & Data\Chrome"), r"C:\NOVA &amp; Data\Chrome");
+        assert_eq!(xml_escape(r"C:\NOVA & Data\Workspace"), r"C:\NOVA &amp; Data\Chrome");
     }
 
     #[cfg(windows)]

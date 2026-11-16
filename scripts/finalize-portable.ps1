@@ -32,6 +32,13 @@ $Signature = Get-AuthenticodeSignature -FilePath $ExePath
 $Signer = if ($Signature.SignerCertificate) { $Signature.SignerCertificate.GetNameInfo('SimpleName', $false) } else { 'Unsigned' }
 $BuildTime = [DateTime]::UtcNow.ToString('o')
 $ExeHash = (Get-FileHash -LiteralPath $ExePath -Algorithm SHA256).Hash.ToLowerInvariant()
+$UniKeyPath = Join-Path $PackageRoot 'Apps\UniKey\UniKeyNT.exe'
+if (-not (Test-Path -LiteralPath $UniKeyPath -PathType Leaf)) { throw 'Bundled UniKeyNT.exe is missing from Apps/UniKey.' }
+$UniKeySignature = Get-AuthenticodeSignature -FilePath $UniKeyPath
+if ($UniKeySignature.Status -ne 'Valid' -or $UniKeySignature.SignerCertificate.GetNameInfo('SimpleName', $false) -cne 'PHAM KIM LONG') {
+    throw 'Bundled UniKey failed Authenticode publisher verification during finalization.'
+}
+$UniKeyHash = (Get-FileHash -LiteralPath $UniKeyPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $LockPath = Join-Path $ProjectRoot 'Cargo.lock'
 if (-not (Test-Path -LiteralPath $LockPath -PathType Leaf)) { throw 'Cargo.lock is required to finalize a reproducible release.' }
 $LockHash = (Get-FileHash -LiteralPath $LockPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -45,6 +52,10 @@ Target: $Target
 Rust: $DetectedRust
 Renderer: eframe/egui Glow
 Executable SHA-256: $ExeHash
+Bundled companion: UniKey 4.6 RC2 x64 (official publisher signature verified)
+UniKey Authenticode status: $($UniKeySignature.Status)
+UniKey publisher: $($UniKeySignature.SignerCertificate.GetNameInfo('SimpleName', $false))
+UniKey SHA-256: $UniKeyHash
 Cargo.lock SHA-256: $LockHash
 Authenticode status: $($Signature.Status)
 Authenticode signer: $Signer
@@ -52,7 +63,10 @@ Portable mode: enabled by portable.flag; data stays under Data/
 Windows Sandbox: optional Windows feature; only explicitly opened routes use it
 External security tools: optional, separately installed; not bundled or sandboxed by NOVA
 "@ | Set-Content (Join-Path $PackageRoot 'BUILD_INFO.txt') -Encoding UTF8
-"$ExeHash  NOVA.exe" | Set-Content (Join-Path $PackageRoot 'CHECKSUMS.sha256') -Encoding ASCII
+@(
+    "$ExeHash  NOVA.exe",
+    "$UniKeyHash  Apps/UniKey/UniKeyNT.exe"
+) | Set-Content (Join-Path $PackageRoot 'CHECKSUMS.sha256') -Encoding ASCII
 
 $ReleaseDirectory = Split-Path -Parent $PackageRoot
 New-Item -ItemType Directory -Path $ReleaseDirectory -Force | Out-Null
