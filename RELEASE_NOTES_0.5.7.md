@@ -42,3 +42,5 @@
 
 - Corrected the iterator predicate for desktop shortcut lookup: `.iter()` passes `&&str` to `find`, so the comparison now dereferences the name to `&str` (`app.name == *name`).
 - Promoted the desktop shortcut list to a shared catalogue constant and added a test ensuring every desktop shortcut maps to a unique app-catalog entry.
+
+- Fixed Windows junction deletion: classify directory-shaped reparse points using `FILE_ATTRIBUTE_DIRECTORY` and remove them with `RemoveDirectoryW` via `std::fs::remove_dir`, rather than relying on `Metadata::is_dir()` and accidentally calling `RemoveFileW` (which returns `ERROR_ACCESS_DENIED`).

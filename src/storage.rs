@@ -299,6 +299,33 @@ pub(crate) fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
     }
 }
 
+/// Remove a link/reparse-point entry without following its target.
+///
+/// On Windows, `symlink_metadata().is_dir()` is not a reliable way to decide
+/// whether a reparse point is directory-shaped: it can report false for a
+/// junction or directory symlink. `RemoveFileW` then fails with
+/// ERROR_ACCESS_DENIED (5). Use the DIRECTORY attribute from the link's own
+/// metadata to select `RemoveDirectoryW` (`remove_dir`) instead.
+fn remove_link_or_reparse_point(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return fs::remove_dir(path);
+        }
+        return fs::remove_file(path);
+    }
+    #[cfg(not(windows))]
+    {
+        if metadata.is_dir() {
+            fs::remove_dir(path)
+        } else {
+            fs::remove_file(path)
+        }
+    }
+}
+
 /// Remove a tree without traversing symlinks or Windows reparse points.
 /// Reparse-point directories are removed as links, never enumerated. The walk
 /// is iterative so an adversarially deep directory tree cannot exhaust the
@@ -306,7 +333,7 @@ pub(crate) fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
 pub(crate) fn remove_tree_without_following_reparse_points(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if is_link_or_reparse_point(&metadata) {
-        return if metadata.is_dir() { fs::remove_dir(path) } else { fs::remove_file(path) };
+        return remove_link_or_reparse_point(path, &metadata);
     }
     if metadata.is_file() {
         return fs::remove_file(path);
@@ -320,7 +347,7 @@ pub(crate) fn remove_tree_without_following_reparse_points(path: &Path) -> io::R
     while let Some(directory) = pending.pop() {
         let directory_metadata = fs::symlink_metadata(&directory)?;
         if is_link_or_reparse_point(&directory_metadata) {
-            if directory_metadata.is_dir() { fs::remove_dir(&directory)?; } else { fs::remove_file(&directory)?; }
+            remove_link_or_reparse_point(&directory, &directory_metadata)?;
             continue;
         }
         if !directory_metadata.is_dir() {
@@ -331,7 +358,7 @@ pub(crate) fn remove_tree_without_following_reparse_points(path: &Path) -> io::R
             let child = entry?.path();
             let child_metadata = fs::symlink_metadata(&child)?;
             if is_link_or_reparse_point(&child_metadata) {
-                if child_metadata.is_dir() { fs::remove_dir(&child)?; } else { fs::remove_file(&child)?; }
+                remove_link_or_reparse_point(&child, &child_metadata)?;
             } else if child_metadata.is_dir() {
                 pending.push(child);
             } else if child_metadata.is_file() {
@@ -584,6 +611,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_junctions_are_rejected_and_safe_delete_never_follows_them() {
+        use std::os::windows::fs::MetadataExt;
         use std::process::Command;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -591,22 +619,47 @@ mod tests {
         let base = std::env::temp_dir().join(format!("nova-junction-test-{}-{nonce}", std::process::id()));
         let root = base.join("root");
         let outside = base.join("outside");
+        let nested = root.join("nested");
         let junction = root.join("redirected-data");
-        std::fs::create_dir_all(&root).unwrap();
+        let nested_junction = nested.join("redirected-data");
+        std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("keep.txt"), "must survive").unwrap();
 
-        let output = Command::new(crate::windows_process::system_binary("cmd.exe").unwrap())
-            .args(["/D", "/C", "mklink", "/J"])
-            .arg(&junction)
-            .arg(&outside)
-            .output()
-            .expect("cmd.exe must be available on Windows");
-        assert!(output.status.success(), "Could not create junction for Windows integration test: {}", String::from_utf8_lossy(&output.stderr));
+        let cmd = crate::windows_process::system_binary("cmd.exe").unwrap();
+        let create_junction = |link: &std::path::Path| {
+            let output = Command::new(&cmd)
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(link)
+                .arg(&outside)
+                .output()
+                .expect("cmd.exe must be available on Windows");
+            assert!(
+                output.status.success(),
+                "Could not create junction for Windows integration test: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        create_junction(&junction);
+        create_junction(&nested_junction);
+
+        // Confirm the fixture is a directory reparse point. On Windows,
+        // Metadata::is_dir() may not report true for this link; the directory
+        // attribute is the authoritative discriminator for RemoveDirectoryW.
+        let junction_metadata = std::fs::symlink_metadata(&junction).unwrap();
+        let attrs = junction_metadata.file_attributes();
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        assert_ne!(attrs & FILE_ATTRIBUTE_DIRECTORY, 0, "Junction fixture must carry FILE_ATTRIBUTE_DIRECTORY");
+        assert_ne!(attrs & FILE_ATTRIBUTE_REPARSE_POINT, 0, "Junction fixture must carry FILE_ATTRIBUTE_REPARSE_POINT");
 
         assert!(super::ensure_real_child(&root, "redirected-data").is_err());
         super::remove_tree_without_following_reparse_points(&junction).unwrap();
         assert!(!junction.exists());
+
+        // Also exercise the recursive walk's child-reparse-point path.
+        super::remove_tree_without_following_reparse_points(&nested).unwrap();
+        assert!(!nested.exists());
         assert_eq!(std::fs::read_to_string(outside.join("keep.txt")).unwrap(), "must survive");
 
         let _ = std::fs::remove_dir_all(base);
