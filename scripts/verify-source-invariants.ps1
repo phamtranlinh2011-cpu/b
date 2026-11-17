@@ -12,6 +12,7 @@ $RequiredPatterns = @(
     @{ Pattern = 'let mut files_open\s*=\s*self\.files_open\s*;'; Description = 'File Manager must use a local open flag' },
     @{ Pattern = 'window\.open\(&mut files_open\)'; Description = 'File Manager window must borrow the local open flag' }
     @{ Pattern = 'self\.files_open\s*=\s*files_open\s*;'; Description = 'File Manager must copy the local open flag back to application state' }
+    @{ Pattern = 'Some\(Err\(TryRecvError::Disconnected\)\)[\s\S]*?Some\(Err\(_\)\)'; Description = 'Hardware Center must handle all remaining telemetry receive states exhaustively' }
 )
 foreach ($Check in $RequiredPatterns) {
     if ($Source -notmatch $Check.Pattern) {
