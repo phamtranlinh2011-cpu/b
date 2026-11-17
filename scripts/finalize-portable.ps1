@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$PackageDirectory = ''
+    [string]$PackageDirectory = '',
+    [switch]$RequireSignedExecutable
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +31,9 @@ if (Get-Command 'git' -ErrorAction SilentlyContinue) {
 $DetectedRust = if (Get-Command 'rustc' -ErrorAction SilentlyContinue) { (& rustc --version).Trim() } else { 'unknown (rustc unavailable during finalization)' }
 $Signature = Get-AuthenticodeSignature -FilePath $ExePath
 $Signer = if ($Signature.SignerCertificate) { $Signature.SignerCertificate.GetNameInfo('SimpleName', $false) } else { 'Unsigned' }
+if ($RequireSignedExecutable -and $Signature.Status -ne 'Valid') {
+    throw "Trusted release requires a valid Authenticode signature; NOVA.exe status is $($Signature.Status)."
+}
 $BuildTime = [DateTime]::UtcNow.ToString('o')
 $ExeHash = (Get-FileHash -LiteralPath $ExePath -Algorithm SHA256).Hash.ToLowerInvariant()
 $UniKeyPath = Join-Path $PackageRoot 'Apps\UniKey\UniKeyNT.exe'
@@ -84,5 +88,6 @@ Write-Host "USB folder: $PackageRoot" -ForegroundColor Green
 Write-Host "ZIP: $ZipPath" -ForegroundColor Green
 Write-Host "SHA256: $($ZipPath).sha256" -ForegroundColor Green
 if ($Signature.Status -ne 'Valid') {
-    Write-Warning 'This executable is not Authenticode-verified. Configure NOVA signing secrets for trusted main-branch releases.'
+    if ($RequireSignedExecutable) { throw 'Trusted release cannot be finalized without a valid executable signature.' }
+    Write-Warning 'This is an unsigned development artifact. It must not be presented as a trusted signed release.'
 }

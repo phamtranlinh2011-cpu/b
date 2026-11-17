@@ -103,13 +103,12 @@ impl SecurityTool {
         let detected_executable = self.detect(app_dir).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("{} was not found. Install it from the official website, then choose Detect again.", self.info().name))
         })?;
-        verify_security_tool_signature(self, &detected_executable, allow_unsigned_zap)?;
-        // Re-check the canonical path after verification so a replaced parent
-        // junction/symlink cannot redirect the subsequent process launch.
-        let executable = canonical_regular_executable(&detected_executable)
-            .filter(|current| current == &detected_executable)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "Security tool path changed during publisher verification; launch was blocked."))?;
+        let launch_guard = crate::windows_process::hold_verified_executable(&detected_executable)?;
+        let executable = launch_guard.path().to_path_buf();
+        verify_security_tool_signature(self, &executable, allow_unsigned_zap)?;
         let working_directory = executable.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Tool executable has no parent folder."))?;
+        // The guard prevents the verified file or any parent directory from
+        // being replaced until CreateProcess has opened the executable image.
         Command::new(&executable).current_dir(working_directory).spawn()?;
         Ok(executable)
     }
@@ -148,6 +147,37 @@ fn expected_publisher_matches(tool: SecurityTool, signer: &str) -> bool {
     }
 }
 
+#[cfg(any(windows, test))]
+fn interpret_signature_result(
+    tool: SecurityTool,
+    exit_code: Option<i32>,
+    signer: &str,
+    allow_unsigned_zap: bool,
+) -> io::Result<()> {
+    match exit_code {
+        Some(0) => {
+            if expected_publisher_matches(tool, signer) {
+                Ok(())
+            } else {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, format!(
+                    "{} launch blocked: unexpected Authenticode publisher '{}'.", tool.info().name, signer.trim()
+                )))
+            }
+        }
+        Some(18) if tool == SecurityTool::WebSecurity && allow_unsigned_zap => Ok(()),
+        Some(18) if tool == SecurityTool::WebSecurity => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "OWASP ZAP is unsigned. Confirm that this copy came from the official ZAP project before launching it.",
+        )),
+        Some(18) => Err(io::Error::new(io::ErrorKind::PermissionDenied, format!(
+            "{} launch blocked: the executable is not Authenticode-signed.", tool.info().name
+        ))),
+        _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, format!(
+            "{} launch blocked: the Authenticode signature is invalid, untrusted or unavailable.", tool.info().name
+        ))),
+    }
+}
+
 #[cfg(windows)]
 fn verify_security_tool_signature(tool: SecurityTool, executable: &Path, allow_unsigned_zap: bool) -> io::Result<()> {
     use std::time::Duration;
@@ -165,20 +195,12 @@ fn verify_security_tool_signature(tool: SecurityTool, executable: &Path, allow_u
     if output.timed_out || output.drain_timed_out {
         return Err(io::Error::new(io::ErrorKind::TimedOut, "Security tool publisher verification timed out. Check Windows certificate services and try again."));
     }
-    match output.status.code() {
-        Some(0) => {
-            let signer = String::from_utf8_lossy(&output.stdout);
-            if expected_publisher_matches(tool, &signer) {
-                Ok(())
-            } else {
-                Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} launch blocked: unexpected Authenticode publisher '{signer}'.", tool.info().name)))
-            }
-        }
-        Some(18) if tool == SecurityTool::WebSecurity && allow_unsigned_zap => Ok(()),
-        Some(18) if tool == SecurityTool::WebSecurity => Err(io::Error::new(io::ErrorKind::PermissionDenied, "OWASP ZAP is unsigned. Confirm that this copy came from the official ZAP project before launching it.")),
-        Some(18) => Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} launch blocked: the executable is not Authenticode-signed.", tool.info().name))),
-        _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} launch blocked: the Authenticode signature is invalid, untrusted or unavailable.", tool.info().name))),
-    }
+    interpret_signature_result(
+        tool,
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stdout),
+        allow_unsigned_zap,
+    )
 }
 
 #[cfg(not(windows))]
@@ -396,6 +418,22 @@ mod tests {
         assert!(super::canonical_regular_executable(&external.join("tool.exe")).is_some());
         let _ = std::fs::remove_file(&redirected);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn security_center_distinguishes_unsigned_invalid_and_unexpected_signatures() {
+        let unsigned_zap = super::interpret_signature_result(SecurityTool::WebSecurity, Some(18), "", false).unwrap_err();
+        assert!(unsigned_zap.to_string().contains("OWASP ZAP is unsigned"));
+        assert!(super::interpret_signature_result(SecurityTool::WebSecurity, Some(18), "", true).is_ok());
+
+        let unsigned_tool = super::interpret_signature_result(SecurityTool::PacketAnalyzer, Some(18), "", false).unwrap_err();
+        assert!(unsigned_tool.to_string().contains("not Authenticode-signed"));
+
+        let invalid = super::interpret_signature_result(SecurityTool::PacketAnalyzer, Some(17), "", false).unwrap_err();
+        assert!(invalid.to_string().contains("invalid, untrusted or unavailable"));
+
+        let unexpected = super::interpret_signature_result(SecurityTool::PacketAnalyzer, Some(0), "Wireshark Lookalike", false).unwrap_err();
+        assert!(unexpected.to_string().contains("unexpected Authenticode publisher"));
     }
 
     #[test]

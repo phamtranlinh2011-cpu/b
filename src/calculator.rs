@@ -488,4 +488,50 @@ mod tests {
         assert!(super::evaluate("poissonpdf(10000,5000)", context).unwrap().is_finite());
     }
 
+
+    #[test]
+    fn distribution_functions_reject_invalid_domains_and_non_finite_parameters() {
+        let context = super::EvalContext::default();
+        for expression in [
+            "binompdf(-1,0.5,0)", "binompdf(10,1.1,2)", "binompdf(10,0.5,11)",
+            "binomcdf(10,0.5,1.5)", "poissonpdf(-0.1,0)", "poissonpdf(2,-1)",
+            "poissoncdf(2,1.2)", "normalpdf(0,0,0)", "normalcdf(2,1,0,1)",
+        ] {
+            assert!(super::evaluate(expression, context).is_err(), "{expression}");
+        }
+        assert!(super::evaluate("poissonpdf(1/0,2)", context).is_err());
+    }
+
+    #[test]
+    fn distribution_cdfs_are_bounded_and_monotonic_at_boundaries() {
+        let context = super::EvalContext::default();
+        let binomial = (0..=30).map(|k| super::evaluate(&format!("binomcdf(30,0.37,{k})"), context).unwrap()).collect::<Vec<_>>();
+        let poisson = (0..=30).map(|k| super::evaluate(&format!("poissoncdf(12,{k})"), context).unwrap()).collect::<Vec<_>>();
+        for values in [&binomial, &poisson] {
+            assert!(values.iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value)));
+            assert!(values.windows(2).all(|pair| pair[0] <= pair[1] + 1.0e-14));
+        }
+        assert_eq!(super::evaluate("binomcdf(30,0.37,30)", context).unwrap(), 1.0);
+        assert_eq!(super::evaluate("poissoncdf(0,0)", context).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn factorial_and_combinatorics_reject_overflow_boundaries() {
+        let context = super::EvalContext::default();
+        assert_eq!(super::evaluate("0!", context).unwrap(), 1.0);
+        assert!(super::evaluate("171!", context).is_err());
+        assert!(super::evaluate("(-1)!", context).is_err());
+        assert!(super::evaluate("5.5!", context).is_err());
+        assert!(super::evaluate("nCr(171,2)", context).is_err());
+        assert!(super::evaluate("nPr(5,6)", context).is_err());
+    }
+
+    #[test]
+    fn base_conversion_rejects_out_of_range_digits_and_bases() {
+        assert!(super::convert_base("102", 2).is_err());
+        assert!(super::convert_base("10", 1).is_err());
+        assert!(super::convert_base("10", 17).is_err());
+        assert_eq!(super::convert_base("-FF", 16).unwrap(), "BIN  -11111111\nOCT  -377\nDEC  -255\nHEX  -FF");
+    }
+
 }

@@ -5,6 +5,7 @@ mod calculator;
 mod isolation;
 mod apps;
 mod file_ops;
+mod clipboard;
 mod storage;
 mod terminal;
 mod trash;

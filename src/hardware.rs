@@ -4,6 +4,8 @@
 //! does not expose a counter, the corresponding value remains unavailable.
 
 use std::io;
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
+use std::thread;
 #[cfg(windows)]
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -19,6 +21,25 @@ fn bytes_per_second(delta_bytes: u64, elapsed_seconds: Option<f64>) -> Option<f6
     (seconds.is_finite() && seconds > 0.0).then(|| delta_bytes as f64 / seconds)
 }
 
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HardwareProviderState {
+    #[default]
+    Unavailable,
+    NoDevices,
+    Available,
+}
+
+fn gpu_state(provider_available: bool, adapter_count: usize) -> HardwareProviderState {
+    if !provider_available {
+        HardwareProviderState::Unavailable
+    } else if adapter_count == 0 {
+        HardwareProviderState::NoDevices
+    } else {
+        HardwareProviderState::Available
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HardwareSnapshot {
     pub disks: Vec<DiskSnapshot>,
@@ -28,7 +49,7 @@ pub struct HardwareSnapshot {
     pub battery: Option<BatterySnapshot>,
     pub disk_provider_available: bool,
     pub network_provider_available: bool,
-    pub gpu_provider_available: bool,
+    pub gpu_provider_state: HardwareProviderState,
     pub sensor_provider_available: bool,
 }
 
@@ -218,9 +239,10 @@ impl HardwareTelemetry {
                         used_memory: gpu.used_memory(),
                     }
                 }).collect();
-                self.snapshot.gpu_provider_available = true;
+                self.snapshot.gpu_provider_state = gpu_state(true, self.snapshot.gpus.len());
             } else {
-                self.snapshot.gpu_provider_available = false;
+                self.snapshot.gpus.clear();
+                self.snapshot.gpu_provider_state = gpu_state(false, 0);
             }
             changed = true;
             self.last_gpu_refresh = now;
@@ -262,6 +284,81 @@ impl Default for HardwareTelemetry {
     fn default() -> Self { Self::new() }
 }
 
+/// Owns the potentially slow hardware providers on a dedicated worker thread.
+/// Only plain snapshots cross back to the UI thread; sysinfo provider objects
+/// never need to be Send or be refreshed during an egui frame.
+enum HardwareWorkerCommand {
+    Refresh,
+    SetActive(bool),
+}
+
+pub struct HardwareWorker {
+    snapshot_receiver: Receiver<HardwareSnapshot>,
+    command_sender: Sender<HardwareWorkerCommand>,
+    active: bool,
+}
+
+impl HardwareWorker {
+    pub fn start() -> io::Result<Self> {
+        let (snapshot_sender, snapshot_receiver): (SyncSender<HardwareSnapshot>, Receiver<HardwareSnapshot>) = mpsc::sync_channel(1);
+        let (command_sender, command_receiver) = mpsc::channel();
+        thread::Builder::new().name("nova-hardware-telemetry".to_owned()).spawn(move || {
+            let mut telemetry = HardwareTelemetry::new();
+            let mut active = true;
+            loop {
+                if active {
+                    if telemetry.refresh() {
+                        match snapshot_sender.try_send(telemetry.snapshot().clone()) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Disconnected(_)) => break,
+                        }
+                    }
+                    match command_receiver.recv_timeout(Duration::from_millis(500)) {
+                        Ok(HardwareWorkerCommand::Refresh) => telemetry.request_refresh(),
+                        Ok(HardwareWorkerCommand::SetActive(next)) => {
+                            active = next;
+                            if active { telemetry.request_refresh(); }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                } else {
+                    match command_receiver.recv() {
+                        Ok(HardwareWorkerCommand::Refresh) => telemetry.request_refresh(),
+                        Ok(HardwareWorkerCommand::SetActive(next)) => {
+                            active = next;
+                            if active { telemetry.request_refresh(); }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        })?;
+        Ok(Self { snapshot_receiver, command_sender, active: true })
+    }
+
+    /// Returns the newest queued snapshot, or None while the provider worker
+    /// is sampling. A disconnected worker is reported explicitly.
+    pub fn try_snapshot(&self) -> Result<Option<HardwareSnapshot>, TryRecvError> {
+        match self.snapshot_receiver.try_recv() {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(error @ TryRecvError::Disconnected) => Err(error),
+        }
+    }
+
+    pub fn request_refresh(&self) -> bool {
+        self.command_sender.send(HardwareWorkerCommand::Refresh).is_ok()
+    }
+
+    pub fn set_active(&mut self, active: bool) {
+        if self.active != active {
+            self.active = active;
+            let _ = self.command_sender.send(HardwareWorkerCommand::SetActive(active));
+        }
+    }
+}
+
 /// Opens the corresponding Windows control surface. Device-specific controls
 /// remain with Windows rather than writing undocumented hardware values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,11 +370,17 @@ pub enum HostControl {
     Power,
 }
 
+/// Open the Windows privacy page where desktop-app location access can be
+/// enabled after Windows blocks an explicit nearby Wi-Fi scan.
+pub fn open_location_privacy_settings() -> io::Result<()> {
+    open_settings_uri("ms-settings:privacy-location")
+}
+
 pub fn open_host_control(control: HostControl) -> io::Result<()> {
     match control {
         HostControl::Sound => {
             #[cfg(windows)]
-            { Command::new("sndvol.exe").spawn().map(|_| ()) }
+            { Command::new(crate::windows_process::system_binary("sndvol.exe")?).spawn().map(|_| ()) }
             #[cfg(not(windows))]
             { Err(io::Error::new(io::ErrorKind::Unsupported, "Windows volume mixer is only available on Windows.")) }
         }
@@ -433,4 +536,12 @@ mod tests {
         assert_eq!(format_duration(3599), "59m");
         assert_eq!(format_duration(3661), "1h 1m");
     }
+
+    #[test]
+    fn gpu_provider_state_distinguishes_missing_adapter_from_unsupported_provider() {
+        assert_eq!(super::gpu_state(false, 0), super::HardwareProviderState::Unavailable);
+        assert_eq!(super::gpu_state(true, 0), super::HardwareProviderState::NoDevices);
+        assert_eq!(super::gpu_state(true, 1), super::HardwareProviderState::Available);
+    }
+
 }

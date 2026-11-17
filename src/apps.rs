@@ -75,10 +75,14 @@ pub fn launch_chrome(chrome: &std::path::Path) -> io::Result<()> {
     if !chrome.is_file() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "Google Chrome executable was not found."));
     }
-    verify_google_chrome_signature(chrome)?;
+    let launch_guard = crate::windows_process::hold_verified_executable(chrome)?;
+    let executable = launch_guard.path();
+    verify_google_chrome_signature(executable)?;
+    // Keep the executable and its parent directories locked against replacement
+    // from publisher verification until Windows has created the process.
     // Launch the user's installed Chrome with its normal Windows profile,
     // extensions, bookmarks, cookies, native frame and default new-tab page.
-    Command::new(chrome).arg("--new-window").spawn()?;
+    Command::new(executable).arg("--new-window").spawn()?;
     Ok(())
 }
 
@@ -128,7 +132,7 @@ pub fn open_chrome_download_page() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    
+
 
     #[test]
     fn trusted_google_publisher_names_are_explicit() {

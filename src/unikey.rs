@@ -73,13 +73,16 @@ pub fn verify_official_signature(_path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 pub fn launch_verified(path: &Path) -> io::Result<std::process::Child> {
     use std::process::Command;
-    verify_official_signature(path)?;
-    let working_directory = path.parent().ok_or_else(|| {
+    let launch_guard = crate::windows_process::hold_verified_executable(path)?;
+    let executable = launch_guard.path();
+    verify_official_signature(executable)?;
+    let working_directory = executable.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "UniKey executable has no parent directory.")
     })?;
     // Keep UniKey's relative configuration/resource files beside the USB copy
     // instead of inheriting NOVA's potentially unrelated working directory.
-    Command::new(path).current_dir(working_directory).spawn()
+    // The executable guard remains alive until spawn() has opened the image.
+    Command::new(executable).current_dir(working_directory).spawn()
 }
 
 #[cfg(not(windows))]

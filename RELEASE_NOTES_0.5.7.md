@@ -137,7 +137,7 @@
 
 ## Phase 4 — everyday apps and file workflow
 
-- File Manager now supports multi-selection (Ctrl-click/Ctrl+A), an internal Copy/Cut/Paste clipboard, collision-safe Rename, batch Move to NOVA Trash, recursive workspace search, and bounded text preview. Copy/move work runs on background threads; folder copies use staging, refuse links/reparse points, and are bounded by depth/item limits.
+- File Manager supports multi-selection (Ctrl-click/Ctrl+A), Windows CF_HDROP file-path clipboard interoperability with an internal fallback, collision-safe Rename, batch Move to NOVA Trash, recursive workspace search, and bounded text preview. Copy/move work runs on background threads; folder copies use staging, refuse links/reparse points, and are bounded by depth/item limits.
 - Settings → Network adds a graphical Wi-Fi scan/select/connect/disconnect workflow using the Windows WLAN command interface. Passwords are not stored in NOVA preferences or terminal history. Windows may retain the imported profile. The panel reports SSIDs only and does not invent signal/security metadata.
 - Editor adds exact case-sensitive Find and Replace All (Ctrl+F), with output-size preflight before allocation and the existing 2 MiB document limit. Replacements remain unsaved until explicitly saved.
 - Calculator Calculate adds session-only MS/M+/M−/MR/MC memory functions.
@@ -154,3 +154,28 @@
 - Removed the Settings window closure's whole-`self` borrow: theme state is computed before the window borrows its open flag, and Wi-Fi actions are dispatched after the UI closure.
 - Removed an unused binding in the batch Trash path. No dependency or Cargo manifest changes were made.
 - Static checks pass in this editing environment; compile, Clippy and tests must still be confirmed by the Windows CI runner.
+
+## Phase 4 — Windows CI borrow-check follow-up
+
+- Cloned the selected Wi-Fi SSID into a worker-owned value before moving it into the background connection thread; the original remains available for the UI status message.
+- Moved the File Manager open/close flag into a local variable around the egui window closure, then writes the resulting state back after the closure. This avoids overlapping the mutable `files_open` field borrow with File Manager selection methods that borrow the app.
+- No Cargo manifest, dependency, or public feature changes.
+- Static source checks pass; Rust compilation and unit tests still require the Windows CI/toolchain environment.
+
+
+## Phase 3 app-quality audit follow-up
+
+- Added Windows file clipboard interoperability using `CF_HDROP`. Ctrl+C/X and Ctrl+V now publish/read native file-path clipboard data; importing external clipboard files into NOVA is copy-only and refuses nested links/reparse points. The Paste action remains available when the destination folder is empty.
+- Added a one-step Undo for the latest File Manager batch moved into NOVA Trash (button and Ctrl+Z while Files has focus). Retryable items remain in Trash if a restore fails.
+- Editor stores a bounded content fingerprint when opening a document and checks it before overwriting the same path, detecting external edits even when file size is unchanged.
+- Wi-Fi status now polls `WlanQueryInterface` for the current association and signal quality, separating command acceptance from confirmed network state.
+- Added Calculator boundary regression tests and hardened WLAN query error handling when multiple adapters have mixed statuses.
+- SMART drive health and physical-disk read/write throughput remain out of scope; the Storage view continues to report only metrics exposed by its current provider. No health percentage is inferred.
+
+## Audit Phase 4 — CI, Performance & Release
+
+- Added Rust formatting and PowerShell syntax validation to Windows CI.
+- Added a short packaged-executable startup smoke test.
+- Trusted main-branch releases now fail closed unless NOVA.exe has a valid Authenticode signature and signing secrets are configured.
+- Documented x64-only support, Cargo.lock policy, and repeatable performance sampling.
+- ARM64 and fixed performance thresholds remain deferred pending native hardware validation.

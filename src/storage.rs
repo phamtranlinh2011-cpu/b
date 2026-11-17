@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -50,6 +50,10 @@ impl Default for Settings {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct WifiManifest {
     profiles: BTreeSet<String>,
+    /// Exact Windows profile names for newly-created NOVA profiles. Missing
+    /// values are legacy entries using the historical `NOVA::<SSID>` name.
+    #[serde(default)]
+    profile_names: BTreeMap<String, String>,
 }
 
 static ATOMIC_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -75,12 +79,50 @@ fn ensure_real_directory_chain(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+
+const USER_CONFIG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Read configuration through a no-follow file handle while the parent chain
+/// is held stable. This closes the validation-to-open race for settings and
+/// Wi-Fi profile metadata.
+fn read_regular_file_bounded(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Configuration file has no parent directory."))?;
+    #[cfg(windows)]
+    let _parent_guard = crate::windows_process::hold_real_directory_chain(parent)?;
+    #[cfg(not(windows))]
+    ensure_real_directory_chain(parent)?;
+
+    ensure_regular_file_not_reparse(path)?;
+    let file = match crate::file_ops::open_regular_file_for_read(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let length = file.metadata()?.len();
+    if length > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "NOVA configuration file exceeds the supported size limit."));
+    }
+    let mut bytes = Vec::with_capacity(length.min(limit) as usize);
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "NOVA configuration file grew beyond the supported size limit."));
+    }
+    Ok(Some(bytes))
+}
+
 /// Replace a user-data file without exposing partially-written contents if
 /// NOVA or Windows is interrupted during the write. The temporary file is
 /// created in the destination directory so the final rename stays on-volume.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Target file has no parent directory."))?;
+    // Keep the destination directory chain open without DELETE sharing on
+    // Windows so a junction/ancestor cannot be swapped during the atomic write.
+    #[cfg(windows)]
+    let _parent_guard = crate::windows_process::hold_real_directory_chain(parent)?;
+    #[cfg(not(windows))]
+    ensure_real_directory_chain(parent)?;
     let file_name = path.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "Target file has no file name.")
     })?;
@@ -185,13 +227,11 @@ impl AppPaths {
     }
 
     pub fn load_settings(&self) -> io::Result<Settings> {
-        ensure_regular_file_not_reparse(&self.settings_file)?;
-        let mut settings = match fs::read_to_string(&self.settings_file) {
-            Ok(text) => serde_json::from_str::<Settings>(&text).map_err(|error| {
+        let mut settings = match read_regular_file_bounded(&self.settings_file, USER_CONFIG_MAX_BYTES)? {
+            Some(bytes) => serde_json::from_slice::<Settings>(&bytes).map_err(|error| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("Settings file is invalid: {error}"))
             })?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Settings::default(),
-            Err(error) => return Err(error),
+            None => Settings::default(),
         };
         // `system` is a first-class persisted preference. Older versions
         // accidentally normalized it back to dark on every restart.
@@ -214,26 +254,37 @@ impl AppPaths {
         Ok(self.read_wifi_manifest()?.profiles.contains(ssid))
     }
 
-    pub fn add_nova_wifi_profile(&self, ssid: &str) -> io::Result<()> {
+    pub fn add_nova_wifi_profile_named(&self, ssid: &str, profile_name: &str) -> io::Result<()> {
+        if ssid.is_empty() || profile_name.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "SSID and Windows profile name are required."));
+        }
         let mut manifest = self.read_wifi_manifest()?;
         manifest.profiles.insert(ssid.to_owned());
+        manifest.profile_names.insert(ssid.to_owned(), profile_name.to_owned());
         self.write_wifi_manifest(&manifest)
+    }
+
+    pub fn nova_wifi_profile_name(&self, ssid: &str) -> io::Result<Option<String>> {
+        let manifest = self.read_wifi_manifest()?;
+        if !manifest.profiles.contains(ssid) {
+            return Ok(None);
+        }
+        Ok(manifest.profile_names.get(ssid).cloned())
     }
 
     pub fn remove_nova_wifi_profile(&self, ssid: &str) -> io::Result<()> {
         let mut manifest = self.read_wifi_manifest()?;
         manifest.profiles.remove(ssid);
+        manifest.profile_names.remove(ssid);
         self.write_wifi_manifest(&manifest)
     }
 
     fn read_wifi_manifest(&self) -> io::Result<WifiManifest> {
-        ensure_regular_file_not_reparse(&self.wifi_manifest)?;
-        match fs::read_to_string(&self.wifi_manifest) {
-            Ok(text) => serde_json::from_str::<WifiManifest>(&text).map_err(|error| {
+        match read_regular_file_bounded(&self.wifi_manifest, USER_CONFIG_MAX_BYTES)? {
+            Some(bytes) => serde_json::from_slice::<WifiManifest>(&bytes).map_err(|error| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("Wi-Fi profile manifest is invalid: {error}"))
             }),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(WifiManifest::default()),
-            Err(error) => Err(error),
+            None => Ok(WifiManifest::default()),
         }
     }
 
@@ -362,6 +413,13 @@ pub(crate) fn remove_tree_without_following_reparse_points(path: &Path) -> io::R
     let mut pending = vec![path.to_path_buf()];
     let mut directories_postorder = Vec::new();
     while let Some(directory) = pending.pop() {
+        // Lock this directory without following a final reparse point before
+        // enumerating it. The handle prevents the directory itself from being
+        // replaced while its children are classified and removed.
+        #[cfg(windows)]
+        let _directory_guard = crate::windows_process::hold_real_directory_chain(&directory)?;
+        #[cfg(not(windows))]
+        ensure_real_directory_chain(&directory)?;
         let directory_metadata = fs::symlink_metadata(&directory)?;
         if is_link_or_reparse_point(&directory_metadata) {
             remove_link_or_reparse_point(&directory, &directory_metadata)?;
@@ -430,13 +488,66 @@ pub fn safe_user_path(root: &Path, relative: &str) -> io::Result<PathBuf> {
     Ok(root.join(clean))
 }
 
-/// Resolve an existing filesystem path and reject links/reparse points that
-/// resolve outside NOVA's user-data root. Both paths are canonicalized so
-/// Windows junctions and symlinks are checked against their final target.
+/// Resolve an existing path only after checking every lexical component.
+/// Canonicalization alone is insufficient: a junction may point to another
+/// directory *inside* the root and still violate NOVA's no-reparse policy.
 pub fn canonical_user_path(root: &Path, candidate: &Path) -> io::Result<PathBuf> {
     ensure_real_directory_chain(root)?;
     let canonical_root = root.canonicalize()?;
-    let canonical_candidate = candidate.canonicalize()?;
+    let relative = candidate.strip_prefix(root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Access outside NOVA user folder is blocked.",
+        )
+    })?;
+
+    let root_metadata = fs::symlink_metadata(&canonical_root)?;
+    if !root_metadata.is_dir() || is_link_or_reparse_point(&root_metadata) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "NOVA user folder is not a real directory.",
+        ));
+    }
+
+    let mut current = canonical_root.clone();
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            std::path::Component::Normal(part) => current.push(part),
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Path traversal is not allowed in NOVA Files.",
+                ));
+            }
+        }
+
+        let metadata = fs::symlink_metadata(&current)?;
+        if is_link_or_reparse_point(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("NOVA refuses redirected path components: {}", current.display()),
+            ));
+        }
+        let is_last = index + 1 == components.len();
+        if !is_last && !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("A path component is not a directory: {}", current.display()),
+            ));
+        }
+        if !metadata.is_dir() && !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Only regular files and directories are supported in NOVA Files.",
+            ));
+        }
+    }
+
+    let canonical_candidate = current.canonicalize()?;
     if !canonical_candidate.starts_with(&canonical_root) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -569,6 +680,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn canonical_user_path_rejects_nested_symlink_even_when_target_is_inside_root() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("nova-inner-link-test-{}", std::process::id()));
+        let root = base.join("root");
+        let real = root.join("real");
+        let link = root.join("linked");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("note.txt"), "inside").unwrap();
+        symlink(&real, &link).unwrap();
+        assert!(canonical_user_path(&root, &link.join("note.txt")).is_err());
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn safe_user_path_rejects_parent_traversal_and_absolute_paths() {
         let root = Path::new("C:/NOVA/Data/Users/Default");
@@ -679,6 +806,37 @@ mod tests {
         assert!(!nested.exists());
         assert_eq!(std::fs::read_to_string(outside.join("keep.txt")).unwrap(), "must survive");
 
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn wifi_manifest_round_trips_exact_profile_names_and_reads_legacy_entries() {
+        let base = std::env::temp_dir().join(format!("nova-wifi-manifest-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let settings = base.join("Settings");
+        std::fs::create_dir_all(&settings).unwrap();
+        let paths = super::AppPaths {
+            app_dir: base.clone(),
+            data_dir: base.clone(),
+            security_dir: base.join("Security"),
+            user_dir: base.join("Users/Default"),
+            settings_file: settings.join("settings.json"),
+            wifi_manifest: settings.join("wifi-profiles.json"),
+            trash_dir: base.join("Trash"),
+            portable: true,
+        };
+
+        paths.add_nova_wifi_profile_named("Home WiFi", "NOVA::Home WiFi::session-123").unwrap();
+        assert!(paths.is_nova_wifi_profile("Home WiFi").unwrap());
+        assert_eq!(paths.nova_wifi_profile_name("Home WiFi").unwrap().as_deref(), Some("NOVA::Home WiFi::session-123"));
+        paths.remove_nova_wifi_profile("Home WiFi").unwrap();
+        assert!(!paths.is_nova_wifi_profile("Home WiFi").unwrap());
+
+        // Older manifests have only `profiles`; the new optional map must not
+        // break deletion of the historical `NOVA::<SSID>` profile name.
+        std::fs::write(&paths.wifi_manifest, r#"{"profiles":["Legacy WiFi"]}"#).unwrap();
+        assert!(paths.is_nova_wifi_profile("Legacy WiFi").unwrap());
+        assert_eq!(paths.nova_wifi_profile_name("Legacy WiFi").unwrap(), None);
         let _ = std::fs::remove_dir_all(base);
     }
 

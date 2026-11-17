@@ -3,12 +3,15 @@ use crate::terminal::{TerminalState, TerminalTask};
 use crate::trash::{self, TrashEntry};
 use crate::apps;
 use crate::calculator::{self, AngleUnit, EvalContext};
-use crate::{file_ops, wifi, isolation, unikey, unicode, hardware::{self, HardwareTelemetry, HardwareSnapshot, HostControl}, security_tools::{self, SecurityTool}};
+use crate::{file_ops, wifi, isolation, unikey, unicode, hardware::{self, HardwareSnapshot, HostControl}, security_tools::{self, SecurityTool}};
 use eframe::egui::{self, Color32, FontId, RichText, TextEdit};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::process::Child;
@@ -30,6 +33,62 @@ enum PendingEditorAction {
 
 #[derive(Clone, Copy)]
 enum EditorDecision { Save, Discard, Cancel }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EditorFingerprint {
+    length: u64,
+    hash: u64,
+}
+
+fn editor_fingerprint(bytes: &[u8]) -> EditorFingerprint {
+    // Stable FNV-1a content fingerprint. This is a conflict detector, not a
+    // cryptographic integrity primitive; length is checked independently.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    EditorFingerprint { length: bytes.len() as u64, hash }
+}
+
+fn read_editor_file(path: &Path, max_bytes: u64) -> std::io::Result<(Vec<u8>, EditorFingerprint)> {
+    let parent = path.parent().filter(|value| !value.as_os_str().is_empty())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Editor file has no parent folder."))?;
+    let _parent_guard = file_ops::hold_directory_chain(parent)?;
+    let mut file = file_ops::open_regular_file_for_read(path)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Editor accepts regular files only."));
+    }
+    if before.len() > max_bytes {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Editor file exceeds the configured size limit."));
+    }
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    (&mut file).take(max_bytes.saturating_add(1)).read_to_end(&mut bytes)?;
+    let after = std::fs::metadata(path)?;
+    if bytes.len() as u64 > max_bytes || before.len() != after.len() || bytes.len() as u64 != after.len() {
+        return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "The file changed while the Editor was reading it. Reopen it and try again."));
+    }
+    let fingerprint = editor_fingerprint(&bytes);
+    Ok((bytes, fingerprint))
+}
+
+fn editor_file_fingerprint(path: &Path) -> std::io::Result<Option<EditorFingerprint>> {
+    match read_editor_file(path, 2 * 1024 * 1024) {
+        Ok((_, fingerprint)) => Ok(Some(fingerprint)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Editor save target is no longer a regular file."));
+            }
+            // An oversized replacement cannot match a document that the Editor
+            // originally loaded (which is always at most 2 MiB).
+            Ok(Some(EditorFingerprint { length: metadata.len(), hash: 0 }))
+        }
+        Err(error) => Err(error),
+    }
+}
 
 #[derive(Clone)]
 struct ProcessMetric {
@@ -65,11 +124,18 @@ struct CachedFileEntry {
 }
 
 enum FilesWorkerResult {
-    Operation { message: String, clear_clipboard: bool, retry_sources: Vec<PathBuf> },
-    Search {
-        query: String,
-        result: Result<file_ops::SearchResult, String>,
-    },
+    Operation { message: String, clear_clipboard: bool, retry_sources: Vec<PathBuf>, cancelled: bool, external_retry: bool },
+    Search { query: String, result: Result<file_ops::SearchResult, String> },
+    SearchCancelled { query: String },
+}
+
+struct FilesWorkerProgress {
+    phase: String,
+    current_item: String,
+    completed_items: usize,
+    total_items: usize,
+    detail_count: Arc<AtomicUsize>,
+    bytes_count: Arc<AtomicU64>,
 }
 
 enum NetworkWorkerResult {
@@ -378,6 +444,7 @@ pub struct NovaApp {
     trash_confirm_delete: bool,
     trash_entries: Vec<TrashEntry>,
     trash_selected: Option<String>,
+    last_trash_undo_ids: Vec<String>,
     files_selected: Option<PathBuf>,
     files_entries: Vec<CachedFileEntry>,
     files_cache_dir: Option<PathBuf>,
@@ -387,6 +454,8 @@ pub struct NovaApp {
     files_multi_selected: HashSet<PathBuf>,
     files_clipboard: Vec<PathBuf>,
     files_clipboard_cut: bool,
+    files_clipboard_fallback_only: bool,
+    files_external_retry_sources: Vec<PathBuf>,
     files_preview: Option<(PathBuf, String)>,
     files_rename_target: Option<PathBuf>,
     files_rename_input: String,
@@ -394,6 +463,8 @@ pub struct NovaApp {
     files_search_truncated: bool,
     files_worker_receiver: Option<Receiver<FilesWorkerResult>>,
     files_worker_busy: bool,
+    files_worker_cancel: Option<Arc<AtomicBool>>,
+    files_worker_progress: Option<Arc<Mutex<FilesWorkerProgress>>>,
     network_worker_receiver: Option<Receiver<NetworkWorkerResult>>,
     network_busy: bool,
     network_networks: Vec<String>,
@@ -430,6 +501,7 @@ pub struct NovaApp {
     editor_text: String,
     editor_saved_text: String,
     editor_saved_path: Option<PathBuf>,
+    editor_saved_fingerprint: Option<EditorFingerprint>,
     editor_dirty: bool,
     editor_pending_action: Option<PendingEditorAction>,
     editor_overwrite_pending: Option<PathBuf>,
@@ -469,7 +541,8 @@ pub struct NovaApp {
     calc_ratio_b: String,
     calc_ratio_c: String,
     monitor: Option<System>,
-    hardware: Option<HardwareTelemetry>,
+    hardware: Option<hardware::HardwareWorker>,
+    hardware_initializing: bool,
     hardware_snapshot: HardwareSnapshot,
     monitor_tab: usize,
     monitor_process_rows: Vec<ProcessMetric>,
@@ -511,6 +584,14 @@ fn replace_all_bounded(
         return Err(format!("the result would exceed the {max_bytes} byte limit"));
     }
     Ok((original.replace(needle, replacement), matches))
+}
+
+fn same_path_selection(left: &[PathBuf], right: &[PathBuf]) -> bool {
+    let mut left = top_level_selected_paths(left.to_vec());
+    let mut right = top_level_selected_paths(right.to_vec());
+    left.sort();
+    right.sort();
+    left == right
 }
 
 fn top_level_selected_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -585,6 +666,7 @@ impl NovaApp {
             trash_confirm_delete: false,
             trash_entries: Vec::new(),
             trash_selected: None,
+            last_trash_undo_ids: Vec::new(),
             files_selected: None,
             files_entries: Vec::new(),
             files_cache_dir: None,
@@ -594,6 +676,8 @@ impl NovaApp {
             files_multi_selected: HashSet::new(),
             files_clipboard: Vec::new(),
             files_clipboard_cut: false,
+            files_clipboard_fallback_only: false,
+            files_external_retry_sources: Vec::new(),
             files_preview: None,
             files_rename_target: None,
             files_rename_input: String::new(),
@@ -601,6 +685,8 @@ impl NovaApp {
             files_search_truncated: false,
             files_worker_receiver: None,
             files_worker_busy: false,
+            files_worker_cancel: None,
+            files_worker_progress: None,
             network_worker_receiver: None,
             network_busy: false,
             network_networks: Vec::new(),
@@ -636,6 +722,7 @@ impl NovaApp {
             editor_text: String::new(),
             editor_saved_text: String::new(),
             editor_saved_path: None,
+            editor_saved_fingerprint: None,
             editor_dirty: false,
             editor_pending_action: None,
             editor_overwrite_pending: None,
@@ -676,6 +763,7 @@ impl NovaApp {
             calc_ratio_c: "8".to_owned(),
             monitor: None,
             hardware: None,
+            hardware_initializing: false,
             hardware_snapshot: HardwareSnapshot::default(),
             monitor_tab: 0,
             monitor_process_rows: Vec::new(),
@@ -888,6 +976,7 @@ impl NovaApp {
             return;
         }
         let had_window = self.app_is_open(app) || self.minimized_apps.contains(app);
+        if app == "Files" { self.cancel_files_worker(); }
         self.set_app_window_open(app, false);
         self.minimized_apps.remove(app);
         self.window_restore_rects.remove(app);
@@ -1174,45 +1263,258 @@ impl NovaApp {
         self.files_preview = None;
     }
 
-    fn start_files_operation(&mut self, sources: Vec<PathBuf>, cut: bool) {
+    fn set_files_clipboard(&mut self, paths: Vec<PathBuf>, cut: bool) {
+        let paths = top_level_selected_paths(paths);
+        if paths.is_empty() { return; }
+        self.files_clipboard = paths.clone();
+        self.files_clipboard_cut = cut;
+        self.files_external_retry_sources.clear();
+        match crate::clipboard::set_files(&paths, cut) {
+            Ok(()) => {
+                self.files_clipboard_fallback_only = false;
+                self.status_message = if cut {
+                    "Cut selection to the Windows file clipboard. Paste inside NOVA or another Windows app.".to_owned()
+                } else {
+                    "Copied selection to the Windows file clipboard. Paste inside NOVA or another Windows app.".to_owned()
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                self.files_clipboard_fallback_only = true;
+                self.status_message = if cut { "Selection cut to the NOVA clipboard. Paste into a destination folder." }
+                    else { "Selection copied to the NOVA clipboard. Paste into a destination folder." }.to_owned();
+            }
+            Err(error) => {
+                self.files_clipboard_fallback_only = true;
+                self.status_message = format!("NOVA clipboard is ready, but Windows clipboard integration failed: {error}");
+            }
+        }
+    }
+
+    fn paste_files_from_clipboard(&mut self) {
+        if self.files_worker_busy { return; }
+        // If publishing to the OS clipboard failed, prefer the exact NOVA
+        // selection instead of accidentally pasting stale Windows clipboard data.
+        if self.files_clipboard_fallback_only && !self.files_clipboard.is_empty() {
+            self.start_files_operation(self.files_clipboard.clone(), self.files_clipboard_cut);
+            return;
+        }
+        let retry_external = self.files_external_retry_sources.clone();
+        match crate::clipboard::get_files() {
+            Ok(Some((paths, cut))) => {
+                let all_inside_workspace = paths.iter().all(|path| canonical_user_path(&self.paths.user_dir, path).is_ok());
+                if all_inside_workspace {
+                    self.files_external_retry_sources.clear();
+                    self.start_files_operation(paths, cut);
+                } else {
+                    // When the same OS clipboard selection is pasted again,
+                    // retry only failed items. If the selection changed, discard
+                    // the old retry queue and process the new external paths.
+                    let retry_matches_clipboard = !retry_external.is_empty()
+                        && same_path_selection(&retry_external, &paths);
+                    let sources = if retry_matches_clipboard { retry_external } else { paths };
+                    self.files_external_retry_sources.clear();
+                    self.files_clipboard.clear();
+                    self.files_clipboard_cut = false;
+                    self.files_clipboard_fallback_only = false;
+                    self.start_external_files_operation(sources);
+                }
+            }
+            Ok(None) => {
+                if !retry_external.is_empty() {
+                    self.files_external_retry_sources.clear();
+                    self.start_external_files_operation(retry_external);
+                } else if !self.files_clipboard.is_empty() {
+                    self.start_files_operation(self.files_clipboard.clone(), self.files_clipboard_cut);
+                } else {
+                    self.status_message = "The Windows clipboard does not contain files or folders.".to_owned();
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                if !self.files_clipboard.is_empty() {
+                    self.start_files_operation(self.files_clipboard.clone(), self.files_clipboard_cut);
+                } else {
+                    self.status_message = "No files are available in the NOVA clipboard.".to_owned();
+                }
+            }
+            Err(error) => {
+                if !retry_external.is_empty() {
+                    self.files_external_retry_sources.clear();
+                    self.status_message = format!("Could not read Windows clipboard; retrying {} previously failed external item(s): {error}", retry_external.len());
+                    self.start_external_files_operation(retry_external);
+                } else if !self.files_clipboard.is_empty() {
+                    self.status_message = format!("Could not read Windows clipboard; using NOVA's saved selection: {error}");
+                    self.start_files_operation(self.files_clipboard.clone(), self.files_clipboard_cut);
+                } else {
+                    self.status_message = format!("Could not read Windows clipboard: {error}");
+                }
+            }
+        }
+    }
+
+    fn start_external_files_operation(&mut self, sources: Vec<PathBuf>) {
+        let sources = top_level_selected_paths(sources);
         if self.files_worker_busy || sources.is_empty() { return; }
         let root = self.paths.user_dir.clone();
         let destination = self.files_dir.clone();
+        let total_items = sources.len();
         let (sender, receiver) = mpsc::channel();
-        let operation_name = if cut { "Move" } else { "Copy" };
-        let spawn = thread::Builder::new()
-            .name("nova-files-operation".to_owned())
-            .spawn(move || {
-                let mut completed = Vec::new();
-                let mut failures = Vec::new();
-                let mut retry_sources = Vec::new();
-                for source in sources {
-                    let result = if cut {
-                        file_ops::move_item(&root, &source, &destination)
-                    } else {
-                        file_ops::copy_item(&root, &source, &destination)
-                    };
-                    match result {
-                        Ok(path) => completed.push(path.file_name().and_then(|name| name.to_str()).unwrap_or("item").to_owned()),
-                        Err(error) => {
-                            failures.push(format!("{}: {error}", source.display()));
-                            retry_sources.push(source);
-                        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let progress = Arc::new(Mutex::new(FilesWorkerProgress {
+            phase: "Importing".to_owned(),
+            current_item: String::new(),
+            completed_items: 0,
+            total_items,
+            detail_count: Arc::new(AtomicUsize::new(0)),
+            bytes_count: Arc::new(AtomicU64::new(0)),
+        }));
+        let worker_progress = Arc::clone(&progress);
+        let spawn = thread::Builder::new().name("nova-files-clipboard-import".to_owned()).spawn(move || {
+            let mut imported = Vec::new();
+            let mut failures = Vec::new();
+            let mut retry_sources = Vec::new();
+            let mut cancelled = false;
+            let mut sources = sources.into_iter();
+            while let Some(source) = sources.next() {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    cancelled = true;
+                    retry_sources.push(source);
+                    retry_sources.extend(sources);
+                    break;
+                }
+                let label = source.file_name().and_then(|name| name.to_str()).unwrap_or("item").to_owned();
+                let (detail_counter, bytes_counter) = {
+                    let mut state = worker_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.current_item = label;
+                    state.detail_count.store(0, Ordering::Relaxed);
+                    state.bytes_count.store(0, Ordering::Relaxed);
+                    (Arc::clone(&state.detail_count), Arc::clone(&state.bytes_count))
+                };
+                match file_ops::copy_external_item_cancellable(&root, &source, &destination, &worker_cancel, &detail_counter, &bytes_counter) {
+                    Ok(path) => {
+                        imported.push(path.file_name().and_then(|name| name.to_str()).unwrap_or("item").to_owned());
+                        let mut state = worker_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.completed_items = state.completed_items.saturating_add(1);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        cancelled = true;
+                        retry_sources.push(source);
+                        retry_sources.extend(sources);
+                        break;
+                    }
+                    Err(error) => {
+                        failures.push(format!("{}: {error}", source.display()));
+                        retry_sources.push(source);
+                        let mut state = worker_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.completed_items = state.completed_items.saturating_add(1);
                     }
                 }
-                let mut message = format!("{operation_name} completed for {} item(s).", completed.len());
-                if !completed.is_empty() {
-                    message.push_str(&format!(" Created: {}.", completed.join(", ")));
-                }
-                if !failures.is_empty() {
-                    message.push_str(&format!(" {} item(s) failed: {}", failures.len(), failures.join("; ")));
-                }
-                let _ = sender.send(FilesWorkerResult::Operation { message, clear_clipboard: cut, retry_sources });
-            });
+            }
+            let mut message = format!("Imported {} item(s) from Windows clipboard as copies.", imported.len());
+            if !imported.is_empty() { message.push_str(&format!(" Created: {}.", imported.join(", "))); }
+            if !failures.is_empty() { message.push_str(&format!(" {} item(s) failed: {}", failures.len(), failures.join("; "))); }
+            if cancelled { message.push_str(" Import cancelled. Incomplete source items remain available for retry."); }
+            message.push_str(" External source files were left unchanged.");
+            {
+                let mut state = worker_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.phase = if cancelled { "Cancelled".to_owned() } else { "Completed".to_owned() };
+                state.current_item.clear();
+            }
+            let _ = sender.send(FilesWorkerResult::Operation { message, clear_clipboard: false, retry_sources, cancelled, external_retry: true });
+        });
         match spawn {
             Ok(_) => {
                 self.files_worker_receiver = Some(receiver);
                 self.files_worker_busy = true;
+                self.files_worker_cancel = Some(cancel);
+                self.files_worker_progress = Some(progress);
+                self.status_message = "Importing Windows clipboard files into NOVA as copies…".to_owned();
+            }
+            Err(error) => self.status_message = format!("Could not start clipboard import: {error}"),
+        }
+    }
+
+    fn start_files_operation(&mut self, sources: Vec<PathBuf>, cut: bool) {
+        if self.files_worker_busy || sources.is_empty() { return; }
+        let root = self.paths.user_dir.clone();
+        let destination = self.files_dir.clone();
+        let total_items = sources.len();
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let progress = Arc::new(Mutex::new(FilesWorkerProgress {
+            phase: if cut { "Moving".to_owned() } else { "Copying".to_owned() },
+            current_item: String::new(),
+            completed_items: 0,
+            total_items,
+            detail_count: Arc::new(AtomicUsize::new(0)),
+            bytes_count: Arc::new(AtomicU64::new(0)),
+        }));
+        let worker_progress = Arc::clone(&progress);
+        let operation_name = if cut { "Move" } else { "Copy" };
+        let spawn = thread::Builder::new().name("nova-files-operation".to_owned()).spawn(move || {
+            let mut completed = Vec::new();
+            let mut failures = Vec::new();
+            let mut retry_sources = Vec::new();
+            let mut cancelled = false;
+            let mut sources = sources.into_iter();
+            while let Some(source) = sources.next() {
+                if worker_cancel.load(Ordering::Relaxed) {
+                    cancelled = true;
+                    retry_sources.push(source);
+                    retry_sources.extend(sources);
+                    break;
+                }
+                let label = source.file_name().and_then(|name| name.to_str()).unwrap_or("item").to_owned();
+                let (detail_counter, bytes_counter) = {
+                    let mut state = worker_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.current_item = label;
+                    state.detail_count.store(0, Ordering::Relaxed);
+                    state.bytes_count.store(0, Ordering::Relaxed);
+                    (Arc::clone(&state.detail_count), Arc::clone(&state.bytes_count))
+                };
+                let result = if cut {
+                    file_ops::move_item(&root, &source, &destination)
+                } else {
+                    file_ops::copy_item_cancellable(&root, &source, &destination, &worker_cancel, &detail_counter, &bytes_counter)
+                };
+                match result {
+                    Ok(path) => {
+                        completed.push(path.file_name().and_then(|name| name.to_str()).unwrap_or("item").to_owned());
+                        let mut state = worker_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.completed_items = state.completed_items.saturating_add(1);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        cancelled = true;
+                        retry_sources.push(source);
+                        retry_sources.extend(sources);
+                        break;
+                    }
+                    Err(error) => {
+                        failures.push(format!("{}: {error}", source.display()));
+                        retry_sources.push(source);
+                        let mut state = worker_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.completed_items = state.completed_items.saturating_add(1);
+                    }
+                }
+            }
+            let mut message = format!("{operation_name} completed for {} item(s).", completed.len());
+            if !completed.is_empty() { message.push_str(&format!(" Created: {}.", completed.join(", "))); }
+            if !failures.is_empty() { message.push_str(&format!(" {} item(s) failed: {}", failures.len(), failures.join("; "))); }
+            if cancelled { message.push_str(" Operation cancelled. Incomplete items were kept for retry."); }
+            {
+                let mut state = worker_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.phase = if cancelled { "Cancelled".to_owned() } else { "Completed".to_owned() };
+                state.current_item.clear();
+            }
+            let _ = sender.send(FilesWorkerResult::Operation { message, clear_clipboard: cut, retry_sources, cancelled, external_retry: false });
+        });
+        match spawn {
+            Ok(_) => {
+                self.files_worker_receiver = Some(receiver);
+                self.files_worker_busy = true;
+                self.files_worker_cancel = Some(cancel);
+                self.files_worker_progress = Some(progress);
                 self.status_message = if cut { "Moving files in the background…" } else { "Copying files in the background…" }.to_owned();
             }
             Err(error) => self.status_message = format!("Could not start file operation: {error}"),
@@ -1222,28 +1524,57 @@ impl NovaApp {
     fn start_recursive_file_search(&mut self) {
         if self.files_worker_busy { return; }
         let query = self.files_search.trim().to_owned();
-        if query.is_empty() {
-            self.refresh_files();
-            return;
-        }
+        if query.is_empty() { self.refresh_files(); return; }
         let root = self.paths.user_dir.clone();
         let start = root.clone();
         let worker_query = query.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let detail_count = Arc::new(AtomicUsize::new(0));
+        let worker_detail_count = Arc::clone(&detail_count);
+        let progress = Arc::new(Mutex::new(FilesWorkerProgress {
+            phase: "Searching".to_owned(),
+            current_item: query.clone(),
+            completed_items: 0,
+            total_items: 0,
+            detail_count,
+            bytes_count: Arc::new(AtomicU64::new(0)),
+        }));
+        let worker_progress = Arc::clone(&progress);
         let (sender, receiver) = mpsc::channel();
         match thread::Builder::new().name("nova-files-search".to_owned()).spawn(move || {
-            let result = file_ops::search_user_files(&root, &start, &worker_query).map_err(|error| error.to_string());
-            let _ = sender.send(FilesWorkerResult::Search { query: worker_query, result });
+            let result = file_ops::search_user_files_with_control(&root, &start, &worker_query, &worker_cancel, &worker_detail_count);
+            match result {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    let _ = sender.send(FilesWorkerResult::SearchCancelled { query: worker_query });
+                }
+                other => {
+                    let _ = sender.send(FilesWorkerResult::Search { query: worker_query, result: other.map_err(|error| error.to_string()) });
+                }
+            }
+            let mut state = worker_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.phase = if worker_cancel.load(Ordering::Relaxed) { "Cancelled".to_owned() } else { "Completed".to_owned() };
         }) {
             Ok(_) => {
                 self.files_worker_receiver = Some(receiver);
                 self.files_worker_busy = true;
+                self.files_worker_cancel = Some(cancel);
+                self.files_worker_progress = Some(progress);
                 self.status_message = format!("Searching NOVA Files for '{query}'…");
             }
             Err(error) => self.status_message = format!("Could not start search: {error}"),
         }
     }
 
+    fn cancel_files_worker(&mut self) {
+        if let Some(cancel) = &self.files_worker_cancel {
+            cancel.store(true, Ordering::Relaxed);
+            self.status_message = "Cancelling File Manager task…".to_owned();
+        }
+    }
+
     fn poll_files_worker(&mut self, ctx: &egui::Context) {
+        let cancellation_requested = self.files_worker_cancel.as_ref().is_some_and(|token| token.load(Ordering::Relaxed));
         let received = match self.files_worker_receiver.as_ref() {
             Some(receiver) => match receiver.try_recv() {
                 Ok(result) => Some(Some(result)),
@@ -1253,22 +1584,53 @@ impl NovaApp {
             None => None,
         };
         match received {
-            Some(Some(FilesWorkerResult::Operation { message, clear_clipboard, retry_sources })) => {
+            Some(Some(FilesWorkerResult::Operation { message, clear_clipboard, retry_sources, cancelled, external_retry })) => {
                 self.files_worker_receiver = None;
                 self.files_worker_busy = false;
+                self.files_worker_cancel = None;
+                self.files_worker_progress = None;
                 self.status_message = message;
-                if clear_clipboard {
+                if external_retry {
+                    self.files_external_retry_sources = retry_sources;
+                    if !self.files_external_retry_sources.is_empty() {
+                        self.status_message.push_str(" Failed or incomplete external items are queued for retry with Paste.");
+                    }
+                } else if clear_clipboard {
                     self.files_clipboard = retry_sources;
                     self.files_clipboard_cut = !self.files_clipboard.is_empty();
+                    self.files_clipboard_fallback_only = !self.files_clipboard.is_empty();
                     if !self.files_clipboard.is_empty() {
-                        self.status_message.push_str(" Failed cut items remain in the clipboard for retry.");
+                        self.status_message.push_str(" Failed cut items remain in the NOVA clipboard for retry.");
                     }
+                } else if !retry_sources.is_empty() {
+                    self.files_clipboard = retry_sources;
+                    self.files_clipboard_cut = false;
+                    self.files_clipboard_fallback_only = true;
+                    self.status_message.push_str(" Failed or incomplete items remain in the NOVA clipboard for retry.");
+                } else {
+                    self.files_clipboard_fallback_only = false;
+                    if cancelled { self.files_clipboard_cut = false; }
                 }
                 self.refresh_files();
+            }
+            Some(Some(FilesWorkerResult::SearchCancelled { query })) => {
+                self.files_worker_receiver = None;
+                self.files_worker_busy = false;
+                self.files_worker_cancel = None;
+                self.files_worker_progress = None;
+                self.refresh_files();
+                self.status_message = format!("Search for '{query}' was cancelled.");
             }
             Some(Some(FilesWorkerResult::Search { query, result })) => {
                 self.files_worker_receiver = None;
                 self.files_worker_busy = false;
+                self.files_worker_cancel = None;
+                self.files_worker_progress = None;
+                if cancellation_requested {
+                    self.refresh_files();
+                    self.status_message = format!("Search for '{query}' was cancelled or closed before results were applied.");
+                    return;
+                }
                 match result {
                     Ok(result) => {
                         self.files_error = None;
@@ -1290,12 +1652,17 @@ impl NovaApp {
                             format!("Search for '{query}' returned {} item(s).", self.files_entries.len())
                         };
                     }
-                    Err(error) => self.status_message = format!("Search failed: {error}"),
+                    Err(error) => {
+                        self.refresh_files();
+                        self.status_message = format!("Search failed: {error}");
+                    }
                 }
             }
             Some(None) => {
                 self.files_worker_receiver = None;
                 self.files_worker_busy = false;
+                self.files_worker_cancel = None;
+                self.files_worker_progress = None;
                 self.status_message = "File worker stopped unexpectedly.".to_owned();
             }
             None if self.files_worker_busy => ctx.request_repaint_after(Duration::from_millis(100)),
@@ -1342,9 +1709,14 @@ impl NovaApp {
         let password = std::mem::take(&mut self.network_password);
         let password = if password.is_empty() { None } else { Some(password) };
         let paths = self.paths.clone();
+        // Keep the display value outside the worker closure; the worker owns its
+        // copy while the UI still needs the SSID for its immediate status text.
+        let worker_ssid = ssid.clone();
         let (sender, receiver) = mpsc::channel();
         match thread::Builder::new().name("nova-wifi-connect".to_owned()).spawn(move || {
-            let result = wifi::connect(&paths, &ssid, password.as_deref()).map_err(|error| error.to_string());
+            let result = wifi::connect(&paths, &worker_ssid, password.as_deref())
+                .and_then(|_| wifi::wait_for_connection(Some(&worker_ssid), Duration::from_secs(15)))
+                .map_err(|error| error.to_string());
             let _ = sender.send(NetworkWorkerResult::Connect(result));
         }) {
             Ok(_) => {
@@ -1360,7 +1732,9 @@ impl NovaApp {
         if self.network_busy { return; }
         let (sender, receiver) = mpsc::channel();
         match thread::Builder::new().name("nova-wifi-disconnect".to_owned()).spawn(move || {
-            let result = wifi::disconnect().map_err(|error| error.to_string());
+            let result = wifi::disconnect()
+                .and_then(|_| wifi::wait_for_connection(None, Duration::from_secs(8)))
+                .map_err(|error| error.to_string());
             let _ = sender.send(NetworkWorkerResult::Disconnect(result));
         }) {
             Ok(_) => {
@@ -1863,7 +2237,8 @@ impl NovaApp {
             .resizable(false)
             .default_width(540.0);
         if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        let shown = window.open(&mut self.unikey_open).show(ctx, |ui| {
+        let mut unikey_open = self.unikey_open;
+        let shown = window.open(&mut unikey_open).show(ctx, |ui| {
                 ui.heading("Vietnamese typing for NOVA and Windows");
                 ui.label("NOVA uses Unicode text fields and system-font fallback for installed glyphs. UniKey adds Vietnamese Telex/VNI input on the Windows host, including NOVA Editor and Terminal.");
                 ui.separator();
@@ -1893,11 +2268,12 @@ impl NovaApp {
                 ui.label("4. Keep UniKey running while typing. UniKey is a separate Windows-host process, not part of NOVA or Windows Sandbox. Closing NOVA stops the UniKey process that NOVA started when it can do so cleanly.");
                 ui.label(RichText::new("Official source: unikey.org · Publisher must be PHAM KIM LONG · NOVA verifies Authenticode before launch · No Windows service or startup task is installed.").small().weak());
             });
+        self.unikey_open = unikey_open;
         if let Some(shown) = shown {
             self.window_rects.insert("UniKey".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "UniKey"); }
         }
-        // Defer whole-self methods until egui releases the `.open(&mut self.unikey_open)` borrow.
+        // Defer whole-self methods until egui releases the window UI closure.
         if stop_requested { self.stop_unikey(); }
     }
 
@@ -2788,7 +3164,8 @@ impl NovaApp {
         } else {
             window = window.min_width(220.0);
         }
-        let shown = window.open(&mut self.terminal_open).show(ctx, |ui| {
+        let mut terminal_open = self.terminal_open;
+        let shown = window.open(&mut terminal_open).show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(self.terminal.prompt()).monospace().color(Color32::from_rgb(117, 203, 172)));
                     if self.terminal.wifi_mode.is_some() {
@@ -2833,6 +3210,7 @@ impl NovaApp {
                 });
                 ui.label(RichText::new("CMD runs on the Windows host with your account permissions. It is NOT isolated; never run unknown commands here.").small().weak());
             });
+        self.terminal_open = terminal_open;
         if let Some(shown) = shown {
             self.window_rects.insert("Terminal".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "Terminal"); }
@@ -2852,28 +3230,29 @@ impl NovaApp {
         self.poll_files_worker(ctx);
 
         // File shortcuts only run when a text field is not consuming keyboard input.
-        let (ctrl_a, ctrl_c, ctrl_x, ctrl_v, rename_key, delete_key, escape_key) = ctx.input(|input| (
+        let (ctrl_a, ctrl_c, ctrl_x, ctrl_v, ctrl_z, rename_key, delete_key, escape_key) = ctx.input(|input| (
             input.modifiers.ctrl && input.key_pressed(egui::Key::A),
             input.modifiers.ctrl && input.key_pressed(egui::Key::C),
             input.modifiers.ctrl && input.key_pressed(egui::Key::X),
             input.modifiers.ctrl && input.key_pressed(egui::Key::V),
+            input.modifiers.ctrl && input.key_pressed(egui::Key::Z),
             input.key_pressed(egui::Key::F2),
             input.key_pressed(egui::Key::Delete),
             input.key_pressed(egui::Key::Escape),
         ));
-        if self.files_open && !ctx.egui_wants_keyboard_input() {
-            if ctrl_a {
+        if self.files_open && self.active_workspace.as_deref() == Some("Files") && !ctx.egui_wants_keyboard_input() {
+            if ctrl_z && !self.files_worker_busy && !self.last_trash_undo_ids.is_empty() {
+                self.undo_last_trash();
+            } else if ctrl_a {
                 self.files_multi_selected = self.visible_file_paths().into_iter().collect();
                 self.files_selected = self.files_multi_selected.iter().next().cloned();
             } else if ctrl_c || ctrl_x {
                 let selected = self.selected_file_paths();
                 if !selected.is_empty() {
-                    self.files_clipboard = selected;
-                    self.files_clipboard_cut = ctrl_x;
-                    self.status_message = if ctrl_x { "Cut selection. Choose a destination folder and press Ctrl+V." } else { "Copied selection. Choose a destination folder and press Ctrl+V." }.to_owned();
+                    self.set_files_clipboard(selected, ctrl_x);
                 }
-            } else if ctrl_v && !self.files_clipboard.is_empty() && !self.files_worker_busy {
-                self.start_files_operation(self.files_clipboard.clone(), self.files_clipboard_cut);
+            } else if ctrl_v && !self.files_worker_busy {
+                self.paste_files_from_clipboard();
             } else if rename_key && self.selected_file_paths().len() == 1 {
                 let path = self.selected_file_paths()[0].clone();
                 self.files_rename_input = path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
@@ -2900,6 +3279,7 @@ impl NovaApp {
         let mut preview_action = false;
         let mut rename_action: Option<PathBuf> = None;
         let mut trash_action: Option<Vec<PathBuf>> = None;
+        let mut undo_trash_action = false;
         let mut sandbox_sample: Option<PathBuf> = None;
         let mut search_workspace = false;
         let mut clear_preview = false;
@@ -2920,16 +3300,19 @@ impl NovaApp {
         } else {
             window = window.min_width(300.0);
         }
-        let shown = window.open(&mut self.files_open).show(ctx, |ui| {
+        // Use a local open flag so the UI closure may call methods on `self`
+        // without overlapping a mutable borrow of `self.files_open`.
+        let mut files_open = self.files_open;
+        let shown = window.open(&mut files_open).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("↑  Up").clicked() {
+                if ui.add_enabled(!self.files_worker_busy, egui::Button::new("↑  Up")).clicked() {
                     if self.files_recursive_search_active {
                         clear_search = true;
                     } else if self.files_dir != self.paths.user_dir {
                         navigate_to = self.files_dir.parent().map(Path::to_path_buf);
                     }
                 }
-                if ui.button("↻  Refresh").clicked() { refresh = true; }
+                if ui.add_enabled(!self.files_worker_busy, egui::Button::new("↻  Refresh")).clicked() { refresh = true; }
                 ui.separator();
                 if self.files_recursive_search_active {
                     ui.label(RichText::new(format!("Search results  /  {}", self.files_search)).strong());
@@ -2939,7 +3322,17 @@ impl NovaApp {
                 }
                 if self.files_worker_busy {
                     ui.spinner();
-                    ui.label(RichText::new("Working…").small().weak());
+                    let state = self.files_worker_progress.as_ref().and_then(|shared| shared.lock().ok().map(|progress| {
+                        (progress.phase.clone(), progress.current_item.clone(), progress.completed_items, progress.total_items, progress.detail_count.load(Ordering::Relaxed), progress.bytes_count.load(Ordering::Relaxed))
+                    }));
+                    if let Some((phase, current, completed, total, detail_count, bytes_count)) = state {
+                        let label = if phase == "Searching" { format!("{phase} · {detail_count} entries") }
+                            else if phase == "Copying" { format!("{phase} {completed}/{total} · {} copied · {detail_count} entries", hardware::format_bytes(bytes_count)) }
+                            else { format!("{phase} {completed}/{total}") };
+                        ui.label(RichText::new(label).small().weak());
+                        if !current.is_empty() { ui.label(RichText::new(current).small().weak()); }
+                    } else { ui.label(RichText::new("Working…").small().weak()); }
+                    if ui.small_button("Cancel").clicked() { self.cancel_files_worker(); }
                 }
             });
             ui.separator();
@@ -2963,30 +3356,36 @@ impl NovaApp {
                 ui.selectable_value(&mut self.files_grid_view, false, "☷ List");
                 ui.selectable_value(&mut self.files_grid_view, true, "▦ Grid");
             });
-            if selected_count > 0 || !self.files_clipboard.is_empty() || !self.files_entries.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    if selected_count > 0 {
-                        ui.label(RichText::new(format!("{selected_count} selected")).strong());
-                        if ui.add_enabled(selected_count == 1, egui::Button::new("Open")).clicked() {
-                            let selected = &selected_paths[0];
-                            if selected.is_dir() { navigate_to = Some(selected.clone()); } else { open_file = Some(selected.clone()); }
-                        }
-                        if ui.add_enabled(selected_count == 1 && selected_paths[0].is_file(), egui::Button::new("Preview")).clicked() { preview_action = true; }
-                        if ui.add_enabled(!self.files_worker_busy, egui::Button::new("Copy")).clicked() { copy_cut_action = Some((selected_paths.clone(), false)); }
-                        if ui.add_enabled(!self.files_worker_busy, egui::Button::new("Cut")).clicked() { copy_cut_action = Some((selected_paths.clone(), true)); }
-                        if ui.add_enabled(selected_count == 1 && !self.files_worker_busy, egui::Button::new("Rename")).clicked() { rename_action = Some(selected_paths[0].clone()); }
-                        if ui.add_enabled(selected_count == 1 && selected_paths[0].is_file(), egui::Button::new("Inspect in Sandbox")).clicked() { sandbox_sample = Some(selected_paths[0].clone()); }
-                        if ui.add_enabled(!self.files_worker_busy, egui::Button::new("Move to Trash")).clicked() { trash_action = Some(selected_paths.clone()); }
-                        if ui.button("Clear selection").clicked() { clear_selection = true; }
+            ui.horizontal_wrapped(|ui| {
+                if selected_count > 0 {
+                    ui.label(RichText::new(format!("{selected_count} selected")).strong());
+                    if ui.add_enabled(selected_count == 1 && !self.files_worker_busy, egui::Button::new("Open")).clicked() {
+                        let selected = &selected_paths[0];
+                        if selected.is_dir() { navigate_to = Some(selected.clone()); } else { open_file = Some(selected.clone()); }
                     }
-                    if !self.files_clipboard.is_empty() {
-                        let label = if self.files_clipboard_cut { "Paste (Move)" } else { "Paste" };
-                        if ui.add_enabled(!self.files_worker_busy, egui::Button::new(label)).clicked() { paste_action = true; }
-                        ui.label(RichText::new(format!("{} item(s) in clipboard", self.files_clipboard.len())).small().weak());
-                    }
-                    if ui.button("Select all").clicked() { select_all = true; }
-                });
-            }
+                    if ui.add_enabled(selected_count == 1 && selected_paths[0].is_file() && !self.files_worker_busy, egui::Button::new("Preview")).clicked() { preview_action = true; }
+                    if ui.add_enabled(!self.files_worker_busy, egui::Button::new("Copy")).clicked() { copy_cut_action = Some((selected_paths.clone(), false)); }
+                    if ui.add_enabled(!self.files_worker_busy, egui::Button::new("Cut")).clicked() { copy_cut_action = Some((selected_paths.clone(), true)); }
+                    if ui.add_enabled(selected_count == 1 && !self.files_worker_busy, egui::Button::new("Rename")).clicked() { rename_action = Some(selected_paths[0].clone()); }
+                    if ui.add_enabled(selected_count == 1 && selected_paths[0].is_file() && !self.files_worker_busy, egui::Button::new("Inspect in Sandbox")).clicked() { sandbox_sample = Some(selected_paths[0].clone()); }
+                    if ui.add_enabled(!self.files_worker_busy, egui::Button::new("Move to Trash")).clicked() { trash_action = Some(selected_paths.clone()); }
+                    if ui.add_enabled(!self.files_worker_busy, egui::Button::new("Clear selection")).clicked() { clear_selection = true; }
+                }
+                // Always expose Paste: Windows Explorer may own the clipboard
+                // even when the current NOVA folder is empty.
+                if ui.add_enabled(!self.files_worker_busy, egui::Button::new("Paste")).clicked() { paste_action = true; }
+                if !self.files_clipboard.is_empty() {
+                    ui.label(RichText::new(format!("{} NOVA clipboard item(s)", self.files_clipboard.len())).small().weak());
+                }
+                if !self.files_external_retry_sources.is_empty() {
+                    ui.label(RichText::new(format!("{} external item(s) ready to retry", self.files_external_retry_sources.len())).small().weak());
+                }
+                if !self.last_trash_undo_ids.is_empty()
+                    && ui.add_enabled(!self.files_worker_busy, egui::Button::new("Undo last delete")).clicked() {
+                    undo_trash_action = true;
+                }
+                if ui.add_enabled(!self.files_worker_busy && !self.files_entries.is_empty(), egui::Button::new("Select all")).clicked() { select_all = true; }
+            });
             ui.separator();
             let filter = if self.files_recursive_search_active { String::new() } else { self.files_search.trim().to_lowercase() };
             let visible_entries: Vec<CachedFileEntry> = self.files_entries.iter()
@@ -2994,7 +3393,13 @@ impl NovaApp {
                 .cloned()
                 .collect();
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                if let Some(error) = &self.files_error {
+                if self.files_worker_busy {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(22.0);
+                        ui.spinner();
+                        ui.label("File Manager is working in the background. The current list is temporarily locked to avoid stale actions.");
+                    });
+                } else if let Some(error) = &self.files_error {
                     ui.colored_label(Color32::LIGHT_RED, error);
                 } else if visible_entries.is_empty() {
                     ui.add_space(18.0);
@@ -3109,8 +3514,11 @@ impl NovaApp {
                 });
             }
             ui.separator();
-            ui.label(RichText::new("Ctrl-click selects multiple items · Ctrl+C / Ctrl+X / Ctrl+V copy or move · F2 renames · Delete moves selection to NOVA Trash").small().weak());
+            ui.label(RichText::new("Ctrl-click selects multiple items · Ctrl+C / Ctrl+X / Ctrl+V use the Windows file clipboard · external items are copied into NOVA · F2 renames · Delete moves to NOVA Trash").small().weak());
         });
+        let was_files_open = self.files_open;
+        self.files_open = files_open;
+        if was_files_open && !files_open { self.cancel_files_worker(); }
         if let Some(shown) = shown {
             self.window_rects.insert("Files".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "Files"); }
@@ -3118,6 +3526,7 @@ impl NovaApp {
 
         if refresh { self.refresh_files(); }
         if clear_search {
+            self.cancel_files_worker();
             self.files_search.clear();
             self.files_recursive_search_active = false;
             self.files_search_truncated = false;
@@ -3158,13 +3567,9 @@ impl NovaApp {
             }
         }
         if let Some((paths, cut)) = copy_cut_action {
-            self.files_clipboard = top_level_selected_paths(paths);
-            self.files_clipboard_cut = cut;
-            self.status_message = if cut { "Selection cut. Paste it into a destination folder." } else { "Selection copied. Paste it into a destination folder." }.to_owned();
+            self.set_files_clipboard(paths, cut);
         }
-        if paste_action && !self.files_clipboard.is_empty() {
-            self.start_files_operation(self.files_clipboard.clone(), self.files_clipboard_cut);
-        }
+        if paste_action { self.paste_files_from_clipboard(); }
         if preview_action { self.preview_selected_file(); }
         if clear_preview { self.files_preview = None; }
         if let Some(path) = rename_action {
@@ -3173,6 +3578,9 @@ impl NovaApp {
         }
         if let Some(paths) = trash_action {
             self.trash_selected_files(top_level_selected_paths(paths));
+        }
+        if undo_trash_action {
+            self.undo_last_trash();
         }
         if let Some(path) = navigate_to {
             match canonical_user_path(&self.paths.user_dir, &path) {
@@ -3242,20 +3650,58 @@ impl NovaApp {
     fn trash_selected_files(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() { return; }
         let mut moved = 0usize;
+        let mut moved_ids = Vec::new();
         let mut failures = Vec::new();
         for path in paths {
             match trash::move_to_trash(&self.paths, &path) {
-                Ok(_entry) => moved += 1,
+                Ok(entry) => {
+                    moved += 1;
+                    moved_ids.push(entry.id);
+                }
                 Err(error) => failures.push(format!("{}: {error}", path.display())),
             }
         }
+        if !moved_ids.is_empty() {
+            self.last_trash_undo_ids = moved_ids;
+        }
         self.status_message = if failures.is_empty() {
-            format!("Moved {moved} item(s) to NOVA Trash.")
+            format!("Moved {moved} item(s) to NOVA Trash. Use Undo last delete to restore them.")
         } else {
             format!("Moved {moved} item(s) to Trash; {} failed: {}", failures.len(), failures.join("; "))
         };
         self.files_selected = None;
         self.files_multi_selected.clear();
+        self.refresh_files();
+        self.refresh_trash();
+    }
+
+    fn undo_last_trash(&mut self) {
+        let ids = std::mem::take(&mut self.last_trash_undo_ids);
+        if ids.is_empty() { return; }
+        let mut restored = 0usize;
+        let mut remaining = Vec::new();
+        let mut failures = Vec::new();
+        for id in ids.into_iter().rev() {
+            match trash::restore_from_trash(&self.paths, &id) {
+                Ok(path) => {
+                    restored += 1;
+                    self.files_selected = Some(path.clone());
+                    self.files_multi_selected.clear();
+                    self.files_multi_selected.insert(path);
+                }
+                Err(error) => {
+                    failures.push(error.to_string());
+                    remaining.push(id);
+                }
+            }
+        }
+        remaining.reverse();
+        self.last_trash_undo_ids = remaining;
+        self.status_message = if failures.is_empty() {
+            format!("Undo complete: restored {restored} item(s) to NOVA Files.")
+        } else {
+            format!("Restored {restored} item(s); {} could not be restored and remain in Trash: {}", failures.len(), failures.join("; "))
+        };
         self.refresh_files();
         self.refresh_trash();
     }
@@ -3300,6 +3746,7 @@ impl NovaApp {
                 self.editor_text.clear();
                 self.editor_saved_text.clear();
                 self.editor_saved_path = None;
+                self.editor_saved_fingerprint = None;
                 self.editor_overwrite_pending = None;
                 self.editor_dirty = false;
                 self.editor_status = new_path_status.unwrap_or_else(|| "New document — not saved".to_owned());
@@ -3343,11 +3790,14 @@ impl NovaApp {
         };
         match fs::metadata(&canonical_file) {
             Ok(meta) if meta.is_file() && meta.len() <= 2 * 1024 * 1024 => {
-                match fs::read(&canonical_file).and_then(|bytes| unicode::decode_text_file(&bytes)) {
-                    Ok(text) => {
+                match read_editor_file(&canonical_file, 2 * 1024 * 1024)
+                    .and_then(|(bytes, fingerprint)| unicode::decode_text_file(&bytes).map(|text| (text, fingerprint))
+                        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))) {
+                    Ok((text, fingerprint)) => {
                         self.editor_text = text;
                         self.editor_saved_text.clone_from(&self.editor_text);
                         self.editor_saved_path = Some(canonical_file.clone());
+                        self.editor_saved_fingerprint = Some(fingerprint);
                         self.editor_overwrite_pending = None;
                         self.editor_dirty = false;
                         let canonical_root = self.paths.user_dir.canonicalize().ok();
@@ -3391,6 +3841,13 @@ impl NovaApp {
             Err(error) => return Err(format!("Cannot inspect save target: {error}")),
         };
         let is_current_document = self.editor_saved_path.as_ref() == Some(&safe_target);
+        if is_current_document {
+            let current_fingerprint = editor_file_fingerprint(&safe_target)
+                .map_err(|error| format!("Could not verify the current document before saving: {error}"))?;
+            if current_fingerprint != self.editor_saved_fingerprint {
+                return Err("This file changed outside NOVA (or was removed) after it was opened. Your edits are still safe in the Editor. Reopen the file to load the external changes, or change the Location path to save your edits as a separate file.".to_owned());
+            }
+        }
         if target_exists && !is_current_document && !confirm_overwrite {
             self.editor_overwrite_pending = Some(safe_target);
             self.editor_status = "A file with this name already exists. Confirm overwrite to replace it.".to_owned();
@@ -3405,6 +3862,7 @@ impl NovaApp {
         atomic_write_user_file(&safe_target, self.editor_text.as_bytes())
             .map_err(|error| format!("Save failed: {error}"))?;
         self.editor_saved_text.clone_from(&self.editor_text);
+        self.editor_saved_fingerprint = Some(editor_fingerprint(self.editor_text.as_bytes()));
         self.editor_saved_path = Some(safe_target);
         self.editor_overwrite_pending = None;
         self.editor_dirty = false;
@@ -3625,7 +4083,8 @@ impl NovaApp {
         } else {
             window = window.min_width(220.0);
         }
-        let shown = window.open(&mut self.settings_open).show(ctx, |ui| {
+        let mut settings_open = self.settings_open;
+        let shown = window.open(&mut settings_open).show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.vertical(|ui| {
                         ui.heading("Settings");
@@ -3766,6 +4225,13 @@ impl NovaApp {
                             if self.network_busy { ui.spinner(); ui.label(RichText::new("Working…").small().weak()); }
                         });
                         ui.label(RichText::new(&self.network_status).small().weak());
+                        if self.network_status.starts_with("Location access is required")
+                            && ui.small_button("Open Location privacy settings").clicked()
+                        {
+                            if let Err(error) = hardware::open_location_privacy_settings() {
+                                self.network_status = format!("Could not open Windows Location settings: {error}");
+                            }
+                        }
                         ui.separator();
                         ui.label(RichText::new("Nearby networks").strong());
                         egui::ScrollArea::vertical().max_height(170.0).show(ui, |ui| {
@@ -3799,7 +4265,7 @@ impl NovaApp {
                             }
                             if ui.button("Network Discovery").clicked() { launch_app = Some("Network Discovery"); }
                         });
-                        ui.label(RichText::new("Wi-Fi scan/connect/disconnect run through Windows WLAN commands with your current account. Passwords are sent only to the worker performing the connection and are not written to NOVA settings or terminal history. Windows may retain the imported Wi-Fi profile under the current user. Signal strength and secured/open status are not inferred from SSID names.").small().weak());
+                        ui.label(RichText::new("Wi-Fi discovery and live connection status use the Windows WLAN API; profile import/connect/disconnect requests use Windows WLAN commands. NOVA checks the actual associated SSID and signal after a request instead of treating command acceptance as success. Passwords are sent only to the connection worker and are not written to NOVA settings or terminal history. Windows may retain the imported profile under the current user.").small().weak());
                     }
                     4 => {
                         ui.heading("Security & isolation");
@@ -3826,6 +4292,7 @@ impl NovaApp {
                 ui.separator();
                 ui.label(RichText::new("Settings are stored in the NOVA user data folder. NOVA does not install Windows services or startup tasks.").small().weak());
             });
+        self.settings_open = settings_open;
         if let Some(shown) = shown {
             self.window_rects.insert("Settings".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "Settings"); }
@@ -3859,7 +4326,8 @@ impl NovaApp {
             .fade_out(!self.settings.reduce_motion)
             .default_size([690.0, 450.0]);
         if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        let shown = window.open(&mut self.trash_open).show(ctx, |ui| {
+        let mut trash_open = self.trash_open;
+        let shown = window.open(&mut trash_open).show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!("{} item(s)", self.trash_entries.len()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3898,6 +4366,7 @@ impl NovaApp {
                 ui.separator();
                 ui.label(RichText::new("NOVA Trash is stored in the Data folder on this USB. Emptying Trash permanently deletes these items.").small().weak());
             });
+        self.trash_open = trash_open;
         if let Some(shown) = shown {
             self.window_rects.insert("Trash".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "Trash"); }
@@ -3906,7 +4375,11 @@ impl NovaApp {
         if refresh_requested { self.refresh_trash(); }
         if let Some(id) = restore_id {
             match trash::restore_from_trash(&self.paths, &id) {
-                Ok(path) => { self.status_message = format!("Restored to {}", path.display()); self.refresh_trash(); }
+                Ok(path) => {
+                    self.last_trash_undo_ids.retain(|entry_id| entry_id != &id);
+                    self.status_message = format!("Restored to {}", path.display());
+                    self.refresh_trash();
+                }
                 Err(error) => self.status_message = format!("Restore failed: {error}"),
             }
         }
@@ -3938,7 +4411,10 @@ impl NovaApp {
             self.trash_confirm_delete = confirm_open && !close_requested;
             if let Some(id) = confirmed_id {
                 match trash::delete_permanently(&self.paths, &id) {
-                    Ok(()) => self.status_message = "Item permanently deleted.".to_owned(),
+                    Ok(()) => {
+                        self.last_trash_undo_ids.retain(|entry_id| entry_id != &id);
+                        self.status_message = "Item permanently deleted.".to_owned();
+                    }
                     Err(error) => self.status_message = format!("Permanent delete failed: {error}"),
                 }
                 self.refresh_trash();
@@ -3965,7 +4441,10 @@ impl NovaApp {
             self.trash_confirm_empty = confirm_open && !close_requested;
             if empty_confirmed {
                 match trash::empty_trash(&self.paths) {
-                    Ok(count) => self.status_message = format!("Permanently deleted {count} item(s) from NOVA Trash."),
+                    Ok(count) => {
+                        self.last_trash_undo_ids.clear();
+                        self.status_message = format!("Permanently deleted {count} item(s) from NOVA Trash.");
+                    }
                     Err(error) => self.status_message = format!("Could not empty Trash: {error}"),
                 }
                 self.refresh_trash();
@@ -3992,7 +4471,8 @@ impl NovaApp {
         let mut clear_now = false;
         let mut inserted: Option<&'static str> = None;
         let mut inserted_dynamic: Option<String> = None;
-        let shown = window.open(&mut self.calculator_open).show(ctx, |ui| {
+        let mut calculator_open = self.calculator_open;
+        let shown = window.open(&mut calculator_open).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("CLASSWIZ-INSPIRED SCIENTIFIC WORKSPACE").small().strong().color(Color32::from_rgb(104, 167, 245)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4210,6 +4690,7 @@ impl NovaApp {
                 });
             }
         });
+        self.calculator_open = calculator_open;
         if let Some(shown) = shown {
             self.window_rects.insert("Calculator".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "Calculator"); }
@@ -4238,16 +4719,36 @@ impl NovaApp {
                 Err(error) => self.monitor_error = Some(format!("Hardware Center unavailable: {error:?}")),
             }
         }
-        if self.monitor_open && self.hardware.is_none() {
-            self.hardware = Some(HardwareTelemetry::new());
-        }
-        if self.monitor_open {
-            if let Some(hardware) = self.hardware.as_mut() {
-                if hardware.refresh() {
-                    self.hardware_snapshot = hardware.snapshot().clone();
+        if self.monitor_open && self.hardware.is_none() && self.monitor_error.is_none() {
+            match hardware::HardwareWorker::start() {
+                Ok(worker) => {
+                    self.hardware = Some(worker);
+                    self.hardware_initializing = true;
                 }
+                Err(error) => self.monitor_error = Some(format!("Hardware telemetry could not start: {error}")),
             }
         }
+        let hardware_update = self.hardware.as_ref().map(hardware::HardwareWorker::try_snapshot);
+        match hardware_update {
+            Some(Ok(Some(snapshot))) => {
+                self.hardware_snapshot = snapshot;
+                self.hardware_initializing = false;
+                self.monitor_error = None;
+            }
+            Some(Ok(None)) => {
+                if self.hardware_initializing { ctx.request_repaint_after(Duration::from_millis(100)); }
+            }
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.hardware = None;
+                self.hardware_initializing = false;
+                self.monitor_error = Some("Hardware telemetry worker stopped unexpectedly.".to_owned());
+            }
+            None => {}
+        }
+        if let Some(worker) = self.hardware.as_mut() {
+            worker.set_active(self.monitor_open);
+        }
+
 
         let metrics = if self.monitor_open {
             if let Some(monitor) = self.monitor.as_mut() {
@@ -4327,13 +4828,20 @@ impl NovaApp {
             .fade_out(!self.settings.reduce_motion)
             .default_size([760.0, 570.0]);
         if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        let shown = window.open(&mut self.monitor_open).show(ctx, |ui| {
+        let mut monitor_open = self.monitor_open;
+        let shown = window.open(&mut monitor_open).show(ctx, |ui| {
             let Some((cpu, used, total, swap_used, swap_total, process_count, process_rows, cpu_name, cpu_cores, cpu_sample_ready, process_cpu_ready)) = metrics.as_ref() else {
                 ui.colored_label(Color32::LIGHT_RED, monitor_error.as_deref().unwrap_or("System information is unavailable on this device."));
                 return;
             };
 
             let snapshot = &self.hardware_snapshot;
+            if let Some(error) = monitor_error.as_deref() {
+                ui.colored_label(Color32::LIGHT_RED, error);
+            }
+            if self.hardware_initializing {
+                ui.label(RichText::new("Discovering storage, network, GPU and sensor providers in the background…").small().weak());
+            }
             ui.horizontal_wrapped(|ui| {
                 let tabs = ["Overview", "Processes", "Storage", "Network", "GPU & Power", "Sensors & Controls"];
                 for (index, label) in tabs.iter().enumerate() {
@@ -4344,6 +4852,8 @@ impl NovaApp {
                 if ui.button("↻ Refresh").on_hover_text("Refresh hardware telemetry").clicked() {
                     if let Some(hardware) = self.hardware.as_mut() {
                         hardware.request_refresh();
+                    } else {
+                        self.monitor_error = None;
                     }
                     self.last_monitor_refresh = Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now);
                 }
@@ -4510,7 +5020,11 @@ impl NovaApp {
                     4 => {
                         ui.heading("Graphics adapters");
                         if snapshot.gpus.is_empty() {
-                            ui.label(if snapshot.gpu_provider_available { "No GPU adapters were reported." } else { "GPU telemetry provider is unavailable. Check the graphics driver and Windows support." });
+                            match snapshot.gpu_provider_state {
+                                hardware::HardwareProviderState::Unavailable => ui.label("GPU telemetry provider is unavailable. Check the graphics driver and Windows support."),
+                                hardware::HardwareProviderState::NoDevices => ui.label("The GPU provider responded, but Windows reported no GPU adapters."),
+                                hardware::HardwareProviderState::Available => ui.label("Windows reported GPU adapters, but their details are not present in this snapshot."),
+                            };
                         }
                         for gpu in &snapshot.gpus {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -4576,6 +5090,7 @@ impl NovaApp {
             ui.separator();
             ui.label(RichText::new("Telemetry is read from the Windows host. GPU and temperature availability depends on the installed driver/firmware; unsupported readings are shown as unavailable.").small().weak());
         });
+        self.monitor_open = monitor_open;
         if let Some(shown) = shown {
             self.window_rects.insert("Monitor".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "Monitor"); }
@@ -4760,7 +5275,6 @@ impl eframe::App for NovaApp {
         }
     }
 }
-
 
 #[cfg(windows)]
 fn local_clock_strings() -> (String, String) {
@@ -4956,6 +5470,7 @@ fn vector_calculate(a: &str, b: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use eframe::egui;
     use super::{compact_file_name, desktop_default_position, desktop_layout_changed, desktop_shortcut_travel, discard_unsaved_editor_text, format_number, move_pinned_app, next_untitled_file_name, normalize_desktop_positions, normalize_pinned_apps, start_menu_dimensions, taskbar_rail_widths, workspace_is_active, START_APPS, START_PINS};
     use crate::storage::Settings;
@@ -5066,6 +5581,17 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_retry_selection_ignores_duplicate_and_nested_paths() {
+        let root = PathBuf::from("C:/NOVA/Files");
+        let folder = root.join("Folder");
+        let nested = folder.join("child.txt");
+        let a = vec![folder.clone()];
+        let b = vec![nested, folder.clone(), folder];
+        assert!(super::same_path_selection(&a, &b));
+        assert!(!super::same_path_selection(&a, &[root.join("Other.txt")]));
+    }
+
+    #[test]
     fn compact_file_names_truncate_without_splitting_unicode_scalars() {
         assert_eq!(compact_file_name("report.txt", 20), "report.txt");
         assert_eq!(compact_file_name("Báo cáo học kỳ.docx", 9), "Báo cáo …");
@@ -5087,6 +5613,30 @@ mod tests {
         let mut current = "unsaved edits".to_owned();
         discard_unsaved_editor_text(&mut current, "last saved text");
         assert_eq!(current, "last saved text");
+    }
+
+
+    #[test]
+    fn editor_file_reader_detects_same_length_external_rewrites() {
+        let base = std::env::temp_dir().join(format!("nova-editor-external-edit-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("note.txt");
+        std::fs::write(&path, b"alpha").unwrap();
+        let (_, original) = super::read_editor_file(&path, 1024).unwrap();
+        std::fs::write(&path, b"bravo").unwrap();
+        let changed = super::editor_file_fingerprint(&path).unwrap().unwrap();
+        assert_eq!(original.length, changed.length);
+        assert_ne!(original, changed);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn editor_fingerprint_detects_same_length_external_edits() {
+        let first = super::editor_fingerprint(b"alpha");
+        let second = super::editor_fingerprint(b"bravo");
+        assert_eq!(first.length, second.length);
+        assert_ne!(first, second);
+        assert_eq!(first, super::editor_fingerprint(b"alpha"));
     }
 
     #[test]
@@ -5198,6 +5748,11 @@ mod tests {
 
 impl Drop for NovaApp {
     fn drop(&mut self) {
+        // Signal long-running File Manager workers to stop cooperatively before
+        // releasing their receiver and shared state.
+        if let Some(cancel) = &self.files_worker_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
         // UniKey is a host process that NOVA explicitly started; stop it when
         // NOVA closes so the portable workspace does not leave input hooks running.
         if self.unikey_process_kind == Some(UniKeyProcessKind::Running) {

@@ -10,6 +10,8 @@ use std::process::ExitStatus;
 #[cfg(windows)]
 use std::process::{Child, Command, Stdio};
 #[cfg(windows)]
+use std::fs::{File, OpenOptions};
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use std::thread::{self, JoinHandle};
@@ -39,6 +41,137 @@ unsafe extern "system" {
     fn Thread32Next(snapshot: *mut std::ffi::c_void, entry: *mut ThreadEntry32) -> i32;
     fn OpenThread(access: u32, inherit: i32, thread_id: u32) -> *mut std::ffi::c_void;
     fn ResumeThread(thread: *mut std::ffi::c_void) -> u32;
+}
+
+/// Holds every directory from the volume root through `directory` open while
+/// a path-based operation is in progress. The handles deny DELETE sharing, so
+/// an ancestor cannot be renamed/replaced between validation and file access.
+#[cfg(windows)]
+pub(crate) struct DirectoryChainGuard {
+    canonical_path: std::path::PathBuf,
+    _handles: Vec<File>,
+}
+
+#[cfg(windows)]
+pub(crate) fn hold_real_directory_chain(directory: &std::path::Path) -> io::Result<DirectoryChainGuard> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let canonical_path = directory.canonicalize()?;
+    let mut ancestors = directory.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
+    let mut handles = Vec::with_capacity(ancestors.len());
+
+    for component in ancestors {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let handle = options.open(component)?;
+        let metadata = handle.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & 0x0400 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("NOVA refuses a redirected or non-directory path component: {}", component.display()),
+            ));
+        }
+        handles.push(handle);
+    }
+    if directory.canonicalize()? != canonical_path {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Directory path changed while NOVA was securing its ancestors.",
+        ));
+    }
+    Ok(DirectoryChainGuard { canonical_path, _handles: handles })
+}
+
+/// Keeps a trusted executable and every parent directory open while NOVA
+/// verifies its publisher and creates the process. The file handle denies
+/// write/delete replacement and OPEN_REPARSE_POINT prevents following a
+/// redirected final component during validation.
+#[cfg(windows)]
+pub(crate) struct ExecutableLaunchGuard {
+    canonical_path: std::path::PathBuf,
+    _parent_guard: DirectoryChainGuard,
+    _file_handle: File,
+}
+
+#[cfg(windows)]
+impl ExecutableLaunchGuard {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.canonical_path
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn hold_verified_executable(path: &std::path::Path) -> io::Result<ExecutableLaunchGuard> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let canonical_path = path.canonicalize()?;
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Executable has no parent directory.")
+    })?;
+    let parent_guard = hold_real_directory_chain(parent)?;
+    if Some(parent_guard.canonical_path.as_path()) != canonical_path.parent()
+        || path.canonicalize()? != canonical_path
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Executable path changed while NOVA was securing its parent directories.",
+        ));
+    }
+
+    // Share read only. This denies concurrent writes and deletion/replacement
+    // of the executable until the spawned process has been created.
+    let mut file_options = OpenOptions::new();
+    file_options
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file_handle = file_options.open(path)?;
+    let metadata = file_handle.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & 0x0400 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Executable is not a regular file or is a reparse point.",
+        ));
+    }
+    if path.canonicalize()? != canonical_path {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Executable path changed while NOVA was opening it.",
+        ));
+    }
+
+    Ok(ExecutableLaunchGuard {
+        canonical_path,
+        _parent_guard: parent_guard,
+        _file_handle: file_handle,
+    })
+}
+
+#[cfg(not(windows))]
+pub(crate) struct ExecutableLaunchGuard {
+    canonical_path: std::path::PathBuf,
+}
+
+#[cfg(not(windows))]
+impl ExecutableLaunchGuard {
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.canonical_path
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn hold_verified_executable(_path: &std::path::Path) -> io::Result<ExecutableLaunchGuard> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "Verified executable launching is available only in the Windows build of NOVA."))
 }
 
 pub const MAX_CAPTURE_BYTES_PER_STREAM: usize = 1024 * 1024;
