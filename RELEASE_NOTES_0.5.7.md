@@ -179,3 +179,11 @@
 - Trusted main-branch releases now fail closed unless NOVA.exe has a valid Authenticode signature and signing secrets are configured.
 - Documented x64-only support, Cargo.lock policy, and repeatable performance sampling.
 - ARM64 and fixed performance thresholds remain deferred pending native hardware validation.
+
+
+## Windows path normalization regression fix
+
+- Updated `canonical_user_path` to validate the caller-visible directory chain and final object for reparse points before resolving both root and candidate independently. This accepts equivalent DOS and extended-length Windows path spellings without relying on `strip_prefix` across mixed path forms.
+- Retained canonical containment enforcement and repeated resolved-component checks; external paths, parent traversal, symlinks, junctions and other reparse points remain rejected.
+- Added regression coverage for mixed canonical/lexical root and candidate paths, and made an already-cancelled file search return `Interrupted` before path traversal.
+- This addresses the Windows CI failures in File Manager and Trash that surfaced as `PermissionDenied: Access outside NOVA user folder is blocked.` Actual Windows test results are still required to confirm the fix.

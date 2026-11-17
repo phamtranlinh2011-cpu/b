@@ -632,6 +632,9 @@ pub fn search_user_files_with_control(
     cancel: &AtomicBool,
     progress: &AtomicUsize,
 ) -> io::Result<SearchResult> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "File search was cancelled."));
+    }
     let canonical_root = root.canonicalize()?;
     let canonical_start = canonical_user_path(root, start)?;
     if !canonical_start.is_dir() {
