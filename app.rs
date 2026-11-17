@@ -4735,7 +4735,7 @@ impl NovaApp {
                 self.hardware_initializing = false;
                 self.monitor_error = None;
             }
-            Some(Ok(None)) | Some(Err(TryRecvError::Empty)) => {
+            Some(Ok(None)) => {
                 // No telemetry update is ready yet. Keep the last snapshot and
                 // retry shortly only while the initial sample is still pending.
                 if self.hardware_initializing { ctx.request_repaint_after(Duration::from_millis(100)); }
@@ -4744,6 +4744,14 @@ impl NovaApp {
                 self.hardware = None;
                 self.hardware_initializing = false;
                 self.monitor_error = Some("Hardware telemetry worker stopped unexpectedly.".to_owned());
+            }
+            Some(Err(_)) => {
+                // Preserve the last known hardware snapshot for any other
+                // non-fatal receive state. The explicit Disconnected arm above
+                // remains responsible for stopping a dead worker.
+                if self.hardware_initializing {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
             }
             None => {}
         }

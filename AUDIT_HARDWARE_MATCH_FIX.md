@@ -1,31 +1,29 @@
-# NOVA Native v0.5.7 — Hardware match exhaustiveness fix
+# NOVA v0.5.7 – Hardware receive match exhaustiveness follow-up
 
-## Issue
+## Reported CI failure
 
-The Windows CI compile reported `E0004` in `src/app.rs` at the `match hardware_update` expression in `monitor_window`. The expression has type:
+Windows CI reported E0004 at `match hardware_update` in `src/app.rs`: the compiler still considered `Some(Err(std::sync::mpmc::TryRecvError::Empty))` uncovered, despite the prior explicit `TryRecvError::Empty` arm.
 
-`Option<Result<Option<HardwareSnapshot>, TryRecvError>>`
+## Corrective change
 
-The match handled `Some(Ok(Some(_)))`, `Some(Ok(None))`, `Some(Err(TryRecvError::Disconnected))`, and `None`, but omitted `Some(Err(TryRecvError::Empty))`.
+The match now keeps the explicit `Some(Err(TryRecvError::Disconnected))` arm for a stopped worker, then adds `Some(Err(_))` as a conservative fallback for every other receive error. The fallback preserves the last known hardware snapshot and requests another repaint only during first-sample initialization. It does not terminate the worker or falsely report a hardware failure.
 
-## Change
+This catch-all is intentionally used instead of naming `Empty` again. It makes the outer `Option<Result<...>>` match exhaustive even if the standard-library error enum is non-exhaustive or its implementation changes. `Some(Ok(None))` continues to represent the normal no-new-snapshot state.
 
-The `Some(Ok(None))` and `Some(Err(TryRecvError::Empty))` cases now share one arm. Both mean there is no new telemetry snapshot available; the current snapshot is retained, and a short repaint is requested only while the first hardware sample is still initializing. `Disconnected` continues to be treated as an unexpected worker stop.
+## Retained changes
 
-The CI source-invariant script now verifies that the hardware match includes this case. Existing Wi-Fi SSID ownership and File Manager local-open-flag fixes from the Library-CI-Guarded source are retained.
+- Wi-Fi worker owns `worker_ssid = ssid.clone()` while the original `ssid` remains available for UI status.
+- File Manager opens the egui window with a local `files_open` flag and copies the resulting value back to `self.files_open` after `.show(...)`.
+- CI still reports the checked-out commit and the SHA-256 of `src/app.rs` before compilation.
 
-## Checks performed
+## Static checks performed
 
-- Confirmed the hardware match now covers all variants of the outer `Option`, inner `Result`, and nested `Option`.
-- Confirmed the existing Wi-Fi `worker_ssid` clone remains present.
-- Confirmed the File Manager continues to use a local `files_open` flag.
-- Confirmed the CI invariant script includes the new hardware-match check.
-- Validated `Cargo.toml` parsing and ZIP integrity.
+- Verified the Hardware Center match has an explicit `Disconnected` arm and a following `Some(Err(_))` fallback.
+- Verified the Wi-Fi cloned-SSID invariant remains present.
+- Verified the File Manager local-open-flag invariant remains present.
+- Verified the PowerShell invariant script requires the catch-all receive-error arm.
+- Parsed the ZIP central directory and tested all compressed entries for integrity.
 
 ## Not performed
 
-This environment does not have the Rust toolchain or Windows runtime available. `cargo fmt`, `cargo check`, `cargo test`, Clippy, and the Windows GitHub Actions workflow have not been run. This package therefore contains a source-level fix, not a verified successful Windows build.
-
-## Version note
-
-The Cargo package version remains `0.5.7`, matching the source project. No version bump was made as part of this targeted compile fix.
+The current environment does not provide the Rust toolchain or Windows runtime. `cargo fmt`, `cargo check`, `cargo test`, Clippy, Windows linking, PowerShell parser validation, and the packaged startup smoke test have not been executed. This package is not being represented as a confirmed successful Windows build.
