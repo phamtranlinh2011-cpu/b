@@ -4735,7 +4735,9 @@ impl NovaApp {
                 self.hardware_initializing = false;
                 self.monitor_error = None;
             }
-            Some(Ok(None)) => {
+            Some(Ok(None)) | Some(Err(TryRecvError::Empty)) => {
+                // No telemetry update is ready yet. Keep the last snapshot and
+                // retry shortly only while the initial sample is still pending.
                 if self.hardware_initializing { ctx.request_repaint_after(Duration::from_millis(100)); }
             }
             Some(Err(TryRecvError::Disconnected)) => {
