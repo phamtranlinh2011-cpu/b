@@ -1,0 +1,8 @@
+/target/
+/release/
+/dist/
+*.zip
+*.sha256
+
+# Local runtime measurements
+/perf-results/
