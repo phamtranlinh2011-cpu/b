@@ -184,7 +184,11 @@ pub fn move_to_trash(paths: &AppPaths, source: &Path) -> io::Result<TrashEntry> 
     if !source_meta.is_file() && !source_meta.is_dir() {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "Only regular files and directories can be moved to NOVA Trash."));
     }
-    let canonical_source = canonical_user_path(&canonical_root, source)?;
+    // Validate the caller's path against the root in the same lexical form.
+    // On Windows canonicalize() may add the \\?\ prefix; comparing an
+    // unprefixed caller path to a prefixed canonical root falsely rejects a
+    // valid in-root path as outside the workspace.
+    let canonical_source = canonical_user_path(&paths.user_dir, source)?;
     if canonical_source == canonical_root {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "The NOVA workspace root cannot be moved to Trash."));
     }
