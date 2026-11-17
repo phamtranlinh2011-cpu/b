@@ -2237,7 +2237,8 @@ impl NovaApp {
             .resizable(false)
             .default_width(540.0);
         if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        let shown = window.open(&mut self.unikey_open).show(ctx, |ui| {
+        let mut unikey_open = self.unikey_open;
+        let shown = window.open(&mut unikey_open).show(ctx, |ui| {
                 ui.heading("Vietnamese typing for NOVA and Windows");
                 ui.label("NOVA uses Unicode text fields and system-font fallback for installed glyphs. UniKey adds Vietnamese Telex/VNI input on the Windows host, including NOVA Editor and Terminal.");
                 ui.separator();
@@ -2267,11 +2268,12 @@ impl NovaApp {
                 ui.label("4. Keep UniKey running while typing. UniKey is a separate Windows-host process, not part of NOVA or Windows Sandbox. Closing NOVA stops the UniKey process that NOVA started when it can do so cleanly.");
                 ui.label(RichText::new("Official source: unikey.org · Publisher must be PHAM KIM LONG · NOVA verifies Authenticode before launch · No Windows service or startup task is installed.").small().weak());
             });
+        self.unikey_open = unikey_open;
         if let Some(shown) = shown {
             self.window_rects.insert("UniKey".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "UniKey"); }
         }
-        // Defer whole-self methods until egui releases the `.open(&mut self.unikey_open)` borrow.
+        // Defer whole-self methods until egui releases the window UI closure.
         if stop_requested { self.stop_unikey(); }
     }
 
@@ -3162,7 +3164,8 @@ impl NovaApp {
         } else {
             window = window.min_width(220.0);
         }
-        let shown = window.open(&mut self.terminal_open).show(ctx, |ui| {
+        let mut terminal_open = self.terminal_open;
+        let shown = window.open(&mut terminal_open).show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(self.terminal.prompt()).monospace().color(Color32::from_rgb(117, 203, 172)));
                     if self.terminal.wifi_mode.is_some() {
@@ -3207,6 +3210,7 @@ impl NovaApp {
                 });
                 ui.label(RichText::new("CMD runs on the Windows host with your account permissions. It is NOT isolated; never run unknown commands here.").small().weak());
             });
+        self.terminal_open = terminal_open;
         if let Some(shown) = shown {
             self.window_rects.insert("Terminal".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "Terminal"); }
@@ -4079,7 +4083,8 @@ impl NovaApp {
         } else {
             window = window.min_width(220.0);
         }
-        let shown = window.open(&mut self.settings_open).show(ctx, |ui| {
+        let mut settings_open = self.settings_open;
+        let shown = window.open(&mut settings_open).show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.vertical(|ui| {
                         ui.heading("Settings");
@@ -4287,6 +4292,7 @@ impl NovaApp {
                 ui.separator();
                 ui.label(RichText::new("Settings are stored in the NOVA user data folder. NOVA does not install Windows services or startup tasks.").small().weak());
             });
+        self.settings_open = settings_open;
         if let Some(shown) = shown {
             self.window_rects.insert("Settings".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "Settings"); }
@@ -4320,7 +4326,8 @@ impl NovaApp {
             .fade_out(!self.settings.reduce_motion)
             .default_size([690.0, 450.0]);
         if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        let shown = window.open(&mut self.trash_open).show(ctx, |ui| {
+        let mut trash_open = self.trash_open;
+        let shown = window.open(&mut trash_open).show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!("{} item(s)", self.trash_entries.len()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4359,6 +4366,7 @@ impl NovaApp {
                 ui.separator();
                 ui.label(RichText::new("NOVA Trash is stored in the Data folder on this USB. Emptying Trash permanently deletes these items.").small().weak());
             });
+        self.trash_open = trash_open;
         if let Some(shown) = shown {
             self.window_rects.insert("Trash".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "Trash"); }
@@ -4463,7 +4471,8 @@ impl NovaApp {
         let mut clear_now = false;
         let mut inserted: Option<&'static str> = None;
         let mut inserted_dynamic: Option<String> = None;
-        let shown = window.open(&mut self.calculator_open).show(ctx, |ui| {
+        let mut calculator_open = self.calculator_open;
+        let shown = window.open(&mut calculator_open).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("CLASSWIZ-INSPIRED SCIENTIFIC WORKSPACE").small().strong().color(Color32::from_rgb(104, 167, 245)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4681,6 +4690,7 @@ impl NovaApp {
                 });
             }
         });
+        self.calculator_open = calculator_open;
         if let Some(shown) = shown {
             self.window_rects.insert("Calculator".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "Calculator"); }
@@ -4818,7 +4828,8 @@ impl NovaApp {
             .fade_out(!self.settings.reduce_motion)
             .default_size([760.0, 570.0]);
         if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        let shown = window.open(&mut self.monitor_open).show(ctx, |ui| {
+        let mut monitor_open = self.monitor_open;
+        let shown = window.open(&mut monitor_open).show(ctx, |ui| {
             let Some((cpu, used, total, swap_used, swap_total, process_count, process_rows, cpu_name, cpu_cores, cpu_sample_ready, process_cpu_ready)) = metrics.as_ref() else {
                 ui.colored_label(Color32::LIGHT_RED, monitor_error.as_deref().unwrap_or("System information is unavailable on this device."));
                 return;
@@ -5079,6 +5090,7 @@ impl NovaApp {
             ui.separator();
             ui.label(RichText::new("Telemetry is read from the Windows host. GPU and temperature availability depends on the installed driver/firmware; unsupported readings are shown as unavailable.").small().weak());
         });
+        self.monitor_open = monitor_open;
         if let Some(shown) = shown {
             self.window_rects.insert("Monitor".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "Monitor"); }

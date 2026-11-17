@@ -97,24 +97,27 @@ Script ghi một mẫu mỗi giây vào CSV: CPU đã chuẩn hóa theo tổng s
 
 Mở **Monitor** từ Start hoặc phím `Ctrl + Shift + Esc` để vào NOVA Hardware Center. Các trang gồm Overview, Processes, Storage, Network, GPU & Power và Sensors & Controls. CPU tổng và từng logical processor/RAM được cập nhật khoảng mỗi giây; mức CPU chờ mẫu đối chiếu thứ hai trước khi hiển thị như số liệu hợp lệ; tần số CPU và danh sách tiến trình khoảng 5 giây; ổ đĩa khoảng 5 giây; lưu lượng mạng lấy mẫu theo từng giây sau hai mẫu ban đầu để không ước tính sai tốc độ ngay khi mở bảng. Trang Overview có thêm mức dùng swap/page file. GPU/VRAM chỉ hiển thị khi Windows và driver cung cấp bộ đếm tương ứng; VRAM chuyên dụng không bao gồm bộ nhớ GPU chia sẻ với RAM hệ thống. Pin/nguồn AC lấy từ Windows và phân biệt được trạng thái pin không có với trạng thái Windows không xác định; các nút Display, Sound, Network, Bluetooth và Power mở trang điều khiển của Windows. Nhiệt độ có thể không xuất hiện nếu firmware/driver không công bố cảm biến cho ứng dụng.
 
+Các provider ổ đĩa, mạng, GPU và cảm biến được khởi tạo/cập nhật ở worker nền để tránh chặn giao diện; khi đóng Hardware Center, worker tạm dừng lấy mẫu. NOVA phân biệt trường hợp provider GPU không khả dụng với trường hợp provider hoạt động nhưng không báo adapter nào.
+
 Đợt này bật tính năng GPU của `sysinfo`, vì vậy cần cập nhật lockfile trên máy có Rust 1.95 trước khi chạy CI: `./scripts/prepare-lockfile.ps1 -Update`, xem lại thay đổi rồi commit `Cargo.lock`.
 
 ## File Manager nâng cao (Đợt 4)
 
-- Mở **Files** để duyệt thư mục trong vùng dữ liệu NOVA. Có thể chọn nhiều mục bằng **Ctrl-click** hoặc **Ctrl+A**; nhấn **Ctrl+C** để copy, **Ctrl+X** để cut và **Ctrl+V** để paste vào thư mục hiện tại. Clipboard này chỉ dùng bên trong NOVA Files, không phải clipboard của Windows.
-- Nhấn **F2** để đổi tên mục đang chọn; nhấn **Delete** để chuyển các mục đã chọn vào NOVA Trash. Thao tác Rename không ghi đè tên đã tồn tại.
+- Mở **Files** để duyệt thư mục trong vùng dữ liệu NOVA. Có thể chọn nhiều mục bằng **Ctrl-click** hoặc **Ctrl+A**; nhấn **Ctrl+C** để copy, **Ctrl+X** để cut và **Ctrl+V** để paste. Clipboard file dùng định dạng Windows `CF_HDROP`, nên có thể trao đổi đường dẫn file với File Explorer và ứng dụng Windows khác. Khi paste file từ bên ngoài vào NOVA, NOVA luôn tạo bản sao; file nguồn bên ngoài không bị xóa ngay cả khi clipboard báo thao tác Move.
+- Nhấn **F2** để đổi tên mục đang chọn; nhấn **Delete** để chuyển các mục đã chọn vào NOVA Trash. Dùng nút **Undo last delete** hoặc **Ctrl+Z** trong Files để khôi phục lô xóa gần nhất. Undo chỉ giữ một lô mới nhất trong phiên NOVA hiện tại; sau khi thoát ứng dụng, bạn vẫn có thể khôi phục từng mục riêng trong ứng dụng Trash. Thao tác Rename không ghi đè tên đã tồn tại.
 - Ô tìm kiếm có thể lọc thư mục hiện tại; **Search workspace** tìm đệ quy trong vùng làm việc NOVA. Kết quả giới hạn tối đa 2.000 mục/50.000 mục đã duyệt để tránh quét không giới hạn.
-- Chọn một file rồi **Preview** để xem nhanh văn bản UTF-8/UTF-16 tối đa 256 KiB; file lớn hơn hoặc không giải mã được nên mở trong Editor. Copy thư mục chạy nền, dùng thư mục staging và từ chối link/junction/reparse point.
+- Chọn một file rồi **Preview** để xem nhanh văn bản UTF-8/UTF-16 tối đa 256 KiB; file lớn hơn hoặc không giải mã được nên mở trong Editor. Copy thư mục chạy nền, dùng thư mục staging và từ chối link/junction/reparse point. Khi Copy hoặc Search đang chạy, thanh trạng thái hiển thị tiến độ; bấm **Cancel** để yêu cầu dừng. Copy kiểm tra yêu cầu dừng trong lúc đọc file và xóa phần staging chưa hoàn tất. Với thao tác Move nhiều mục, yêu cầu dừng được xử lý giữa các mục.
 
 ## Wi-Fi bằng giao diện đồ họa (Đợt 4)
 
-- Vào **Settings → Network**, chọn **Scan Wi-Fi**, chọn SSID, nhập mật khẩu nếu mạng yêu cầu rồi chọn **Connect**. Có thể bấm **Disconnect** để ngắt kết nối hiện tại.
-- NOVA dùng Windows WLAN commands với quyền tài khoản Windows hiện tại. Mật khẩu chỉ được chuyển cho worker kết nối, không lưu vào Settings hay lịch sử Terminal. Windows có thể lưu profile Wi-Fi đã import dưới tài khoản hiện tại.
+- Vào **Settings → Network**, chọn **Scan Wi-Fi**, chọn SSID, nhập mật khẩu nếu mạng yêu cầu rồi chọn **Connect**. Có thể bấm **Disconnect** để ngắt kết nối hiện tại. Sau yêu cầu kết nối, NOVA truy vấn trạng thái liên kết hiện tại và chỉ báo đã kết nối khi WLAN API xác nhận đúng SSID; nếu hết thời gian chờ thì trạng thái sẽ ghi rõ chưa xác nhận được.
+- NOVA dùng Windows WLAN API để quét danh sách SSID (không phụ thuộc ngôn ngữ hiển thị của Windows), còn import profile/kết nối/ngắt kết nối vẫn dùng công cụ WLAN của Windows. Mật khẩu chỉ được chuyển cho worker kết nối, không lưu vào Settings hay lịch sử Terminal. Windows có thể lưu profile Wi-Fi đã import dưới tài khoản hiện tại.
+- Trên các phiên bản Windows yêu cầu quyền vị trí chính xác để quét Wi-Fi, API WLAN có thể trả về lỗi Access Denied cho đến khi quyền được bật. Nếu bị từ chối, NOVA sẽ hiện nút **Open Location privacy settings**. Hãy bật Location services và quyền cho ứng dụng desktop truy cập vị trí trong **Settings → Privacy & security → Location**, rồi quét lại.
 - Kết quả quét hiện tên SSID; không suy đoán cường độ sóng hoặc loại bảo mật từ tên mạng. Mạng doanh nghiệp 802.1X, captive portal và cấu hình chứng thực nâng cao chưa được quản lý trong trang này.
 
 ## Editor và Calculator (Đợt 4)
 
-- Trong Editor, nhấn **Ctrl+F** để mở Find/Replace. Nhập nội dung cần tìm và nội dung thay thế rồi chọn **Replace all**. Tìm kiếm phân biệt hoa/thường; ứng dụng kiểm tra kích thước kết quả trước khi cấp phát và vẫn giữ giới hạn tài liệu 2 MiB. Hãy kiểm tra thay đổi và nhấn Save để ghi.
+- Trong Editor, nhấn **Ctrl+F** để mở Find/Replace. Nhập nội dung cần tìm và nội dung thay thế rồi chọn **Replace all**. Tìm kiếm phân biệt hoa/thường; ứng dụng kiểm tra kích thước kết quả trước khi cấp phát và vẫn giữ giới hạn tài liệu 2 MiB. Trước khi lưu đè chính file đang mở, Editor kiểm tra fingerprint nội dung; nếu phát hiện file bị sửa hoặc bị xóa bên ngoài NOVA thì sẽ chặn lưu để tránh ghi đè thay đổi đó. Hãy mở lại file hoặc đổi Location để lưu thành file khác.
 - Trong Calculator → Calculate, **MS** lưu kết quả hiện tại vào bộ nhớ, **M+** cộng kết quả, **M−** trừ kết quả, **MR** chèn giá trị nhớ vào biểu thức, **MC** xóa bộ nhớ. Bộ nhớ chỉ tồn tại trong phiên NOVA hiện tại.
 
 ## 8. Tài liệu
@@ -123,3 +126,11 @@ Mở **Monitor** từ Start hoặc phím `Ctrl + Shift + Esc` để vào NOVA Ha
 - `RELEASE_NOTES_0.5.7.md`: thay đổi của bản hiện tại.
 - `SECURITY.md`: ranh giới bảo mật và cách báo cáo lỗ hổng riêng tư.
 - `QUICK_START.txt`: hướng dẫn nhanh được tạo tự động trong gói USB.
+
+## Build and release support
+
+- Supported release target: Windows 10/11 x64 (`x86_64-pc-windows-msvc`). Windows ARM64 is not currently a supported build target.
+- CI checks Rust formatting, Clippy, Windows-target tests/build, PowerShell syntax, and a short executable-startup smoke test. The smoke test does not replace interactive UI testing on physical hardware.
+- Main-branch trusted releases require `NOVA_SIGN_CERT_BASE64` and `NOVA_SIGN_CERT_PASSWORD` repository secrets. Pull-request and local builds may be unsigned development artifacts; do not distribute them as verified releases.
+- The source archive intentionally omits `Cargo.lock`; keep the committed lockfile in the Git repository and regenerate it with `scripts/prepare-lockfile.ps1 -Update` whenever dependencies or features change. CI rejects a missing or stale lockfile.
+- `scripts/measure-performance.ps1` records CPU, working set, private memory, handles, and threads to CSV. Run it against a real Windows session with the intended NOVA workloads; CI does not enforce arbitrary machine-dependent RAM/CPU thresholds.
