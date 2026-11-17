@@ -181,7 +181,7 @@ impl HardwareTelemetry {
                     let received_rate = bytes_per_second(data.received(), elapsed);
                     let transmitted_rate = bytes_per_second(data.transmitted(), elapsed);
                     NetworkSnapshot {
-                        name: name.clone(),
+                        name: name.to_string_lossy().into_owned(),
                         received_per_sec: received_rate.unwrap_or(0.0),
                         transmitted_per_sec: transmitted_rate.unwrap_or(0.0),
                         total_received: data.total_received(),

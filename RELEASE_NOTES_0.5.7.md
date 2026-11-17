@@ -142,3 +142,15 @@
 - Editor adds exact case-sensitive Find and Replace All (Ctrl+F), with output-size preflight before allocation and the existing 2 MiB document limit. Replacements remain unsaved until explicitly saved.
 - Calculator Calculate adds session-only MS/M+/M−/MR/MC memory functions.
 - Added regression tests for file operations, bounded previews/search and safe Editor replacement sizing.
+
+
+## Phase 4 — Windows CI compile follow-up
+
+- Imported the crate-root `file_ops` and `wifi` modules into `app.rs`; the modules were already declared in `main.rs`, but child modules must refer to them through `crate` imports.
+- Added the Editor helper functions and `Settings` to the relevant unit-test module imports so the Phase 1 regression tests resolve in test builds.
+- Migrated the keyboard-focus check to egui 0.37's `Context::egui_wants_keyboard_input` API and changed stable widget IDs from deprecated `Id::new` to `Id::unique` (preserving stable ID hashing).
+- Matched `sysinfo 0.40.3`'s fallible `System::name` API by accepting the error argument in `unwrap_or_else`.
+- Converted the `OsString` network interface name to an owned display `String` for the Hardware Center snapshot.
+- Removed the Settings window closure's whole-`self` borrow: theme state is computed before the window borrows its open flag, and Wi-Fi actions are dispatched after the UI closure.
+- Removed an unused binding in the batch Trash path. No dependency or Cargo manifest changes were made.
+- Static checks pass in this editing environment; compile, Clippy and tests must still be confirmed by the Windows CI runner.

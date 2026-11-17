@@ -3,7 +3,7 @@ use crate::terminal::{TerminalState, TerminalTask};
 use crate::trash::{self, TrashEntry};
 use crate::apps;
 use crate::calculator::{self, AngleUnit, EvalContext};
-use crate::{isolation, unikey, unicode, hardware::{self, HardwareTelemetry, HardwareSnapshot, HostControl}, security_tools::{self, SecurityTool}};
+use crate::{file_ops, wifi, isolation, unikey, unicode, hardware::{self, HardwareTelemetry, HardwareSnapshot, HostControl}, security_tools::{self, SecurityTool}};
 use eframe::egui::{self, Color32, FontId, RichText, TextEdit};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -904,7 +904,7 @@ impl NovaApp {
             .filter(|app| (self.app_is_open(app.name) || self.minimized_apps.contains(app.name)) && app.name != "Google Chrome")
             .map(|app| app.name).collect();
         let dark = self.is_dark_mode(ctx);
-        egui::Area::new(egui::Id::new("nova-task-view-switcher"))
+        egui::Area::new(egui::Id::unique("nova-task-view-switcher"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -72.0))
             .show(ctx, |ui| {
@@ -2700,7 +2700,7 @@ impl NovaApp {
             } else {
                 desktop_default_position(index, desktop, columns)
             };
-            let output = egui::Area::new(egui::Id::new(("nova-desktop-icon", *name)))
+            let output = egui::Area::new(egui::Id::unique(("nova-desktop-icon", *name)))
                 .order(egui::Order::Middle)
                 .default_pos(pos)
                 .movable(true)
@@ -2861,7 +2861,7 @@ impl NovaApp {
             input.key_pressed(egui::Key::Delete),
             input.key_pressed(egui::Key::Escape),
         ));
-        if self.files_open && !ctx.wants_keyboard_input() {
+        if self.files_open && !ctx.egui_wants_keyboard_input() {
             if ctrl_a {
                 self.files_multi_selected = self.visible_file_paths().into_iter().collect();
                 self.files_selected = self.files_multi_selected.iter().next().cloned();
@@ -3245,7 +3245,7 @@ impl NovaApp {
         let mut failures = Vec::new();
         for path in paths {
             match trash::move_to_trash(&self.paths, &path) {
-                Ok(entry) => moved += 1,
+                Ok(_entry) => moved += 1,
                 Err(error) => failures.push(format!("{}: {error}", path.display())),
             }
         }
@@ -3609,7 +3609,11 @@ impl NovaApp {
         let mut changed = false;
         let mut launch_app: Option<&'static str> = None;
         let mut open_files_requested = false;
+        let mut request_network_scan = false;
+        let mut request_network_disconnect = false;
+        let mut request_network_connect = false;
         let snap = self.take_window_snap("Settings", ctx);
+        let is_dark_mode = self.is_dark_mode(ctx);
         let mut window = egui::Window::new("⚙  NOVA Settings")
             .order(self.window_order("Settings"))
             .collapsible(false)
@@ -3740,7 +3744,7 @@ impl NovaApp {
                             for app in START_APPS {
                                 ui.horizontal_wrapped(|ui| {
                                     let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
-                                    paint_vector_app_icon(ui.painter(), icon_rect.center(), app.name, 27.0, self.is_dark_mode(ctx));
+                                    paint_vector_app_icon(ui.painter(), icon_rect.center(), app.name, 27.0, is_dark_mode);
                                     ui.vertical(|ui| {
                                         ui.label(RichText::new(app.name).strong());
                                         ui.label(RichText::new(app.description).small().weak());
@@ -3757,8 +3761,8 @@ impl NovaApp {
                         ui.heading("Network & connectivity");
                         ui.label("Manage Wi-Fi on the Windows host. NOVA does not create a virtual network adapter or isolate host traffic.");
                         ui.horizontal_wrapped(|ui| {
-                            if ui.add_enabled(!self.network_busy, egui::Button::new("Scan Wi-Fi")).clicked() { self.start_network_scan(); }
-                            if ui.add_enabled(!self.network_busy, egui::Button::new("Disconnect")).clicked() { self.start_network_disconnect(); }
+                            if ui.add_enabled(!self.network_busy, egui::Button::new("Scan Wi-Fi")).clicked() { request_network_scan = true; }
+                            if ui.add_enabled(!self.network_busy, egui::Button::new("Disconnect")).clicked() { request_network_disconnect = true; }
                             if self.network_busy { ui.spinner(); ui.label(RichText::new("Working…").small().weak()); }
                         });
                         ui.label(RichText::new(&self.network_status).small().weak());
@@ -3785,7 +3789,7 @@ impl NovaApp {
                                 ui.label("Password");
                                 ui.add_enabled(!self.network_busy, TextEdit::singleline(&mut self.network_password)
                                     .password(true).desired_width(220.0).hint_text("Leave empty for an open network"));
-                                if ui.add_enabled(!self.network_busy, egui::Button::new("Connect")).clicked() { self.start_network_connect(); }
+                                if ui.add_enabled(!self.network_busy, egui::Button::new("Connect")).clicked() { request_network_connect = true; }
                             });
                         }
                         ui.horizontal_wrapped(|ui| {
@@ -3826,6 +3830,9 @@ impl NovaApp {
             self.window_rects.insert("Settings".to_owned(), shown.response.rect);
             if shown.response.hovered() { self.mark_window_active(ctx, "Settings"); }
         }
+        if request_network_scan { self.start_network_scan(); }
+        if request_network_disconnect { self.start_network_disconnect(); }
+        if request_network_connect { self.start_network_connect(); }
         if !self.settings_open {
             self.network_password.clear();
         }
@@ -4400,7 +4407,7 @@ impl NovaApp {
                                     }
                                 });
                             });
-                        let os_name = System::name().unwrap_or_else(|| "Windows host".to_owned());
+                        let os_name = System::name().unwrap_or_else(|_| "Windows host".to_owned());
                         let os_version = System::os_version().unwrap_or_default();
                         ui.label(if os_version.is_empty() { os_name } else { format!("{os_name} {os_version}") });
                         ui.add_space(12.0);
@@ -4950,7 +4957,7 @@ fn vector_calculate(a: &str, b: &str) -> String {
 mod tests {
     use std::collections::BTreeMap;
     use eframe::egui;
-    use super::{compact_file_name, desktop_default_position, desktop_layout_changed, desktop_shortcut_travel, format_number, move_pinned_app, normalize_desktop_positions, normalize_pinned_apps, start_menu_dimensions, taskbar_rail_widths, workspace_is_active, START_APPS, START_PINS};
+    use super::{compact_file_name, desktop_default_position, desktop_layout_changed, desktop_shortcut_travel, discard_unsaved_editor_text, format_number, move_pinned_app, next_untitled_file_name, normalize_desktop_positions, normalize_pinned_apps, start_menu_dimensions, taskbar_rail_widths, workspace_is_active, START_APPS, START_PINS};
     use crate::storage::Settings;
 
     #[test]

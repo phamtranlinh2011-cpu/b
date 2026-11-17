@@ -548,7 +548,7 @@ pub fn create_user_directories(root: &Path, candidate: &Path) -> io::Result<Path
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_user_path, safe_user_path};
+    use super::{canonical_user_path, safe_user_path, Settings};
     use std::path::Path;
 
     #[test]
