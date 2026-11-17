@@ -1,4 +1,7 @@
-use crate::storage::{atomic_write_user_file, canonical_user_path, create_user_directories, is_link_or_reparse_point, safe_user_path, AppPaths, Settings};
+use crate::storage::{
+    atomic_write_user_file, canonical_user_path, canonical_user_path_with_relative,
+    create_user_directories, is_link_or_reparse_point, safe_user_path, AppPaths, Settings,
+};
 use crate::terminal::{TerminalState, TerminalTask};
 use crate::trash::{self, TrashEntry};
 use crate::apps;
@@ -3800,13 +3803,13 @@ impl NovaApp {
                         self.editor_saved_fingerprint = Some(fingerprint);
                         self.editor_overwrite_pending = None;
                         self.editor_dirty = false;
-                        let canonical_root = self.paths.user_dir.canonicalize().ok();
-                        self.editor_path = canonical_root
-                            .as_deref()
-                            .and_then(|root| canonical_file.strip_prefix(root).ok())
-                            .unwrap_or(&canonical_file)
-                            .to_string_lossy()
-                            .to_string();
+                        let editor_relative_path = canonical_user_path_with_relative(
+                            &self.paths.user_dir,
+                            &canonical_file,
+                        )
+                        .map(|(_, relative)| relative)
+                        .unwrap_or_else(|_| canonical_file.clone());
+                        self.editor_path = editor_relative_path.to_string_lossy().to_string();
                         self.editor_status = "File opened".to_owned();
                     }
                     Err(error) => self.editor_status = format!("Text file could not be decoded: {error}"),
@@ -5039,6 +5042,9 @@ impl NovaApp {
                         for gpu in &snapshot.gpus {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
                                 ui.heading(&gpu.name);
+                                if let Some(vendor) = gpu.vendor.as_deref().filter(|value| !value.trim().is_empty()) {
+                                    ui.label(RichText::new(vendor).small().weak());
+                                }
                                 if let Some(usage) = gpu.usage_percent {
                                     ui.label(format!("GPU engine usage: {usage:.1}%"));
                                     ui.add(egui::ProgressBar::new((usage / 100.0).clamp(0.0, 1.0)).show_percentage());

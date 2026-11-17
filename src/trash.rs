@@ -2,7 +2,11 @@
 //! remain with the USB workspace and can be restored without relying on the
 //! host Windows Recycle Bin.
 
-use crate::storage::{canonical_user_path, create_user_directories, ensure_real_child, is_link_or_reparse_point, remove_tree_without_following_reparse_points, safe_user_path, AppPaths};
+use crate::storage::{
+    canonical_user_path, canonical_user_path_with_relative, create_user_directories,
+    ensure_real_child, is_link_or_reparse_point, remove_tree_without_following_reparse_points,
+    safe_user_path, AppPaths,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -184,13 +188,15 @@ pub fn move_to_trash(paths: &AppPaths, source: &Path) -> io::Result<TrashEntry> 
     if !source_meta.is_file() && !source_meta.is_dir() {
         return Err(io::Error::new(io::ErrorKind::Unsupported, "Only regular files and directories can be moved to NOVA Trash."));
     }
-    let canonical_source = canonical_user_path(&canonical_root, source)?;
-    if canonical_source == canonical_root {
+    // Validate the caller path and obtain its safe relative name using the
+    // shared file-identity containment check. Avoid lexical prefix comparison
+    // because Windows may expose one directory through several path spellings.
+    let (canonical_source, relative_source) =
+        canonical_user_path_with_relative(&paths.user_dir, source)?;
+    if relative_source.as_os_str().is_empty() {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "The NOVA workspace root cannot be moved to Trash."));
     }
-    let original_path = canonical_source
-        .strip_prefix(&canonical_root)
-        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "Item is outside NOVA workspace."))?
+    let original_path = relative_source
         .to_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "NOVA Trash requires valid Unicode file paths."))?
         .to_owned();

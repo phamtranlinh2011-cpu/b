@@ -152,6 +152,42 @@ fn matches_expected_ssid(actual: &str, expected: &str) -> bool {
     actual.as_bytes() == expected.as_bytes()
 }
 
+fn matches_profile_name(actual: &str, expected: &str) -> bool {
+    // Windows WLAN profile names are case-sensitive identifiers.
+    actual == expected
+}
+
+fn checked_dot11_ssid_bytes(bytes: &[u8], length: usize) -> io::Result<&[u8]> {
+    if length == 0 || length > bytes.len() || length > 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Windows WLAN reported an invalid SSID byte length: {length}."),
+        ));
+    }
+    Ok(&bytes[..length])
+}
+
+fn connection_timeout_error(
+    expected_ssid: Option<&str>,
+    timeout: Duration,
+    last_error: Option<String>,
+) -> io::Error {
+    let detail = last_error
+        .map(|error| format!(" Last status: {error}."))
+        .unwrap_or_default();
+    let message = match expected_ssid {
+        Some(ssid) => format!(
+            "Windows accepted the connection request for '{ssid}', but the WLAN API did not confirm association within {} seconds.{detail}",
+            timeout.as_secs()
+        ),
+        None => format!(
+            "Windows accepted the disconnect request, but disconnection was not confirmed within {} seconds.{detail}",
+            timeout.as_secs()
+        ),
+    };
+    io::Error::new(io::ErrorKind::TimedOut, message)
+}
+
 // Keep the hand-written FFI layout pinned to wlanapi.h. A size/offset drift
 // would make the variable-length list unsafe to iterate on Windows x64/x86.
 #[cfg(windows)]
@@ -428,7 +464,8 @@ fn current_connection_windows() -> io::Result<Option<WifiConnectionInfo>> {
         let attributes = unsafe { &*raw_data.cast::<WlanConnectionAttributes>() };
         if attributes.state != 1 { continue; } // wlan_interface_state_connected
         let length = attributes.association.ssid.length as usize;
-        if let Some(ssid) = decode_ssid(&attributes.association.ssid.bytes[..length.min(32)]) {
+        let ssid_bytes = checked_dot11_ssid_bytes(&attributes.association.ssid.bytes, length)?;
+        if let Some(ssid) = decode_ssid(ssid_bytes) {
             return Ok(Some(WifiConnectionInfo {
                 ssid,
                 signal_quality: attributes.association.signal_quality.min(100),
@@ -453,7 +490,7 @@ pub fn wait_for_connection(expected_ssid: Option<&str>, timeout: Duration) -> io
         match current_connection() {
             Ok(Some(connection)) => {
                 if let Some(expected) = expected_ssid {
-                    if connection.ssid.eq_ignore_ascii_case(expected) {
+                    if matches_expected_ssid(&connection.ssid, expected) {
                         return Ok(format!("Connected to '{}' · signal {}%.", connection.ssid, connection.signal_quality));
                     }
                 } else {
@@ -467,10 +504,7 @@ pub fn wait_for_connection(expected_ssid: Option<&str>, timeout: Duration) -> io
         if std::time::Instant::now() >= deadline { break; }
         std::thread::sleep(Duration::from_millis(500));
     }
-    match expected_ssid {
-        Some(ssid) => Ok(format!("Windows accepted the connection request for '{ssid}', but the WLAN API did not confirm association within {} seconds.{}", timeout.as_secs(), last_error.map(|error| format!(" Last status: {error}.")).unwrap_or_default())),
-        None => Ok(format!("Windows accepted the disconnect request, but disconnection was not confirmed within {} seconds.{}", timeout.as_secs(), last_error.map(|error| format!(" Last status: {error}.")).unwrap_or_default())),
-    }
+    Err(connection_timeout_error(expected_ssid, timeout, last_error))
 }
 
 /// Request disconnection from the active Windows WLAN network.
@@ -503,9 +537,9 @@ pub fn connect(paths: &AppPaths, ssid: &str, password: Option<&str>) -> io::Resu
     }
     let profile = build_profile(ssid, &profile_name, password);
     let mut temp_guard = create_temp_profile_file()?;
-    temp_guard.file_mut().write_all(profile.as_bytes())?;
-    temp_guard.file_mut().flush()?;
-    temp_guard.file_mut().sync_all()?;
+    temp_guard.file_mut()?.write_all(profile.as_bytes())?;
+    temp_guard.file_mut()?.flush()?;
+    temp_guard.file_mut()?.sync_all()?;
     // Close the writer before launching netsh. This avoids requiring netsh's
     // internal file opener to share DELETE access while the XML is imported.
     temp_guard.close_for_import();
@@ -649,7 +683,7 @@ fn windows_profile_exists(profile_name: &str) -> io::Result<bool> {
             let profile = unsafe { &*profile_ptr.add(profile_index) };
             let length = profile.profile_name.iter().position(|unit| *unit == 0).unwrap_or(profile.profile_name.len());
             let name = String::from_utf16_lossy(&profile.profile_name[..length]);
-            if name.eq_ignore_ascii_case(profile_name) {
+            if matches_profile_name(&name, profile_name) {
                 found = true;
                 break;
             }
@@ -782,8 +816,10 @@ struct TempProfileGuard {
 }
 
 impl TempProfileGuard {
-    fn file_mut(&mut self) -> &mut File {
-        self.file.as_mut().expect("temporary profile file is already closed")
+    fn file_mut(&mut self) -> io::Result<&mut File> {
+        self.file.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "Temporary Wi-Fi profile file is already closed.")
+        })
     }
 
     fn close_for_import(&mut self) {
@@ -1028,11 +1064,12 @@ mod tests {
     fn temp_profile_guard_closes_and_removes_file_on_drop() {
         let mut guard = create_temp_profile_file().unwrap();
         let path = guard.path.clone();
-        guard.file_mut().write_all(b"temporary").unwrap();
-        guard.file_mut().flush().unwrap();
+        guard.file_mut().unwrap().write_all(b"temporary").unwrap();
+        guard.file_mut().unwrap().flush().unwrap();
         assert!(path.exists());
         // Verify the handoff closes the writer before the importer opens it.
         guard.close_for_import();
+        assert!(guard.file_mut().is_err());
         assert_eq!(fs::read(&path).unwrap(), b"temporary");
         drop(guard);
         assert!(!path.exists());
@@ -1080,10 +1117,37 @@ mod tests {
 
 #[cfg(test)]
 mod connection_tests {
+    use std::time::Duration;
+
     #[test]
     fn expected_ssid_comparison_is_case_sensitive() {
         assert!(super::matches_expected_ssid("MyNetwork", "MyNetwork"));
         assert!(!super::matches_expected_ssid("MyNetwork", "mynetwork"));
+    }
+
+    #[test]
+    fn unconfirmed_wifi_requests_return_a_timeout_error() {
+        let connect_error = super::connection_timeout_error(
+            Some("Home WiFi"),
+            Duration::from_secs(15),
+            None,
+        );
+        assert_eq!(connect_error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(connect_error.to_string().contains("did not confirm association"));
+
+        let disconnect_error = super::connection_timeout_error(
+            None,
+            Duration::from_secs(8),
+            Some("adapter busy".to_owned()),
+        );
+        assert_eq!(disconnect_error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(disconnect_error.to_string().contains("adapter busy"));
+    }
+
+    #[test]
+    fn wlan_profile_name_comparison_is_case_sensitive() {
+        assert!(super::matches_profile_name("NOVA::Home WiFi", "NOVA::Home WiFi"));
+        assert!(!super::matches_profile_name("NOVA::Home WiFi", "nova::home wifi"));
     }
 }
 
@@ -1102,6 +1166,17 @@ mod scan_tests {
         assert!(decode_ssid(&[b'A'; 33]).is_none());
         assert!(decode_ssid(b"bad\nname").is_none());
         assert!(decode_ssid(&[0xff, 0xfe]).is_none());
+    }
+
+    #[test]
+    fn dot11_ssid_length_is_checked_without_silent_truncation() {
+        let bytes = [b'A'; 32];
+        assert_eq!(
+            super::checked_dot11_ssid_bytes(&bytes, 1).unwrap(),
+            b"A"
+        );
+        assert!(super::checked_dot11_ssid_bytes(&bytes, 0).is_err());
+        assert!(super::checked_dot11_ssid_bytes(&bytes, 33).is_err());
     }
 
     #[cfg(windows)]
