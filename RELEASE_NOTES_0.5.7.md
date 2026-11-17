@@ -187,3 +187,12 @@
 - Retained canonical containment enforcement and repeated resolved-component checks; external paths, parent traversal, symlinks, junctions and other reparse points remain rejected.
 - Added regression coverage for mixed canonical/lexical root and candidate paths, and made an already-cancelled file search return `Interrupted` before path traversal.
 - This addresses the Windows CI failures in File Manager and Trash that surfaced as `PermissionDenied: Access outside NOVA user folder is blocked.` Actual Windows test results are still required to confirm the fix.
+
+
+## Windows file-identity containment follow-up
+
+- Replaced Windows lexical-prefix fallback for NOVA root containment with stable volume serial + file-index identity checks. Canonical descendants are walked by directory identity, so DOS, extended-length, case-varied, short-name and volume aliases do not incorrectly appear outside the user folder.
+- Continued rejecting symlinks, junctions and other reparse points by checking caller-visible directory chains and each resolved component before file operations. The identity helper opens final components without following a final reparse point and fails closed if stable identity cannot be obtained.
+- Updated File Manager copy/import/move descendant checks, Rename relative-path generation, Trash original-path metadata, Editor path display and safe directory creation to use verified relative paths or directory identity instead of Windows string-prefix comparisons.
+- Added a Windows case-varied path regression test and expanded descendant-destination checks. CI now records hashes for `app.rs`, `file_ops.rs`, `storage.rs` and `trash.rs`, and checks that pre-cancelled search exits with `Interrupted` before any path validation.
+- Windows `cargo test`, Clippy and build still require confirmation by the Windows CI runner.

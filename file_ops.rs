@@ -5,8 +5,8 @@
 //! are assembled in a private staging directory and published with one rename.
 
 use crate::storage::{
-    canonical_user_path, is_link_or_reparse_point, remove_tree_without_following_reparse_points,
-    safe_user_path,
+    canonical_directory_contains, canonical_user_path, canonical_user_path_with_relative,
+    is_link_or_reparse_point, remove_tree_without_following_reparse_points, safe_user_path,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -336,16 +336,16 @@ where
     progress.store(0, Ordering::Relaxed);
     bytes_copied.store(0, Ordering::Relaxed);
     let canonical_root = root.canonicalize()?;
-    let (canonical_source, metadata) = validate_existing_item(&canonical_root, source)?;
+    let (canonical_source, metadata) = validate_existing_item(root, source)?;
     if canonical_source == canonical_root {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "The NOVA workspace root cannot be copied as an item."));
     }
-    let destination = validate_destination_dir(&canonical_root, destination_dir)?;
+    let destination = validate_destination_dir(root, destination_dir)?;
     let _destination_guard = hold_directory_chain(&destination)?;
     if canonical_user_path(&canonical_root, &destination)? != destination {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Destination path changed before copy."));
     }
-    if metadata.is_dir() && destination.starts_with(&canonical_source) {
+    if metadata.is_dir() && canonical_directory_contains(&canonical_source, &destination)? {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "A folder cannot be copied into itself or one of its descendants."));
     }
     let name = canonical_source.file_name().and_then(|v| v.to_str())
@@ -464,9 +464,9 @@ pub fn copy_external_item_cancellable(
     let _source_parent_guard = hold_directory_chain(source_parent)?;
     let canonical_source = source.canonicalize()?;
     let (canonical_source, metadata) = validate_external_item_under_guard(&canonical_source)?;
-    let destination = validate_destination_dir(&canonical_root, destination_dir)?;
+    let destination = validate_destination_dir(root, destination_dir)?;
     let _destination_guard = hold_directory_chain(&destination)?;
-    if metadata.is_dir() && destination.starts_with(&canonical_source) {
+    if metadata.is_dir() && canonical_directory_contains(&canonical_source, &destination)? {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "A folder cannot be imported into itself or one of its descendants."));
     }
     let name = canonical_source.file_name().and_then(|value| value.to_str())
@@ -518,11 +518,11 @@ fn validate_external_item_under_guard(source: &Path) -> io::Result<(PathBuf, fs:
 /// Move an item within the NOVA workspace without overwriting an existing name.
 pub fn move_item(root: &Path, source: &Path, destination_dir: &Path) -> io::Result<PathBuf> {
     let canonical_root = root.canonicalize()?;
-    let (canonical_source, _) = validate_existing_item(&canonical_root, source)?;
+    let (canonical_source, _) = validate_existing_item(root, source)?;
     if canonical_source == canonical_root {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "The NOVA workspace root cannot be moved."));
     }
-    let destination = validate_destination_dir(&canonical_root, destination_dir)?;
+    let destination = validate_destination_dir(root, destination_dir)?;
     let source_parent = canonical_source.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Source item has no parent."))?;
     let _source_parent_guard = hold_directory_chain(source_parent)?;
     let _destination_guard = hold_directory_chain(&destination)?;
@@ -534,7 +534,7 @@ pub fn move_item(root: &Path, source: &Path, destination_dir: &Path) -> io::Resu
     if destination == canonical_source.parent().unwrap_or(Path::new("")) {
         return Ok(canonical_source);
     }
-    if canonical_source.is_dir() && destination.starts_with(&canonical_source) {
+    if canonical_source.is_dir() && canonical_directory_contains(&canonical_source, &destination)? {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "A folder cannot be moved into itself or one of its descendants."));
     }
     let name = canonical_source.file_name().and_then(|v| v.to_str())
@@ -556,7 +556,7 @@ pub fn rename_item(root: &Path, source: &Path, new_name: &str) -> io::Result<Pat
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Enter a valid name. The reserved .nova-copy- prefix cannot be used."));
     }
     let canonical_root = root.canonicalize()?;
-    let (canonical_source, _) = validate_existing_item(&canonical_root, source)?;
+    let (canonical_source, _) = validate_existing_item(root, source)?;
     if canonical_source == canonical_root {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "The NOVA workspace root cannot be renamed."));
     }
@@ -565,8 +565,7 @@ pub fn rename_item(root: &Path, source: &Path, new_name: &str) -> io::Result<Pat
     if canonical_user_path(&canonical_root, &canonical_source)? != canonical_source {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Source path changed before rename."));
     }
-    let relative_parent = parent.strip_prefix(&canonical_root)
-        .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "The selected item's parent is outside NOVA Files."))?;
+    let relative_parent = canonical_user_path_with_relative(root, parent)?.1;
     let relative = relative_parent.join(new_name);
     let target = safe_user_path(&canonical_root, &relative.to_string_lossy())?;
     if target == canonical_source { return Ok(canonical_source); }
@@ -632,8 +631,11 @@ pub fn search_user_files_with_control(
     cancel: &AtomicBool,
     progress: &AtomicUsize,
 ) -> io::Result<SearchResult> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "File search was cancelled."));
+    }
     let canonical_root = root.canonicalize()?;
-    let canonical_start = canonical_user_path(&canonical_root, start)?;
+    let canonical_start = canonical_user_path(root, start)?;
     if !canonical_start.is_dir() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Search must start in a folder."));
     }
@@ -747,9 +749,12 @@ mod tests {
         let temp = TestDir::new();
         let root = &temp.0;
         let source = root.join("Folder");
-        fs::create_dir(&source).unwrap();
+        let nested = source.join("Nested");
+        fs::create_dir_all(&nested).unwrap();
         assert!(copy_item(root, &source, &source).is_err());
         assert!(move_item(root, &source, &source).is_err());
+        assert!(copy_item(root, &source, &nested).is_err());
+        assert!(move_item(root, &source, &nested).is_err());
     }
 
     #[test]

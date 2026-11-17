@@ -1,4 +1,7 @@
-use crate::storage::{atomic_write_user_file, canonical_user_path, create_user_directories, is_link_or_reparse_point, safe_user_path, AppPaths, Settings};
+use crate::storage::{
+    atomic_write_user_file, canonical_user_path, canonical_user_path_with_relative,
+    create_user_directories, is_link_or_reparse_point, safe_user_path, AppPaths, Settings,
+};
 use crate::terminal::{TerminalState, TerminalTask};
 use crate::trash::{self, TrashEntry};
 use crate::apps;
@@ -3800,13 +3803,13 @@ impl NovaApp {
                         self.editor_saved_fingerprint = Some(fingerprint);
                         self.editor_overwrite_pending = None;
                         self.editor_dirty = false;
-                        let canonical_root = self.paths.user_dir.canonicalize().ok();
-                        self.editor_path = canonical_root
-                            .as_deref()
-                            .and_then(|root| canonical_file.strip_prefix(root).ok())
-                            .unwrap_or(&canonical_file)
-                            .to_string_lossy()
-                            .to_string();
+                        let editor_relative_path = canonical_user_path_with_relative(
+                            &self.paths.user_dir,
+                            &canonical_file,
+                        )
+                        .map(|(_, relative)| relative)
+                        .unwrap_or_else(|_| canonical_file.clone());
+                        self.editor_path = editor_relative_path.to_string_lossy().to_string();
                         self.editor_status = "File opened".to_owned();
                     }
                     Err(error) => self.editor_status = format!("Text file could not be decoded: {error}"),
@@ -4736,12 +4739,22 @@ impl NovaApp {
                 self.monitor_error = None;
             }
             Some(Ok(None)) => {
+                // No telemetry update is ready yet. Keep the last snapshot and
+                // retry shortly only while the initial sample is still pending.
                 if self.hardware_initializing { ctx.request_repaint_after(Duration::from_millis(100)); }
             }
             Some(Err(TryRecvError::Disconnected)) => {
                 self.hardware = None;
                 self.hardware_initializing = false;
                 self.monitor_error = Some("Hardware telemetry worker stopped unexpectedly.".to_owned());
+            }
+            Some(Err(_)) => {
+                // Preserve the last known hardware snapshot for any other
+                // non-fatal receive state. The explicit Disconnected arm above
+                // remains responsible for stopping a dead worker.
+                if self.hardware_initializing {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
             }
             None => {}
         }

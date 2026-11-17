@@ -33,9 +33,15 @@ jobs:
           $commit = (git rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($commit)) { throw 'Could not identify the checked-out Git commit.' }
           $appHash = (Get-FileHash -LiteralPath 'src/app.rs' -Algorithm SHA256).Hash
+          $fileOpsHash = (Get-FileHash -LiteralPath 'src/file_ops.rs' -Algorithm SHA256).Hash
+          $storageHash = (Get-FileHash -LiteralPath 'src/storage.rs' -Algorithm SHA256).Hash
+          $trashHash = (Get-FileHash -LiteralPath 'src/trash.rs' -Algorithm SHA256).Hash
           Write-Host "NOVA workflow ref: ${{ github.ref }}"
           Write-Host "NOVA checked-out commit: $commit"
           Write-Host "src/app.rs SHA256: $appHash"
+          Write-Host "src/file_ops.rs SHA256: $fileOpsHash"
+          Write-Host "src/storage.rs SHA256: $storageHash"
+          Write-Host "src/trash.rs SHA256: $trashHash"
 
       # This immutable action revision pins Rust 1.95.0 internally; it has no toolchain input.
       - name: Install Rust 1.95.0 toolchain
