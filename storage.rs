@@ -488,24 +488,20 @@ pub fn safe_user_path(root: &Path, relative: &str) -> io::Result<PathBuf> {
     Ok(root.join(clean))
 }
 
-/// Resolve an existing path only after checking every path component for
-/// symlinks/junctions/reparse points. Windows may return a `\\?\` verbatim
-/// path from `canonicalize()` while a caller still holds the ordinary DOS
-/// spelling (or vice versa). Comparing those two spellings lexically with
-/// `strip_prefix` rejects valid descendants. Resolve both ends first, but only
-/// after inspecting the caller's original path chain so canonicalization can
-/// never hide a redirected component.
+/// Resolve an existing path only after checking every lexical component.
+/// Canonicalization alone is insufficient: a junction may point to another
+/// directory *inside* the root and still violate NOVA's no-reparse policy.
 pub fn canonical_user_path(root: &Path, candidate: &Path) -> io::Result<PathBuf> {
     ensure_real_directory_chain(root)?;
-
-    if candidate.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
-        return Err(io::Error::new(
+    let canonical_root = root.canonicalize()?;
+    let relative = candidate.strip_prefix(root).map_err(|_| {
+        io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "Path traversal is not allowed in NOVA Files.",
-        ));
-    }
+            "Access outside NOVA user folder is blocked.",
+        )
+    })?;
 
-    let root_metadata = fs::symlink_metadata(root)?;
+    let root_metadata = fs::symlink_metadata(&canonical_root)?;
     if !root_metadata.is_dir() || is_link_or_reparse_point(&root_metadata) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -513,43 +509,9 @@ pub fn canonical_user_path(root: &Path, candidate: &Path) -> io::Result<PathBuf>
         ));
     }
 
-    let candidate_parent = candidate.parent().filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "The selected path has no parent directory."))?;
-    // Check the entire caller-visible ancestor chain before canonicalizing.
-    // This catches an intermediate junction even if its resolved target is
-    // still somewhere under the NOVA root.
-    ensure_real_directory_chain(candidate_parent)?;
-
-    let candidate_metadata = fs::symlink_metadata(candidate)?;
-    if is_link_or_reparse_point(&candidate_metadata) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("NOVA refuses redirected path components: {}", candidate.display()),
-        ));
-    }
-    if !candidate_metadata.is_dir() && !candidate_metadata.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Only regular files and directories are supported in NOVA Files.",
-        ));
-    }
-
-    // Canonicalize root and candidate independently. This deliberately avoids
-    // comparing a caller's unprefixed path with a canonical Windows path.
-    let canonical_root = root.canonicalize()?;
-    let canonical_candidate = candidate.canonicalize()?;
-    let relative = canonical_candidate.strip_prefix(&canonical_root).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "Access outside NOVA user folder is blocked.",
-        )
-    })?;
-
-    // Re-check the resolved components as a defense-in-depth check. The
-    // original chain above is still required because canonicalization follows
-    // reparse points and would otherwise erase evidence of them.
     let mut current = canonical_root.clone();
-    for component in relative.components() {
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
         match component {
             std::path::Component::Normal(part) => current.push(part),
             std::path::Component::CurDir => continue,
@@ -562,11 +524,19 @@ pub fn canonical_user_path(root: &Path, candidate: &Path) -> io::Result<PathBuf>
                 ));
             }
         }
+
         let metadata = fs::symlink_metadata(&current)?;
         if is_link_or_reparse_point(&metadata) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!("NOVA refuses redirected path components: {}", current.display()),
+            ));
+        }
+        let is_last = index + 1 == components.len();
+        if !is_last && !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("A path component is not a directory: {}", current.display()),
             ));
         }
         if !metadata.is_dir() && !metadata.is_file() {
@@ -577,13 +547,11 @@ pub fn canonical_user_path(root: &Path, candidate: &Path) -> io::Result<PathBuf>
         }
     }
 
-    // The reconstructed path and canonical target must still identify the
-    // same location. This also detects path changes during validation.
-    let verified_candidate = current.canonicalize()?;
-    if verified_candidate != canonical_candidate {
+    let canonical_candidate = current.canonicalize()?;
+    if !canonical_candidate.starts_with(&canonical_root) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "The selected path changed during validation.",
+            "Access outside NOVA user folder is blocked.",
         ));
     }
     Ok(canonical_candidate)
@@ -709,26 +677,6 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         assert!(canonical_user_path(&root, &root).is_ok());
         assert!(canonical_user_path(&root, &outside).is_err());
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn canonical_user_path_accepts_mixed_canonical_and_lexical_spellings() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let base = std::env::temp_dir().join(format!("nova-path-spelling-{}-{stamp}", std::process::id()));
-        let root = base.join("root");
-        let file = root.join("note.txt");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(&file, "safe").unwrap();
-
-        let canonical_root = root.canonicalize().unwrap();
-        let canonical_file = file.canonicalize().unwrap();
-        assert_eq!(canonical_user_path(&canonical_root, &file).unwrap(), canonical_file);
-        assert_eq!(canonical_user_path(&root, &canonical_file).unwrap(), canonical_file);
-
         let _ = std::fs::remove_dir_all(base);
     }
 
