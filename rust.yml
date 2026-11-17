@@ -28,6 +28,8 @@ jobs:
 
       - name: Report checked-out source revision
         shell: pwsh
+        env:
+          NOVA_WORKFLOW_REF: ${{ github.ref }}
         run: |
           $ErrorActionPreference = 'Stop'
           $commit = (git rev-parse HEAD).Trim()
@@ -36,19 +38,29 @@ jobs:
           $fileOpsHash = (Get-FileHash -LiteralPath 'src/file_ops.rs' -Algorithm SHA256).Hash
           $storageHash = (Get-FileHash -LiteralPath 'src/storage.rs' -Algorithm SHA256).Hash
           $trashHash = (Get-FileHash -LiteralPath 'src/trash.rs' -Algorithm SHA256).Hash
-          Write-Host "NOVA workflow ref: ${{ github.ref }}"
+          $wifiHash = (Get-FileHash -LiteralPath 'src/wifi.rs' -Algorithm SHA256).Hash
+          $terminalHash = (Get-FileHash -LiteralPath 'src/terminal.rs' -Algorithm SHA256).Hash
+          $unikeyHash = (Get-FileHash -LiteralPath 'src/unikey.rs' -Algorithm SHA256).Hash
+          $invariantsHash = (Get-FileHash -LiteralPath 'scripts/verify-source-invariants.ps1' -Algorithm SHA256).Hash
+          $revision = (Get-Content -LiteralPath 'SOURCE_REVISION.txt' -Raw).Trim()
+          Write-Host "NOVA workflow ref: $env:NOVA_WORKFLOW_REF"
+          Write-Host "NOVA source revision: $revision"
           Write-Host "NOVA checked-out commit: $commit"
           Write-Host "src/app.rs SHA256: $appHash"
           Write-Host "src/file_ops.rs SHA256: $fileOpsHash"
           Write-Host "src/storage.rs SHA256: $storageHash"
           Write-Host "src/trash.rs SHA256: $trashHash"
+          Write-Host "src/wifi.rs SHA256: $wifiHash"
+          Write-Host "src/terminal.rs SHA256: $terminalHash"
+          Write-Host "src/unikey.rs SHA256: $unikeyHash"
+          Write-Host "source-invariants SHA256: $invariantsHash"
 
       # This immutable action revision pins Rust 1.95.0 internally; it has no toolchain input.
       - name: Install Rust 1.95.0 toolchain
         uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # Rust 1.95.0
         with:
           targets: x86_64-pc-windows-msvc
-          components: clippy
+          components: clippy, rustfmt
 
       - name: Require committed dependency lockfile
         shell: pwsh

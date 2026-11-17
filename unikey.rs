@@ -13,22 +13,13 @@ pub fn find_portable(app_dir: &Path) -> Option<PathBuf> {
         root.join("Apps/UniKey/UniKey.exe"),
         root.join("UniKeyNT.exe"),
     ];
-    candidates.into_iter().find(|path| {
-        let Ok(canonical) = path.canonicalize() else { return false; };
-        if !canonical.starts_with(&root) || !canonical.is_file() { return false; }
-
-        // Check each existing component rather than trusting canonicalization
-        // alone; a USB junction must not silently redirect the companion.
-        let mut current = path.as_path();
-        loop {
-            let Ok(metadata) = std::fs::symlink_metadata(current) else { return false; };
-            if crate::storage::is_link_or_reparse_point(&metadata) { return false; }
-            if current == root.as_path() { break; }
-            let Some(parent) = current.parent() else { return false; };
-            current = parent;
-        }
-        true
-    }).and_then(|path| path.canonicalize().ok())
+    candidates.into_iter().find_map(|path| {
+        // Use NOVA's Windows-aware canonical containment verifier instead of
+        // Path::starts_with, which compares path components case-sensitively
+        // and does not normalize DOS vs. verbatim path spellings on Windows.
+        let canonical = crate::storage::canonical_user_path(&root, &path).ok()?;
+        canonical.is_file().then_some(canonical)
+    })
 }
 
 #[cfg(windows)]

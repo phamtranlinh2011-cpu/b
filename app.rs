@@ -5042,6 +5042,9 @@ impl NovaApp {
                         for gpu in &snapshot.gpus {
                             egui::Frame::group(ui.style()).show(ui, |ui| {
                                 ui.heading(&gpu.name);
+                                if let Some(vendor) = gpu.vendor.as_deref().filter(|value| !value.trim().is_empty()) {
+                                    ui.label(RichText::new(vendor).small().weak());
+                                }
                                 if let Some(usage) = gpu.usage_percent {
                                     ui.label(format!("GPU engine usage: {usage:.1}%"));
                                     ui.add(egui::ProgressBar::new((usage / 100.0).clamp(0.0, 1.0)).show_percentage());

@@ -40,10 +40,14 @@ impl TerminalTask {
                 }
                 Err(error) => format!("Wi-Fi scan failed: {error}"),
             },
-            Self::WifiConnect { paths, ssid, password } => match wifi::connect(&paths, &ssid, password.as_deref()) {
-                Ok(message) => message,
-                Err(error) => format!("Wi-Fi connection failed: {error}"),
-            },
+            Self::WifiConnect { paths, ssid, password } => {
+                match wifi::connect(&paths, &ssid, password.as_deref()).and_then(|_| {
+                    wifi::wait_for_connection(Some(&ssid), Duration::from_secs(15))
+                }) {
+                    Ok(message) => message,
+                    Err(error) => format!("Wi-Fi connection failed: {error}"),
+                }
+            }
             Self::WifiDelete { paths, ssid } => match wifi::delete_profile(&paths, &ssid) {
                 Ok(message) => message,
                 Err(error) => format!("Wi-Fi profile deletion failed: {error}"),
