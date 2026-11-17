@@ -92,22 +92,98 @@ impl SecurityTool {
             return None;
         }
         executable_candidates(self, app_dir).into_iter().find_map(|candidate| {
-            let canonical = candidate.canonicalize().ok()?;
-            if canonical.is_file() { Some(canonical) } else { None }
+            canonical_regular_executable(&candidate)
         })
     }
 
-    pub fn launch(self, app_dir: &Path) -> io::Result<PathBuf> {
+    pub fn launch(self, app_dir: &Path, allow_unsigned_zap: bool) -> io::Result<PathBuf> {
         if self == Self::VulnerabilityManagement {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Greenbone is a separately hosted web console. Enter your authorized GSA URL and open it from NOVA."));
         }
-        let executable = self.detect(app_dir).ok_or_else(|| {
+        let detected_executable = self.detect(app_dir).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("{} was not found. Install it from the official website, then choose Detect again.", self.info().name))
         })?;
+        verify_security_tool_signature(self, &detected_executable, allow_unsigned_zap)?;
+        // Re-check the canonical path after verification so a replaced parent
+        // junction/symlink cannot redirect the subsequent process launch.
+        let executable = canonical_regular_executable(&detected_executable)
+            .filter(|current| current == &detected_executable)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "Security tool path changed during publisher verification; launch was blocked."))?;
         let working_directory = executable.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Tool executable has no parent folder."))?;
         Command::new(&executable).current_dir(working_directory).spawn()?;
         Ok(executable)
     }
+}
+
+/// Return a canonical executable only when the file and every existing
+/// parent directory are regular filesystem entries (not symlinks/junctions).
+/// This prevents an install-path redirect from substituting another file.
+fn canonical_regular_executable(candidate: &Path) -> Option<PathBuf> {
+    let metadata = std::fs::symlink_metadata(candidate).ok()?;
+    if crate::storage::is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+        return None;
+    }
+    let parent = candidate.parent()?;
+    let mut ancestors = parent.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
+    for directory in ancestors {
+        let metadata = std::fs::symlink_metadata(directory).ok()?;
+        if !metadata.is_dir() || crate::storage::is_link_or_reparse_point(&metadata) {
+            return None;
+        }
+    }
+    let canonical = candidate.canonicalize().ok()?;
+    if canonical.is_file() { Some(canonical) } else { None }
+}
+
+#[cfg(any(windows, test))]
+fn expected_publisher_matches(tool: SecurityTool, signer: &str) -> bool {
+    let signer = signer.trim().to_ascii_lowercase();
+    match tool {
+        SecurityTool::NetworkDiscovery => signer == "insecure.com llc",
+        SecurityTool::VulnerabilityManagement => false,
+        SecurityTool::WebSecurity => matches!(signer.as_str(), "owasp" | "owasp foundation" | "owasp foundation, inc."),
+        SecurityTool::PacketAnalyzer => signer == "wireshark foundation",
+        SecurityTool::WebApiInspector => matches!(signer.as_str(), "portswigger" | "portswigger ltd" | "portswigger ltd." | "portswigger limited" | "portswigger web security"),
+    }
+}
+
+#[cfg(windows)]
+fn verify_security_tool_signature(tool: SecurityTool, executable: &Path, allow_unsigned_zap: bool) -> io::Result<()> {
+    use std::time::Duration;
+
+    if !executable.is_file() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "Security tool executable was not found."));
+    }
+    let powershell = crate::windows_process::system_binary(r"WindowsPowerShell\v1.0\powershell.exe")?;
+    // Emit only the signer name on success. Exit code 18 means genuinely
+    // unsigned; invalid/expired/untrusted signatures fail closed.
+    let script = "$ErrorActionPreference='Stop'; $sig=Get-AuthenticodeSignature -LiteralPath $env:NOVA_VERIFY_PATH; if ($sig.Status -eq 'Valid') { $name=$sig.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false); [Console]::Out.Write($name); exit 0 }; if ($sig.Status -eq 'NotSigned') { exit 18 }; exit 17";
+    let mut command = Command::new(powershell);
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]).env("NOVA_VERIFY_PATH", executable);
+    let output = crate::windows_process::run_captured(command, Duration::from_secs(15))?;
+    if output.timed_out || output.drain_timed_out {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "Security tool publisher verification timed out. Check Windows certificate services and try again."));
+    }
+    match output.status.code() {
+        Some(0) => {
+            let signer = String::from_utf8_lossy(&output.stdout);
+            if expected_publisher_matches(tool, &signer) {
+                Ok(())
+            } else {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} launch blocked: unexpected Authenticode publisher '{signer}'.", tool.info().name)))
+            }
+        }
+        Some(18) if tool == SecurityTool::WebSecurity && allow_unsigned_zap => Ok(()),
+        Some(18) if tool == SecurityTool::WebSecurity => Err(io::Error::new(io::ErrorKind::PermissionDenied, "OWASP ZAP is unsigned. Confirm that this copy came from the official ZAP project before launching it.")),
+        Some(18) => Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} launch blocked: the executable is not Authenticode-signed.", tool.info().name))),
+        _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} launch blocked: the Authenticode signature is invalid, untrusted or unavailable.", tool.info().name))),
+    }
+}
+
+#[cfg(not(windows))]
+fn verify_security_tool_signature(_tool: SecurityTool, _executable: &Path, _allow_unsigned_zap: bool) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "Security tool signature verification is available in the Windows NOVA build."))
 }
 
 #[cfg(windows)]
@@ -305,4 +381,34 @@ mod tests {
     fn greenbone_is_a_hosted_web_console_not_a_local_scanner_binary() {
         assert!(!SecurityTool::VulnerabilityManagement.info().requires_local_executable);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn security_tool_detection_rejects_symlinked_install_directories() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("nova-security-tool-link-{}", std::process::id()));
+        let external = base.join("external");
+        let redirected = base.join("Program Files");
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::write(external.join("tool.exe"), b"not a real executable").unwrap();
+        symlink(&external, &redirected).unwrap();
+        assert!(super::canonical_regular_executable(&redirected.join("tool.exe")).is_none());
+        assert!(super::canonical_regular_executable(&external.join("tool.exe")).is_some());
+        let _ = std::fs::remove_file(&redirected);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn known_security_tool_publishers_are_explicit_and_exact() {
+        assert!(super::expected_publisher_matches(SecurityTool::NetworkDiscovery, "Insecure.Com LLC"));
+        assert!(super::expected_publisher_matches(SecurityTool::PacketAnalyzer, "Wireshark Foundation"));
+        assert!(super::expected_publisher_matches(SecurityTool::WebApiInspector, "PortSwigger Ltd"));
+        assert!(super::expected_publisher_matches(SecurityTool::WebApiInspector, "PortSwigger Ltd."));
+        assert!(super::expected_publisher_matches(SecurityTool::WebApiInspector, "PortSwigger Web Security"));
+        assert!(super::expected_publisher_matches(SecurityTool::WebSecurity, "OWASP Foundation"));
+        assert!(!super::expected_publisher_matches(SecurityTool::PacketAnalyzer, "Wireshark Lookalike"));
+        assert!(!super::expected_publisher_matches(SecurityTool::NetworkDiscovery, "Nmap Lookalike LLC"));
+        assert!(!super::expected_publisher_matches(SecurityTool::WebApiInspector, "PortSwigger Support Forum"));
+    }
+
 }

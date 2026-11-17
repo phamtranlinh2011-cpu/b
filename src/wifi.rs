@@ -81,6 +81,15 @@ pub fn scan_networks() -> io::Result<Vec<String>> {
     Ok(networks)
 }
 
+/// Request disconnection from the active Windows WLAN network.
+pub fn disconnect() -> io::Result<String> {
+    let output = run_netsh(&["wlan", "disconnect"])?;
+    if output.timed_out || output.drain_timed_out || !output.status.success() {
+        return Err(io::Error::other(output.combined_text()));
+    }
+    Ok("Windows accepted the Wi-Fi disconnect request.".to_owned())
+}
+
 pub fn connect(paths: &AppPaths, ssid: &str, password: Option<&str>) -> io::Result<String> {
     validate_ssid(ssid)?;
     if let Some(secret) = password {

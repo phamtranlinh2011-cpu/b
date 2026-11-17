@@ -4,6 +4,7 @@ mod app;
 mod calculator;
 mod isolation;
 mod apps;
+mod file_ops;
 mod storage;
 mod terminal;
 mod trash;
@@ -12,6 +13,7 @@ mod unikey;
 mod wifi;
 mod security_tools;
 mod windows_process;
+mod hardware;
 
 fn main() -> eframe::Result {
     let paths = match storage::AppPaths::discover() {

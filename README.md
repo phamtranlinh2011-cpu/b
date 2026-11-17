@@ -6,7 +6,24 @@
 - Calculator upgraded to a ClassWiz-inspired scientific workspace with expression parsing, DEG/RAD/GRA, scientific/trigonometric/hyperbolic functions, constants, factorial, combinations/permutations, normal/binomial/Poisson distributions, 1/2-variable statistics and regression, linear/quadratic equations, quadratic inequalities, numerical derivative/integration, numeric tables, Base-N, 2×2/3×3 matrices, vectors and ratios. This is a growing compatible feature set, not a claim of full fx-991CW feature parity.
 - Google Chrome shortcut now launches the actual installed Windows Chrome executable as a native Chrome window, using the user's existing Chrome profile and settings instead of drawing a NOVA imitation window.
 
-NOVA now has responsive desktop and Start grids, a searchable List/Grid File Manager with contextual actions and clearer empty states, Settings pages for Appearance/System/Apps/Network/Security/About, System theme following Windows, a Windows 11-inspired centered floating taskbar with a balanced system tray and local clock, and an animated Quick Settings panel. The taskbar shows all configured pinned apps plus unpinned workspaces while they are open; the app strip scrolls horizontally when it is full, rather than forcing every catalog item into the dock. Its side rails adapt symmetrically so Start and app shortcuts remain centered at narrower widths. Quick Settings controls and Start Menu grids now size themselves from the real content width, avoiding clipped buttons and overflow. Both Pinned and All apps content scroll vertically when the Start surface is short; Quick Access collapses to one, two or three columns based on the actual inner width. The File Manager List view allocates a bounded name column and size column, shortening long Unicode filenames without clipping the size or losing the full filename on disk. Start/Quick Settings surfaces use eased transitions, taskbar and desktop icons animate on hover, and app windows fade in/out with consistent rounded surfaces, borders and shadows. Snap panes no longer inherit oversized minimum widths after the transition; Settings reflows to one column, and Editor/Terminal/Trash/Monitor/Security action rows wrap when needed. The taskbar, Start menu and Quick Settings render in a foreground shell layer above app windows; Snap layouts reserve space above the dock and animate window position/size without covering it. Windows remain draggable/resizable with egui's native in-app window behavior. The taskbar is inside NOVA and does not replace the Windows host taskbar or control host volume/battery. See `RELEASE_NOTES_0.5.7.md` for the current release summary.
+NOVA now has responsive desktop and Start grids, a searchable List/Grid File Manager with contextual actions and clearer empty states, Settings pages for Appearance/System/Apps/Network/Security/About, System theme following Windows and persisting across restarts, a Windows 11-inspired centered floating taskbar with a balanced system tray and local clock, and an animated Quick Settings panel. The taskbar shows all configured pinned apps plus unpinned workspaces while they are open; the app strip scrolls horizontally when it is full, rather than forcing every catalog item into the dock. Its side rails adapt symmetrically so Start and app shortcuts remain centered at narrower widths. Quick Settings controls and Start Menu grids now size themselves from the real content width, avoiding clipped buttons and overflow. Both Pinned and All apps content scroll vertically when the Start surface is short; Quick Access collapses to one, two or three columns based on the actual inner width. The File Manager List view allocates a bounded name column and size column, shortening long Unicode filenames without clipping the size or losing the full filename on disk. Start/Quick Settings surfaces use eased transitions, taskbar and desktop icons animate on hover, and app windows fade in/out with consistent rounded surfaces, borders and shadows. Snap panes no longer inherit oversized minimum widths after the transition; Settings reflows to one column, and Editor/Terminal/Trash/Monitor/Security action rows wrap when needed. The taskbar, Start menu and Quick Settings render in a foreground shell layer above app windows; Snap layouts reserve space above the dock and animate window position/size without covering it. Windows remain draggable/resizable with egui's native in-app window behavior. The taskbar is inside NOVA and does not replace the Windows host taskbar or control host volume/battery. See `RELEASE_NOTES_0.5.7.md` for the current release summary.
+
+## Phase 2 desktop shell and window-manager improvements
+
+- Added an in-shell Task View that lists open and minimized NOVA workspaces and restores the selected app above other NOVA windows. It intentionally excludes Chrome because Chrome is a native Windows host window whose foreground/minimized state is not owned by NOVA.
+- Taskbar clicks now follow a clearer Windows-style behavior: clicking a background open app focuses it, clicking the active app minimizes it, and clicking a minimized app restores it. Taskbar indicators distinguish the active workspace, other open windows and minimized workspaces.
+- Added taskbar context actions to minimize/close workspaces, snap left/right, fill the NOVA desktop and restore the previous window size. Snap and restore transitions use an eased 240 ms position/size interpolation, respecting Reduce Motion.
+- Desktop shortcuts can now be dragged and their normalized positions are saved in Settings. Positions are constrained to the desktop work area and are re-seeded from normalized coordinates when the desktop viewport is resized. Use **Right-click → Reorder Start pin** (Move earlier/Move later) to rearrange pinned apps from desktop shortcuts, Start Pinned or All apps.
+- Replaced the remaining primary desktop, taskbar, Start and Installed Apps glyph labels with shared egui vector icons to reduce reliance on emoji/font fallback. Added activity entries for workspace open/restore/minimize/close and retained the bounded recent-status history.
+- Active-window layering is now managed within NOVA: interacting with a workspace promotes it, while the active window is shown above other NOVA workspaces. This does not control native Windows windows or provide a separate Windows virtual desktop.
+
+## Phase 1 data-safety fixes in this source refresh
+
+- Settings preserve the `system` theme preference and sanitize persisted Start pins against the application catalog, removing unknown names and duplicates without silently restoring pins the user removed.
+- Editor now prompts Save / Discard / Cancel before New, opening another file, closing the Editor or exiting NOVA when content is dirty. Ctrl+S is supported; failed saves keep the pending action open. New documents use an unused Untitled filename, and saving to a different existing file requires explicit overwrite confirmation.
+- Editor writes through a same-directory temporary file, flushes it, revalidates the path chain and replaces the target only after the write succeeds. The 2 MiB editor limit remains.
+- Security Center checks Authenticode validity and an explicit publisher allowlist immediately before launching Zenmap, Wireshark and Burp. Official OWASP ZAP Windows releases are currently unsigned, so ZAP remains an explicit one-session opt-in exception; NOVA cannot cryptographically establish the origin of that unsigned executable.
+- Binomial and Poisson PMF/CDF use log-space probability calculations and stable recurrences to avoid intermediate factorial/combination overflow. Input count limits remain bounded to protect interactive responsiveness.
 
 ## 0.5.2 — Windows-style desktop refresh
 
@@ -47,15 +64,15 @@ On a compatible Windows 10/11 x64 machine, open the USB in File Explorer and dou
 | App | Behavior |
 |---|---|
 | Files | Browse `Data/Users/Default`; create folders; select, open as text, and move items into NOVA Trash; inspect a selected file in Windows Sandbox |
-| Editor | Unicode text editor; UTF-8 and UTF-16 LE/BE input; UTF-8 output; 2 MiB per-file limit |
+| Editor | Unicode text editor; UTF-8 and UTF-16 LE/BE input; UTF-8 output; 2 MiB per-file limit; unsaved-change prompts, unique Untitled names, overwrite confirmation, Ctrl+S and atomic save |
 | Calculator | Scientific expressions, distributions, 1/2-variable statistics, equations/inequalities, numerical calculus, tables, Base-N, matrices, vectors and ratios |
-| System Monitor | Host CPU usage, memory and process count; refresh while visible |
+| Hardware Center / Monitor | Host CPU total/per-core, RAM/swap, processes, mounted volumes, per-interface network throughput, driver-reported GPU/VRAM, AC/battery state and available temperature sensors |
 | Terminal | Real Windows CMD with signed-in user's permissions; UTF-8 code page request; NOVA Wi-Fi commands |
-| Settings | Dark/light theme, accent color, reduced-motion option, shortcuts to UniKey and Security Center |
+| Settings | System/Light/Dark theme (System preference survives restart), accent color, reduced-motion option, shortcuts to UniKey and Security Center; invalid/duplicate Start pins are removed on load |
 | NOVA Trash | Restore or permanently remove items deleted through NOVA Files |
 | Google Chrome | Launch the installed native Windows Chrome window with its normal user profile |
 | UniKey | Official signed UniKey 4.6 RC2 x64 bundled into the USB release; starts when its NOVA shortcut is opened |
-| Security Center | Authorized-scope workflow reminder, Sandbox availability, isolation limits, staged-sample cleanup and five GUI security-tool workspaces |
+| Security Center | Authorized-scope workflow reminder, Sandbox availability, isolation limits, staged-sample cleanup and five GUI security-tool workspaces; local tool executables are Authenticode-checked against expected publishers before launch |
 | Network Discovery | Opens the separately installed Zenmap/Nmap GUI |
 | Vulnerability Management | Opens a separately hosted Greenbone Security Assistant (GSA) console; scanner/server is not bundled |
 | Web Security | Opens the separately installed OWASP ZAP desktop GUI |
@@ -81,9 +98,25 @@ Build computer requirements: Rust 1.95.0, Microsoft C++ Build Tools/MSVC and Win
 
 GitHub Actions uses `.github/workflows/rust.yml` on `windows-latest` for pushes, pull requests and manual dispatch. It validates the committed lockfile, runs Clippy and Windows-target tests, builds Release and uploads the USB folder, ZIP and checksum. It has read-only repository permissions and does not modify the branch. Code-signing secrets are exposed only to a dedicated post-build signing step on a push to `main`; the Cargo build and dependency build scripts never receive them. Pull requests and manual runs build unsigned packages. For signed main-branch releases, configure `NOVA_SIGN_CERT_BASE64` (base64-encoded code-signing PFX) and `NOVA_SIGN_CERT_PASSWORD`; without both secrets, the EXE is intentionally unsigned.
 
+## Phase 4 — everyday apps and file workflow
+
+- Expanded NOVA Files with Ctrl-click multi-select, Select All/Clear, internal Copy/Cut/Paste, collision-safe Rename, bulk Move to Trash, a bounded recursive workspace search, and a UTF-8/UTF-16 text preview capped at 256 KiB. Copy/move operations run in background workers; directory copy uses a staging directory, refuses links/reparse points, limits nesting and item count, and never intentionally overwrites an existing destination. The NOVA file clipboard is internal to the Files workspace and is not the Windows system clipboard.
+- Added a graphical Wi-Fi panel under Settings → Network for scanning SSIDs, selecting a network, connecting and disconnecting through Windows WLAN commands. Passwords are passed to the connection worker and are not persisted in NOVA settings/history. Windows may retain an imported Wi-Fi profile under the current user. SSID-only scan results do not infer signal strength or security type; enterprise/802.1X and captive portal flows are not implemented by this panel.
+- Added exact, case-sensitive Find/Replace All to the built-in Editor (Ctrl+F). The replacement calculates output size before allocation and retains the existing 2 MiB editor limit; changes remain unsaved until the user saves.
+- Added Calculator memory controls MS, M+, M−, MR and MC to the Calculate workspace. Memory is session-only and is not persisted after NOVA exits.
+- Added regression coverage for staged copy, collision-safe moves/renames, bounded previews and recursive search, hidden copy staging exclusion, and bounded Editor replacement.
+
+## Phase 3 — Hardware Center and host telemetry
+
+The Monitor workspace is now the NOVA Hardware Center with Overview, Processes, Storage, Network, GPU & Power, and Sensors & Controls tabs. CPU total/per-core usage and RAM/swap readings use the `sysinfo` system provider; CPU usage and process CPU rankings wait for a second sample before being presented as valid, while CPU frequency and the process table refresh on a slower five-second cadence. The process table is sorted by CPU with memory as a tie-breaker. Storage volumes refresh every five seconds, network byte rates sample once per second after a two-sample baseline, and GPU/power/sensor information refreshes on slower schedules. `sysinfo`'s optional `gpu` feature is enabled for GPU engine usage and dedicated VRAM where Windows and the installed driver expose those counters. The first GPU usage sample can be unavailable while the time-difference counter warms up. A missing counter is shown as unavailable rather than estimated.
+
+Battery and AC status use the documented Windows `GetSystemPowerStatus` API. The UI distinguishes an explicit no-battery status from an unknown battery status. Display/brightness, sound/volume, network, Bluetooth and power buttons open the corresponding Windows control surfaces; they do not bypass Windows policies or pretend to control hardware when the host/driver does not offer a supported API. Temperature readings depend on the sensor provider and may legitimately be unavailable on many Windows systems. Shared GPU memory is not added to dedicated VRAM totals.
+
+Because the `gpu` dependency feature was enabled, regenerate and commit the lockfile on the Rust 1.95 Windows development machine before CI: `scripts/prepare-lockfile.ps1 -Update`. Review the resulting `Cargo.lock` diff, then verify `cargo metadata --locked`, Clippy and the Windows test job.
+
 ## Performance sampling
 
-Run NOVA on a Windows machine, then in PowerShell execute `powershell -ExecutionPolicy Bypass -File scripts/measure-performance.ps1 -DurationSeconds 120`. The script records whole-machine-normalized CPU usage, working set, private memory, handles and thread count once per second to `perf-results/*.csv`. For multiple NOVA instances, pass `-ProcessId`. Compare an idle sample, a sample with System Monitor open and a sample with several workspaces open; do not treat one machine's numbers as universal limits.
+Run NOVA on a Windows machine, then in PowerShell execute `powershell -ExecutionPolicy Bypass -File scripts/measure-performance.ps1 -DurationSeconds 120`. The script records whole-machine-normalized CPU usage, working set, private memory, handles and thread count once per second to `perf-results/*.csv`. For multiple NOVA instances, pass `-ProcessId`. Compare an idle sample, a sample with Hardware Center open and a sample with several workspaces open; do not treat one machine's numbers as universal limits.
 
 ## Security policy
 
@@ -97,12 +130,14 @@ src/apps.rs             Host Chrome detection, publisher validation and native l
 src/security_tools.rs   Five GUI tool integrations, detection and scope reminder
 src/isolation.rs        Windows Sandbox config, read-only staging and cleanup
 src/storage.rs          Portable paths, settings, validation and atomic JSON writes
+src/file_ops.rs         Bounded safe copy/move/rename, recursive search and text preview
 src/terminal.rs         CMD/Wi-Fi command parsing and background task model
 src/trash.rs            Portable NOVA Trash and restore operations
 src/unicode.rs          UTF-8 / UTF-16 text decoding
 src/unikey.rs           Bundled UniKey discovery, signature validation and launcher
 src/wifi.rs             Windows WLAN profile operations and protected TEMP XML
 src/windows_process.rs  Windows Job Object, process timeout and bounded output
+src/hardware.rs         Host CPU/RAM, storage, network, GPU, power and sensor telemetry
 scripts/Download-UniKey.ps1  Build-time UniKey download and Authenticode verification
 scripts/prepare-lockfile.ps1  Controlled Cargo.lock generation/verification
 scripts/sign-executable.ps1   Optional post-build PFX-based Authenticode signing

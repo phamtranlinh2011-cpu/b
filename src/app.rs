@@ -1,11 +1,11 @@
-use crate::storage::{canonical_user_path, create_user_directories, safe_user_path, AppPaths, Settings};
+use crate::storage::{atomic_write_user_file, canonical_user_path, create_user_directories, is_link_or_reparse_point, safe_user_path, AppPaths, Settings};
 use crate::terminal::{TerminalState, TerminalTask};
 use crate::trash::{self, TrashEntry};
 use crate::apps;
 use crate::calculator::{self, AngleUnit, EvalContext};
-use crate::{isolation, unikey, unicode, security_tools::{self, SecurityTool}};
+use crate::{isolation, unikey, unicode, hardware::{self, HardwareTelemetry, HardwareSnapshot, HostControl}, security_tools::{self, SecurityTool}};
 use eframe::egui::{self, Color32, FontId, RichText, TextEdit};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -17,8 +17,34 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UniKeyProcessKind { Running }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapSide { Left, Right, Maximize, Restore }
+
+#[derive(Clone)]
+enum PendingEditorAction {
+    NewDocument,
+    OpenFile(PathBuf),
+    Close,
+    ExitApplication,
+}
+
 #[derive(Clone, Copy)]
-enum SnapSide { Left, Right, Maximize }
+enum EditorDecision { Save, Discard, Cancel }
+
+#[derive(Clone)]
+struct ProcessMetric {
+    pid: String,
+    name: String,
+    cpu_percent: f32,
+    memory_bytes: u64,
+}
+
+#[derive(Clone)]
+struct CpuCoreMetric {
+    name: String,
+    usage_percent: f32,
+    frequency_mhz: u64,
+}
 
 #[derive(Clone, Copy)]
 struct WindowMotion {
@@ -38,6 +64,20 @@ struct CachedFileEntry {
     display_size: String,
 }
 
+enum FilesWorkerResult {
+    Operation { message: String, clear_clipboard: bool, retry_sources: Vec<PathBuf> },
+    Search {
+        query: String,
+        result: Result<file_ops::SearchResult, String>,
+    },
+}
+
+enum NetworkWorkerResult {
+    Scan(Result<Vec<String>, String>),
+    Connect(Result<String, String>),
+    Disconnect(Result<String, String>),
+}
+
 #[derive(Clone, Copy)]
 struct StartApp {
     name: &'static str,
@@ -51,7 +91,7 @@ const START_APPS: [StartApp; 15] = [
     StartApp { name: "Terminal", icon: "⌘", description: "Commands and Wi-Fi tools", category: "Workspace" },
     StartApp { name: "Editor", icon: "✎", description: "Write and edit text files", category: "Productivity" },
     StartApp { name: "Calculator", icon: "∑", description: "Scientific calculator and Casio-style calculation modes", category: "Productivity" },
-    StartApp { name: "Monitor", icon: "◉", description: "CPU, memory and processes", category: "System" },
+    StartApp { name: "Monitor", icon: "◉", description: "CPU, RAM, processes, storage, network, GPU and power", category: "System" },
     StartApp { name: "Trash", icon: "▤", description: "Restore deleted NOVA files", category: "System" },
     StartApp { name: "Google Chrome", icon: "🌐", description: "Open the real Google Chrome Windows app", category: "Internet" },
     StartApp { name: "UniKey", icon: "文", description: "Bundled Vietnamese Telex and VNI input", category: "Productivity" },
@@ -103,6 +143,196 @@ fn start_menu_dimensions(screen_width: f32, screen_height: f32) -> (f32, f32, us
 }
 
 /// Keep long filenames readable in the compact List view without pushing the size column off-screen.
+fn normalize_pinned_apps(pins: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    pins.iter()
+        .filter(|name| START_APPS.iter().any(|app| app.name == name.as_str()))
+        .filter(|name| seen.insert(name.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn normalize_desktop_positions(positions: &BTreeMap<String, [f32; 2]>) -> BTreeMap<String, [f32; 2]> {
+    positions.iter()
+        .filter(|(name, point)| DESKTOP_SHORTCUTS.contains(&name.as_str())
+            && point[0].is_finite() && point[1].is_finite())
+        .map(|(name, point)| (name.clone(), [point[0].clamp(0.0, 1.0), point[1].clamp(0.0, 1.0)]))
+        .collect()
+}
+
+fn workspace_is_active(active_workspace: Option<&str>, app_name: &str, is_open: bool) -> bool {
+    is_open && active_workspace == Some(app_name)
+}
+
+fn move_pinned_app(pins: &mut [String], name: &str, direction: isize) -> bool {
+    let Some(index) = pins.iter().position(|item| item == name) else { return false; };
+    let target = index as isize + direction;
+    if target < 0 || target >= pins.len() as isize { return false; }
+    pins.swap(index, target as usize);
+    true
+}
+
+fn desktop_default_position(index: usize, rect: egui::Rect, columns: usize) -> egui::Pos2 {
+    let columns = columns.max(1);
+    let col = index % columns;
+    let row = index / columns;
+    egui::pos2(rect.left() + 14.0 + col as f32 * 102.0, rect.top() + 66.0 + row as f32 * 94.0)
+}
+
+fn desktop_layout_changed(previous: Option<egui::Vec2>, current: egui::Vec2) -> bool {
+    previous.is_some_and(|previous| {
+        (previous.x - current.x).abs() > 1.0 || (previous.y - current.y).abs() > 1.0
+    })
+}
+
+fn desktop_shortcut_travel(rect: egui::Rect) -> (f32, f32) {
+    // Desktop shortcut Areas are 94x88 px, constrained inside a 4 px inset.
+    // Their normalized positions start at (12, 58), so subtract both offsets
+    // and the actual Area size from the available desktop dimensions.
+    ((rect.width() - 110.0).max(1.0), (rect.height() - 150.0).max(1.0))
+}
+
+fn app_icon_colors(name: &str) -> (Color32, Color32) {
+    let accent = match name {
+        "Files" => Color32::from_rgb(62, 151, 238),
+        "Terminal" => Color32::from_rgb(57, 185, 145),
+        "Editor" => Color32::from_rgb(111, 143, 231),
+        "Calculator" => Color32::from_rgb(112, 126, 157),
+        "Monitor" => Color32::from_rgb(40, 181, 190),
+        "Trash" => Color32::from_rgb(137, 151, 174),
+        "Google Chrome" => Color32::from_rgb(231, 111, 81),
+        "UniKey" => Color32::from_rgb(171, 125, 224),
+        "Security Center" => Color32::from_rgb(61, 177, 129),
+        "Network Discovery" => Color32::from_rgb(70, 158, 218),
+        "Vulnerability Management" => Color32::from_rgb(219, 160, 66),
+        "Web Security" => Color32::from_rgb(201, 111, 143),
+        "Packet Analyzer" => Color32::from_rgb(93, 132, 203),
+        "Web / API Inspector" => Color32::from_rgb(147, 126, 205),
+        _ => Color32::from_rgb(92, 139, 245),
+    };
+    let background = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 34);
+    (accent, background)
+}
+
+/// Draw a small application icon using egui vector primitives, avoiding emoji/font fallback differences.
+fn paint_vector_app_icon(painter: &egui::Painter, center: egui::Pos2, name: &str, size: f32, dark: bool) {
+    let (accent, background) = app_icon_colors(name);
+    let rect = egui::Rect::from_center_size(center, egui::vec2(size, size));
+    let radius = (size * 0.23).clamp(4.0, 12.0) as u8;
+    painter.rect_filled(rect, egui::CornerRadius::same(radius), background);
+    painter.rect_stroke(rect, egui::CornerRadius::same(radius), egui::Stroke::new(1.0, accent.gamma_multiply(0.55)), egui::StrokeKind::Inside);
+    let unit = size / 32.0;
+    let point = |x: f32, y: f32| egui::pos2(rect.left() + x * unit, rect.top() + y * unit);
+    let stroke = egui::Stroke::new((size * 0.055).clamp(1.2, 2.3), if dark { Color32::from_rgb(239, 245, 255) } else { Color32::from_rgb(36, 50, 72) });
+    let line = |a: (f32, f32), b: (f32, f32)| painter.line_segment([point(a.0, a.1), point(b.0, b.1)], stroke);
+    match name {
+        "Files" => {
+            let pts = vec![point(5.0, 11.0), point(13.0, 11.0), point(16.0, 14.0), point(27.0, 14.0), point(25.0, 24.0), point(6.0, 24.0)];
+            painter.add(egui::Shape::convex_polygon(pts, accent, stroke));
+            painter.line_segment([point(5.5, 12.5), point(26.0, 15.0)], egui::Stroke::new(1.0, Color32::from_white_alpha(150)));
+        }
+        "Terminal" => {
+            let inner = egui::Rect::from_min_max(point(5.0, 7.0), point(27.0, 25.0));
+            painter.rect_stroke(inner, egui::CornerRadius::same(4), stroke, egui::StrokeKind::Inside);
+            line((9.0, 12.0), (13.0, 16.0)); line((13.0, 16.0), (9.0, 20.0)); line((16.0, 20.0), (22.0, 20.0));
+        }
+        "Editor" => {
+            let page = egui::Rect::from_min_max(point(8.0, 5.0), point(24.0, 27.0));
+            painter.rect_stroke(page, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            line((19.0, 5.5), (19.0, 11.0)); line((19.0, 11.0), (23.5, 11.0));
+            line((11.0, 15.0), (21.0, 15.0)); line((11.0, 19.0), (21.0, 19.0)); line((11.0, 23.0), (18.0, 23.0));
+        }
+        "Calculator" => {
+            let body = egui::Rect::from_min_max(point(8.0, 4.5), point(24.0, 27.5));
+            painter.rect_stroke(body, egui::CornerRadius::same(3), stroke, egui::StrokeKind::Inside);
+            painter.rect_filled(egui::Rect::from_min_max(point(11.0, 8.0), point(21.0, 12.0)), egui::CornerRadius::same(1), accent);
+            for (x, y) in [(12.0, 16.0), (19.0, 16.0), (12.0, 22.0), (19.0, 22.0)] { painter.circle_filled(point(x, y), unit * 1.2, accent); }
+        }
+        "Monitor" => {
+            let screen = egui::Rect::from_min_max(point(4.5, 7.0), point(27.5, 22.0));
+            painter.rect_stroke(screen, egui::CornerRadius::same(3), stroke, egui::StrokeKind::Inside);
+            line((16.0, 22.0), (16.0, 26.0)); line((11.0, 27.0), (21.0, 27.0));
+            line((8.0, 18.0), (13.0, 13.0)); line((13.0, 13.0), (17.0, 16.0)); line((17.0, 16.0), (23.0, 10.0));
+        }
+        "Trash" => {
+            line((8.0, 9.0), (24.0, 9.0)); line((12.0, 6.0), (20.0, 6.0));
+            let bin = egui::Rect::from_min_max(point(10.0, 11.0), point(22.0, 26.0));
+            painter.rect_stroke(bin, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+            line((14.0, 14.0), (14.0, 23.0)); line((18.0, 14.0), (18.0, 23.0));
+        }
+        "Google Chrome" => {
+            painter.circle_stroke(center, size * 0.34, egui::Stroke::new((size * 0.10).clamp(2.0, 4.0), accent));
+            painter.circle_stroke(center, size * 0.19, egui::Stroke::new((size * 0.08).clamp(1.8, 3.0), if dark { Color32::WHITE } else { Color32::from_rgb(35, 51, 75) }));
+            painter.circle_filled(center, size * 0.105, Color32::from_rgb(74, 143, 223));
+        }
+        "UniKey" => {
+            let keyboard = egui::Rect::from_min_max(point(4.0, 9.0), point(28.0, 23.0));
+            painter.rect_stroke(keyboard, egui::CornerRadius::same(3), stroke, egui::StrokeKind::Inside);
+            for y in [13.0, 17.0] { for x in [8.0, 13.0, 18.0, 23.0] { painter.circle_filled(point(x, y), unit * 0.85, accent); } }
+            line((11.0, 20.0), (21.0, 20.0));
+        }
+        "Security Center" | "Network Discovery" | "Vulnerability Management" | "Web Security" | "Packet Analyzer" | "Web / API Inspector" => {
+            if name == "Security Center" {
+                let shield = vec![point(16.0, 4.5), point(26.0, 8.0), point(25.0, 19.0), point(16.0, 27.0), point(7.0, 19.0), point(6.0, 8.0)];
+                painter.add(egui::Shape::convex_polygon(shield, background, stroke));
+                line((11.0, 15.0), (15.0, 19.0)); line((15.0, 19.0), (22.0, 11.0));
+            } else if name == "Network Discovery" {
+                painter.circle_stroke(center, size * 0.31, stroke); painter.circle_stroke(center, size * 0.19, stroke);
+                painter.line_segment(
+                    [center - egui::vec2(size * 0.31, 0.0), center + egui::vec2(size * 0.31, 0.0)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [center - egui::vec2(0.0, size * 0.31), center + egui::vec2(0.0, size * 0.31)],
+                    stroke,
+                );
+                painter.circle_filled(point(22.0, 10.0), unit * 2.0, accent);
+            } else if name == "Vulnerability Management" {
+                for (i, h) in [(0, 9.0), (1, 15.0), (2, 21.0)] { let x = 8.0 + i as f32 * 7.0; painter.rect_filled(egui::Rect::from_min_max(point(x, 25.0-h), point(x+4.0, 25.0)), egui::CornerRadius::same(1), accent); }
+                line((6.0, 25.5), (26.0, 25.5));
+            } else if name == "Web Security" {
+                line((12.0, 7.0), (7.0, 16.0)); line((7.0, 16.0), (12.0, 25.0));
+                line((20.0, 7.0), (25.0, 16.0)); line((25.0, 16.0), (20.0, 25.0)); line((18.0, 6.0), (14.0, 26.0));
+            } else if name == "Packet Analyzer" {
+                line((5.0, 17.0), (9.0, 17.0)); line((9.0, 17.0), (12.0, 10.0)); line((12.0, 10.0), (16.0, 23.0)); line((16.0, 23.0), (20.0, 13.0)); line((20.0, 13.0), (23.0, 17.0)); line((23.0, 17.0), (27.0, 17.0));
+            } else {
+                line((7.0, 12.0), (12.0, 16.0)); line((12.0, 16.0), (7.0, 20.0)); line((25.0, 12.0), (20.0, 16.0)); line((20.0, 16.0), (25.0, 20.0)); line((14.0, 23.0), (18.0, 9.0));
+            }
+        }
+        _ => {
+            painter.circle_stroke(center, size * 0.28, stroke); painter.circle_filled(center, size * 0.10, accent);
+            for angle in [0.0_f32, 1.57, 3.14, 4.71] {
+                let direction = egui::vec2(angle.cos(), angle.sin());
+                painter.line_segment([center + direction * size * 0.31, center + direction * size * 0.39], stroke);
+            }
+        }
+    }
+}
+
+fn discard_unsaved_editor_text(current: &mut String, saved_snapshot: &str) {
+    current.clear();
+    current.push_str(saved_snapshot);
+}
+
+fn next_untitled_file_name(directory: &Path) -> std::io::Result<String> {
+    for index in 1..=9_999_u32 {
+        let name = if index == 1 {
+            "Untitled.txt".to_owned()
+        } else {
+            format!("Untitled ({index}).txt")
+        };
+        match fs::symlink_metadata(directory.join(&name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(name),
+            Ok(_) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "Could not find an unused Untitled document name.",
+    ))
+}
+
 fn compact_file_name(name: &str, max_chars: usize) -> String {
     if name.chars().count() <= max_chars {
         return name.to_owned();
@@ -136,6 +366,9 @@ pub struct NovaApp {
     security_tool_installed: [bool; 5],
     security_tool_paths: [Option<PathBuf>; 5],
     security_tools_checked: bool,
+    security_unsigned_zap_acknowledged: bool,
+    security_launch_receiver: Option<Receiver<(usize, Result<PathBuf, String>)>>,
+    security_launching: [bool; 5],
     sandbox_available: Option<bool>,
     security_scope: String,
     security_scope_confirmed: bool,
@@ -151,12 +384,36 @@ pub struct NovaApp {
     files_error: Option<String>,
     files_grid_view: bool,
     files_search: String,
+    files_multi_selected: HashSet<PathBuf>,
+    files_clipboard: Vec<PathBuf>,
+    files_clipboard_cut: bool,
+    files_preview: Option<(PathBuf, String)>,
+    files_rename_target: Option<PathBuf>,
+    files_rename_input: String,
+    files_recursive_search_active: bool,
+    files_search_truncated: bool,
+    files_worker_receiver: Option<Receiver<FilesWorkerResult>>,
+    files_worker_busy: bool,
+    network_worker_receiver: Option<Receiver<NetworkWorkerResult>>,
+    network_busy: bool,
+    network_networks: Vec<String>,
+    network_selected_ssid: Option<String>,
+    network_password: String,
+    network_status: String,
     notification_open: bool,
+    task_view_open: bool,
+    activity_log: Vec<String>,
+    last_activity_status: String,
+    active_workspace: Option<String>,
+    minimized_apps: HashSet<String>,
+    window_restore_rects: HashMap<String, egui::Rect>,
+    desktop_rect: Option<egui::Rect>,
+    desktop_last_size: Option<egui::Vec2>,
+    desktop_layout_generation: u64,
     settings_page: usize,
     window_snap_requests: HashMap<String, SnapSide>,
     window_motions: HashMap<String, WindowMotion>,
     window_rects: HashMap<String, egui::Rect>,
-    icon_galleys: HashMap<(&'static str, u32, u32, bool), std::sync::Arc<egui::Galley>>,
     start_search: String,
     chrome_path: Option<PathBuf>,
     chrome_checked: bool,
@@ -171,12 +428,23 @@ pub struct NovaApp {
     files_new_folder: String,
     editor_path: String,
     editor_text: String,
+    editor_saved_text: String,
+    editor_saved_path: Option<PathBuf>,
+    editor_dirty: bool,
+    editor_pending_action: Option<PendingEditorAction>,
+    editor_overwrite_pending: Option<PathBuf>,
+    exit_after_editor: bool,
     editor_status: String,
+    editor_find_open: bool,
+    editor_find_query: String,
+    editor_replace_text: String,
     calc_mode: String,
     calc_expression: String,
     calc_result: String,
     calc_angle: AngleUnit,
     calc_answer: f64,
+    calc_memory: f64,
+    calc_memory_present: bool,
     calc_history: Vec<String>,
     calc_stats_data: String,
     calc_stats_y: String,
@@ -201,21 +469,84 @@ pub struct NovaApp {
     calc_ratio_b: String,
     calc_ratio_c: String,
     monitor: Option<System>,
+    hardware: Option<HardwareTelemetry>,
+    hardware_snapshot: HardwareSnapshot,
+    monitor_tab: usize,
+    monitor_process_rows: Vec<ProcessMetric>,
+    monitor_cpu_baseline_captured: bool,
+    monitor_cpu_sample_ready: bool,
+    monitor_process_baseline_captured: bool,
+    monitor_process_cpu_ready: bool,
     monitor_error: Option<String>,
     last_monitor_refresh: Instant,
     last_process_refresh: Instant,
+    last_cpu_frequency_refresh: Instant,
     applied_theme: String,
     applied_effective_theme: String,
     applied_accent: String,
     status_message: String,
 }
 
+fn replace_all_bounded(
+    original: &str,
+    needle: &str,
+    replacement: &str,
+    max_bytes: usize,
+) -> Result<(String, usize), String> {
+    if needle.is_empty() {
+        return Ok((original.to_owned(), 0));
+    }
+    let matches = original.matches(needle).count();
+    if matches == 0 {
+        return Ok((original.to_owned(), 0));
+    }
+    let removed = needle.len().checked_mul(matches)
+        .ok_or_else(|| "the replacement size could not be calculated safely".to_owned())?;
+    let added = replacement.len().checked_mul(matches)
+        .ok_or_else(|| "the replacement size could not be calculated safely".to_owned())?;
+    let result_len = original.len().checked_sub(removed)
+        .and_then(|base| base.checked_add(added))
+        .ok_or_else(|| "the replacement size could not be calculated safely".to_owned())?;
+    if result_len > max_bytes {
+        return Err(format!("the result would exceed the {max_bytes} byte limit"));
+    }
+    Ok((original.replace(needle, replacement), matches))
+}
+
+fn top_level_selected_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort_by_key(|path| (path.components().count(), path.clone()));
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if roots.iter().any(|parent| path.starts_with(parent)) { continue; }
+        roots.push(path);
+    }
+    roots
+}
+
 impl NovaApp {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: AppPaths) -> Self {
-        let (settings, settings_warning) = match paths.load_settings() {
+        let (mut settings, mut settings_warning) = match paths.load_settings() {
             Ok(settings) => (settings, None),
             Err(error) => (Settings::default(), Some(format!("Settings could not be loaded; defaults are active: {error}"))),
         };
+        // Settings are user-controlled data: accept only catalog app names and
+        // remove duplicates before Start/Taskbar code consumes the list.
+        let original_pins = settings.pinned_apps.clone();
+        settings.pinned_apps = normalize_pinned_apps(&settings.pinned_apps);
+        if settings.pinned_apps != original_pins {
+            if let Err(error) = paths.save_settings(&settings) {
+                let warning = format!("Invalid Start pins were ignored, but normalized settings could not be saved: {error}");
+                settings_warning = Some(settings_warning.map_or(warning.clone(), |existing| format!("{existing} · {warning}")));
+            }
+        }
+        let original_desktop_positions = settings.desktop_icon_positions.clone();
+        settings.desktop_icon_positions = normalize_desktop_positions(&settings.desktop_icon_positions);
+        if settings.desktop_icon_positions != original_desktop_positions {
+            if let Err(error) = paths.save_settings(&settings) {
+                let warning = format!("Invalid desktop icon positions were reset in memory but could not be saved: {error}");
+                settings_warning = Some(settings_warning.map_or(warning.clone(), |existing| format!("{existing} · {warning}")));
+            }
+        }
         let portable = paths.portable;
         // Host discovery, quarantine enumeration and system telemetry are deferred
         // until their corresponding workspace is first opened.
@@ -242,6 +573,9 @@ impl NovaApp {
             security_tool_installed: [false; 5],
             security_tool_paths: std::array::from_fn(|_| None),
             security_tools_checked: false,
+            security_unsigned_zap_acknowledged: false,
+            security_launch_receiver: None,
+            security_launching: [false; 5],
             sandbox_available: None,
             security_scope: String::new(),
             security_scope_confirmed: false,
@@ -257,12 +591,36 @@ impl NovaApp {
             files_error: None,
             files_grid_view: false,
             files_search: String::new(),
+            files_multi_selected: HashSet::new(),
+            files_clipboard: Vec::new(),
+            files_clipboard_cut: false,
+            files_preview: None,
+            files_rename_target: None,
+            files_rename_input: String::new(),
+            files_recursive_search_active: false,
+            files_search_truncated: false,
+            files_worker_receiver: None,
+            files_worker_busy: false,
+            network_worker_receiver: None,
+            network_busy: false,
+            network_networks: Vec::new(),
+            network_selected_ssid: None,
+            network_password: String::new(),
+            network_status: "Choose Scan to list nearby Wi-Fi networks.".to_owned(),
             notification_open: false,
+            task_view_open: false,
+            activity_log: Vec::new(),
+            last_activity_status: String::new(),
+            active_workspace: None,
+            minimized_apps: HashSet::new(),
+            window_restore_rects: HashMap::new(),
+            desktop_rect: None,
+            desktop_last_size: None,
+            desktop_layout_generation: 0,
             settings_page: 0,
             window_snap_requests: HashMap::new(),
             window_motions: HashMap::new(),
             window_rects: HashMap::new(),
-            icon_galleys: HashMap::new(),
             start_search: String::new(),
             chrome_path: None,
             chrome_checked: false,
@@ -276,12 +634,23 @@ impl NovaApp {
             files_new_folder: String::new(),
             editor_path: "Documents/Note.txt".to_owned(),
             editor_text: String::new(),
+            editor_saved_text: String::new(),
+            editor_saved_path: None,
+            editor_dirty: false,
+            editor_pending_action: None,
+            editor_overwrite_pending: None,
+            exit_after_editor: false,
             editor_status: "Ready".to_owned(),
+            editor_find_open: false,
+            editor_find_query: String::new(),
+            editor_replace_text: String::new(),
             calc_mode: "Calculate".to_owned(),
             calc_expression: "sin(30)+sqrt(16)".to_owned(),
             calc_result: "Ready".to_owned(),
             calc_angle: AngleUnit::Degree,
             calc_answer: 0.0,
+            calc_memory: 0.0,
+            calc_memory_present: false,
             calc_history: Vec::new(),
             calc_stats_data: "12, 15, 18, 20, 25".to_owned(),
             calc_stats_y: String::new(),
@@ -306,9 +675,18 @@ impl NovaApp {
             calc_ratio_b: "3".to_owned(),
             calc_ratio_c: "8".to_owned(),
             monitor: None,
+            hardware: None,
+            hardware_snapshot: HardwareSnapshot::default(),
+            monitor_tab: 0,
+            monitor_process_rows: Vec::new(),
+            monitor_cpu_baseline_captured: false,
+            monitor_cpu_sample_ready: false,
+            monitor_process_baseline_captured: false,
+            monitor_process_cpu_ready: false,
             monitor_error: None,
-            last_monitor_refresh: Instant::now() - Duration::from_secs(2),
-            last_process_refresh: Instant::now() - Duration::from_secs(10),
+            last_monitor_refresh: Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now),
+            last_process_refresh: Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now),
+            last_cpu_frequency_refresh: Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now),
             applied_theme: String::new(),
             applied_effective_theme: String::new(),
             applied_accent: String::new(),
@@ -320,6 +698,8 @@ impl NovaApp {
                 }
             }),
         };
+        // Do not show the initial startup banner as a new recent-activity event.
+        app.last_activity_status.clone_from(&app.status_message);
         app.apply_theme(&cc.egui_ctx);
         app
     }
@@ -426,6 +806,144 @@ impl NovaApp {
         self.applied_accent.clone_from(&self.settings.accent);
     }
 
+    fn window_order(&self, name: &str) -> egui::Order {
+        if self.active_workspace.as_deref() == Some(name) { egui::Order::Foreground } else { egui::Order::Middle }
+    }
+
+    fn mark_window_active(&mut self, ctx: &egui::Context, name: &str) {
+        if self.active_workspace.as_deref() != Some(name) {
+            self.active_workspace = Some(name.to_owned());
+            ctx.request_repaint();
+        }
+    }
+
+    fn record_activity(&mut self, message: impl AsRef<str>) {
+        let message = message.as_ref().trim();
+        if message.is_empty() { return; }
+        let (clock, _) = local_clock_strings();
+        self.activity_log.insert(0, format!("{clock}  {message}"));
+        self.activity_log.truncate(10);
+    }
+
+    fn capture_status_activity(&mut self) {
+        if self.status_message.trim().is_empty() || self.status_message == self.last_activity_status { return; }
+        let message = self.status_message.clone();
+        self.record_activity(&message);
+        self.last_activity_status = message;
+    }
+
+    /// Remove stale window-manager state after the user closes a window with its title-bar X.
+    /// Minimized windows retain their rectangle so they can be restored later.
+    fn prune_closed_window_state(&mut self) {
+        const WORKSPACES: [&str; 14] = [
+            "Files", "Terminal", "Editor", "Settings", "Calculator", "Monitor", "Trash",
+            "UniKey", "Security Center", "Network Discovery", "Vulnerability Management",
+            "Web Security", "Packet Analyzer", "Web / API Inspector",
+        ];
+        for name in WORKSPACES {
+            if !self.app_is_open(name) && !self.minimized_apps.contains(name) {
+                let closed_window = self.window_rects.remove(name).is_some();
+                self.window_restore_rects.remove(name);
+                self.window_motions.remove(name);
+                self.window_snap_requests.remove(name);
+                if self.active_workspace.as_deref() == Some(name) { self.active_workspace = None; }
+                if closed_window { self.record_activity(format!("Closed {name}")); }
+            }
+        }
+    }
+
+    fn set_app_window_open(&mut self, app: &str, open: bool) {
+        match app {
+            "Files" => self.files_open = open,
+            "Terminal" => self.terminal_open = open,
+            "Editor" => self.editor_open = open,
+            "Settings" => self.settings_open = open,
+            "Calculator" => self.calculator_open = open,
+            "Monitor" => self.monitor_open = open,
+            "Trash" => self.trash_open = open,
+            "UniKey" => self.unikey_open = open,
+            "Security Center" => self.security_open = open,
+            "Network Discovery" => self.security_tool_open[SecurityTool::NetworkDiscovery.index()] = open,
+            "Vulnerability Management" => self.security_tool_open[SecurityTool::VulnerabilityManagement.index()] = open,
+            "Web Security" => self.security_tool_open[SecurityTool::WebSecurity.index()] = open,
+            "Packet Analyzer" => self.security_tool_open[SecurityTool::PacketAnalyzer.index()] = open,
+            "Web / API Inspector" => self.security_tool_open[SecurityTool::WebApiInspector.index()] = open,
+            _ => {}
+        }
+    }
+
+    fn minimize_app(&mut self, app: &str) {
+        let was_open = self.app_is_open(app);
+        self.set_app_window_open(app, false);
+        if was_open {
+            self.minimized_apps.insert(app.to_owned());
+            self.record_activity(format!("Minimized {app}"));
+        }
+        if self.active_workspace.as_deref() == Some(app) { self.active_workspace = None; }
+    }
+
+    fn close_app(&mut self, app: &str) {
+        if app == "Editor" && self.editor_dirty {
+            self.request_editor_action(PendingEditorAction::Close);
+            return;
+        }
+        let had_window = self.app_is_open(app) || self.minimized_apps.contains(app);
+        self.set_app_window_open(app, false);
+        self.minimized_apps.remove(app);
+        self.window_restore_rects.remove(app);
+        self.window_motions.remove(app);
+        self.window_snap_requests.remove(app);
+        self.window_rects.remove(app);
+        if self.active_workspace.as_deref() == Some(app) { self.active_workspace = None; }
+        if had_window { self.record_activity(format!("Closed {app}")); }
+    }
+
+    fn window_switcher(&mut self, ctx: &egui::Context) {
+        if !self.task_view_open { return; }
+        let open_names: Vec<&'static str> = START_APPS.iter()
+            .filter(|app| (self.app_is_open(app.name) || self.minimized_apps.contains(app.name)) && app.name != "Google Chrome")
+            .map(|app| app.name).collect();
+        let dark = self.is_dark_mode(ctx);
+        egui::Area::new(egui::Id::new("nova-task-view-switcher"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -72.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(if dark { Color32::from_rgb(24, 32, 49) } else { Color32::from_rgb(248, 250, 255) })
+                    .stroke(egui::Stroke::new(1.0, if dark { Color32::from_white_alpha(28) } else { Color32::from_black_alpha(22) }))
+                    .corner_radius(egui::CornerRadius::same(18))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Task View · Open windows").strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("✕").clicked() { self.task_view_open = false; }
+                            });
+                        });
+                        ui.add_space(5.0);
+                        if open_names.is_empty() {
+                            ui.label(RichText::new("No open NOVA windows. Open an app from Start or the desktop.").small().weak());
+                        } else {
+                            ui.horizontal_wrapped(|ui| {
+                                for name in &open_names {
+                                    if START_APPS.iter().any(|app| app.name == *name) {
+                                        let (accent, _) = app_icon_colors(name);
+                                        let state = if self.minimized_apps.contains(*name) { "Minimized" }
+                                            else if self.active_workspace.as_deref() == Some(*name) { "Active" }
+                                            else { "Open" };
+                                        if ui.button(RichText::new(format!("●  {name}  ·  {state}")).color(accent)).clicked() {
+                                            self.open_app(name);
+                                            self.task_view_open = false;
+                                            ctx.request_repaint();
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    });
+            });
+    }
+
     fn is_dark_mode(&self, ctx: &egui::Context) -> bool {
         if self.settings.theme == "system" {
             ctx.theme() == egui::Theme::Dark
@@ -435,6 +953,14 @@ impl NovaApp {
     }
 
     fn open_app(&mut self, app: &str) {
+        let was_open = self.app_is_open(app);
+        let was_minimized = self.minimized_apps.remove(app);
+        // Chrome is a native host window. NOVA launches it but cannot truthfully
+        // claim ownership of its foreground/minimized state.
+        if app != "Google Chrome" {
+            self.active_workspace = Some(app.to_owned());
+        }
+        self.task_view_open = false;
         match app {
             "Files" => {
                 self.files_open = true;
@@ -471,46 +997,25 @@ impl NovaApp {
         }
         self.start_open = false;
         self.start_show_all = false;
+        self.notification_open = false;
+        if app != "Google Chrome" && (!was_open || was_minimized) {
+            self.record_activity(if was_minimized { format!("Restored {app}") } else { format!("Opened {app}") });
+        }
     }
 
-    /// Clicking an active taskbar item hides its workspace window; clicking it
-    /// again from Start or a desktop shortcut brings it back.
+    /// A taskbar click focuses a background window; only the already-active
+    /// window is minimized. This matches the normal Windows taskbar behavior.
     fn toggle_app(&mut self, app: &str) {
-        match app {
-            "Files" => {
-                self.files_open = !self.files_open;
-                if self.files_open { self.ensure_files_loaded(); }
-            },
-            "Terminal" => self.terminal_open = !self.terminal_open,
-            "Editor" => self.editor_open = !self.editor_open,
-            "Settings" => self.settings_open = !self.settings_open,
-            "Calculator" => self.calculator_open = !self.calculator_open,
-            "Monitor" => self.monitor_open = !self.monitor_open,
-            "Trash" => {
-                self.trash_open = !self.trash_open;
-                if self.trash_open { self.refresh_trash(); }
-            }
-            "Google Chrome" => {
-                self.detect_chrome_if_needed();
-                self.launch_chrome();
-            },
-            "UniKey" => {
-                self.unikey_open = !self.unikey_open;
-                if self.unikey_open {
-                    self.detect_unikey_if_needed();
-                    if self.unikey_path.is_some() && self.unikey_child.is_none() { self.start_unikey(); }
-                }
-            },
-            "Security Center" => {
-                self.security_open = !self.security_open;
-                if self.security_open { self.load_quarantine_count_if_needed(); }
-            },
-            "Network Discovery" => { let i = SecurityTool::NetworkDiscovery.index(); self.security_tool_open[i] = !self.security_tool_open[i]; },
-            "Vulnerability Management" => { let i = SecurityTool::VulnerabilityManagement.index(); self.security_tool_open[i] = !self.security_tool_open[i]; },
-            "Web Security" => { let i = SecurityTool::WebSecurity.index(); self.security_tool_open[i] = !self.security_tool_open[i]; },
-            "Packet Analyzer" => { let i = SecurityTool::PacketAnalyzer.index(); self.security_tool_open[i] = !self.security_tool_open[i]; },
-            "Web / API Inspector" => { let i = SecurityTool::WebApiInspector.index(); self.security_tool_open[i] = !self.security_tool_open[i]; },
-            _ => {}
+        if self.minimized_apps.contains(app) || !self.app_is_open(app) {
+            self.open_app(app);
+        } else if self.active_workspace.as_deref() == Some(app) {
+            self.minimize_app(app);
+        } else {
+            self.active_workspace = Some(app.to_owned());
+            self.task_view_open = false;
+            self.start_open = false;
+            self.notification_open = false;
+            self.start_show_all = false;
         }
     }
 
@@ -609,16 +1114,18 @@ impl NovaApp {
         };
         let mut rows = Vec::new();
         for entry in entries.filter_map(Result::ok) {
-            let Ok(kind) = entry.file_type() else { continue };
-            if kind.is_symlink() { continue; }
             let path = entry.path();
-            if canonical_user_path(&self.paths.user_dir, &path).is_err() { continue; }
             let name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = kind.is_dir();
-            let display_size = entry.metadata().ok()
-                .filter(|meta| meta.is_file())
-                .map(|meta| format_size(meta.len()))
-                .unwrap_or_else(|| if is_dir { "Folder".to_owned() } else { "File".to_owned() });
+            if name.to_ascii_lowercase().starts_with(".nova-copy-") { continue; }
+            let Ok(metadata) = fs::symlink_metadata(&path) else { continue };
+            if is_link_or_reparse_point(&metadata) || (!metadata.is_dir() && !metadata.is_file()) { continue; }
+            if canonical_user_path(&self.paths.user_dir, &path).is_err() { continue; }
+            let is_dir = metadata.is_dir();
+            let display_size = if metadata.is_file() {
+                format_size(metadata.len())
+            } else {
+                "Folder".to_owned()
+            };
             rows.push(CachedFileEntry { path, name, is_dir, display_size });
         }
         rows.sort_by_key(|entry| (!entry.is_dir, entry.name.to_lowercase()));
@@ -626,6 +1133,287 @@ impl NovaApp {
         self.files_dir = folder.clone();
         self.files_cache_dir = Some(folder);
         self.files_error = None;
+        self.files_recursive_search_active = false;
+        self.files_search_truncated = false;
+        self.files_preview = None;
+        self.files_multi_selected.retain(|path| self.files_entries.iter().any(|entry| &entry.path == path));
+        if self.files_selected.as_ref().is_some_and(|path| !self.files_entries.iter().any(|entry| &entry.path == path)) {
+            self.files_selected = None;
+        }
+    }
+
+    fn selected_file_paths(&self) -> Vec<PathBuf> {
+        let mut selected: Vec<PathBuf> = if self.files_multi_selected.is_empty() {
+            self.files_selected.iter().cloned().collect()
+        } else {
+            self.files_multi_selected.iter().cloned().collect()
+        };
+        selected.sort();
+        selected
+    }
+
+    fn visible_file_paths(&self) -> Vec<PathBuf> {
+        let filter = if self.files_recursive_search_active { String::new() } else { self.files_search.trim().to_lowercase() };
+        self.files_entries.iter()
+            .filter(|entry| filter.is_empty() || entry.name.to_lowercase().contains(&filter))
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    fn select_file_path(&mut self, path: PathBuf, additive: bool) {
+        if additive {
+            if !self.files_multi_selected.insert(path.clone()) {
+                self.files_multi_selected.remove(&path);
+            }
+        } else {
+            self.files_multi_selected.clear();
+            self.files_multi_selected.insert(path.clone());
+        }
+        self.files_selected = self.files_multi_selected.iter().next().cloned();
+        if self.files_multi_selected.is_empty() { self.files_selected = None; }
+        self.files_preview = None;
+    }
+
+    fn start_files_operation(&mut self, sources: Vec<PathBuf>, cut: bool) {
+        if self.files_worker_busy || sources.is_empty() { return; }
+        let root = self.paths.user_dir.clone();
+        let destination = self.files_dir.clone();
+        let (sender, receiver) = mpsc::channel();
+        let operation_name = if cut { "Move" } else { "Copy" };
+        let spawn = thread::Builder::new()
+            .name("nova-files-operation".to_owned())
+            .spawn(move || {
+                let mut completed = Vec::new();
+                let mut failures = Vec::new();
+                let mut retry_sources = Vec::new();
+                for source in sources {
+                    let result = if cut {
+                        file_ops::move_item(&root, &source, &destination)
+                    } else {
+                        file_ops::copy_item(&root, &source, &destination)
+                    };
+                    match result {
+                        Ok(path) => completed.push(path.file_name().and_then(|name| name.to_str()).unwrap_or("item").to_owned()),
+                        Err(error) => {
+                            failures.push(format!("{}: {error}", source.display()));
+                            retry_sources.push(source);
+                        }
+                    }
+                }
+                let mut message = format!("{operation_name} completed for {} item(s).", completed.len());
+                if !completed.is_empty() {
+                    message.push_str(&format!(" Created: {}.", completed.join(", ")));
+                }
+                if !failures.is_empty() {
+                    message.push_str(&format!(" {} item(s) failed: {}", failures.len(), failures.join("; ")));
+                }
+                let _ = sender.send(FilesWorkerResult::Operation { message, clear_clipboard: cut, retry_sources });
+            });
+        match spawn {
+            Ok(_) => {
+                self.files_worker_receiver = Some(receiver);
+                self.files_worker_busy = true;
+                self.status_message = if cut { "Moving files in the background…" } else { "Copying files in the background…" }.to_owned();
+            }
+            Err(error) => self.status_message = format!("Could not start file operation: {error}"),
+        }
+    }
+
+    fn start_recursive_file_search(&mut self) {
+        if self.files_worker_busy { return; }
+        let query = self.files_search.trim().to_owned();
+        if query.is_empty() {
+            self.refresh_files();
+            return;
+        }
+        let root = self.paths.user_dir.clone();
+        let start = root.clone();
+        let worker_query = query.clone();
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new().name("nova-files-search".to_owned()).spawn(move || {
+            let result = file_ops::search_user_files(&root, &start, &worker_query).map_err(|error| error.to_string());
+            let _ = sender.send(FilesWorkerResult::Search { query: worker_query, result });
+        }) {
+            Ok(_) => {
+                self.files_worker_receiver = Some(receiver);
+                self.files_worker_busy = true;
+                self.status_message = format!("Searching NOVA Files for '{query}'…");
+            }
+            Err(error) => self.status_message = format!("Could not start search: {error}"),
+        }
+    }
+
+    fn poll_files_worker(&mut self, ctx: &egui::Context) {
+        let received = match self.files_worker_receiver.as_ref() {
+            Some(receiver) => match receiver.try_recv() {
+                Ok(result) => Some(Some(result)),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(None),
+            },
+            None => None,
+        };
+        match received {
+            Some(Some(FilesWorkerResult::Operation { message, clear_clipboard, retry_sources })) => {
+                self.files_worker_receiver = None;
+                self.files_worker_busy = false;
+                self.status_message = message;
+                if clear_clipboard {
+                    self.files_clipboard = retry_sources;
+                    self.files_clipboard_cut = !self.files_clipboard.is_empty();
+                    if !self.files_clipboard.is_empty() {
+                        self.status_message.push_str(" Failed cut items remain in the clipboard for retry.");
+                    }
+                }
+                self.refresh_files();
+            }
+            Some(Some(FilesWorkerResult::Search { query, result })) => {
+                self.files_worker_receiver = None;
+                self.files_worker_busy = false;
+                match result {
+                    Ok(result) => {
+                        self.files_error = None;
+                        self.files_entries = result.paths.into_iter().filter_map(|path| {
+                            let metadata = fs::symlink_metadata(&path).ok()?;
+                            let is_dir = metadata.is_dir();
+                            let name = path.file_name()?.to_string_lossy().to_string();
+                            let display_size = if is_dir { "Folder".to_owned() } else { format_size(metadata.len()) };
+                            Some(CachedFileEntry { path, name, is_dir, display_size })
+                        }).collect();
+                        self.files_recursive_search_active = true;
+                        self.files_search_truncated = result.truncated;
+                        self.files_preview = None;
+                        self.files_multi_selected.clear();
+                        self.files_selected = None;
+                        self.status_message = if result.truncated {
+                            format!("Search for '{query}' reached a safety limit; showing the first {} matches.", self.files_entries.len())
+                        } else {
+                            format!("Search for '{query}' returned {} item(s).", self.files_entries.len())
+                        };
+                    }
+                    Err(error) => self.status_message = format!("Search failed: {error}"),
+                }
+            }
+            Some(None) => {
+                self.files_worker_receiver = None;
+                self.files_worker_busy = false;
+                self.status_message = "File worker stopped unexpectedly.".to_owned();
+            }
+            None if self.files_worker_busy => ctx.request_repaint_after(Duration::from_millis(100)),
+            None => {}
+        }
+    }
+
+    fn preview_selected_file(&mut self) {
+        let selected = self.selected_file_paths();
+        if selected.len() != 1 {
+            self.status_message = "Select exactly one file to preview.".to_owned();
+            return;
+        }
+        match file_ops::read_text_preview(&self.paths.user_dir, &selected[0]) {
+            Ok(text) => self.files_preview = Some((selected[0].clone(), text)),
+            Err(error) => {
+                self.files_preview = Some((selected[0].clone(), format!("Preview unavailable: {error}")));
+            }
+        }
+    }
+
+    fn start_network_scan(&mut self) {
+        if self.network_busy { return; }
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new().name("nova-wifi-scan".to_owned()).spawn(move || {
+            let result = wifi::scan_networks().map_err(|error| error.to_string());
+            let _ = sender.send(NetworkWorkerResult::Scan(result));
+        }) {
+            Ok(_) => {
+                self.network_worker_receiver = Some(receiver);
+                self.network_busy = true;
+                self.network_status = "Scanning nearby Wi-Fi networks…".to_owned();
+            }
+            Err(error) => self.network_status = format!("Could not start Wi-Fi scan: {error}"),
+        }
+    }
+
+    fn start_network_connect(&mut self) {
+        if self.network_busy { return; }
+        let Some(ssid) = self.network_selected_ssid.clone().filter(|ssid| !ssid.trim().is_empty()) else {
+            self.network_status = "Select a Wi-Fi network first.".to_owned();
+            return;
+        };
+        let password = std::mem::take(&mut self.network_password);
+        let password = if password.is_empty() { None } else { Some(password) };
+        let paths = self.paths.clone();
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new().name("nova-wifi-connect".to_owned()).spawn(move || {
+            let result = wifi::connect(&paths, &ssid, password.as_deref()).map_err(|error| error.to_string());
+            let _ = sender.send(NetworkWorkerResult::Connect(result));
+        }) {
+            Ok(_) => {
+                self.network_worker_receiver = Some(receiver);
+                self.network_busy = true;
+                self.network_status = format!("Connecting to '{ssid}'… The password is not saved in NOVA.");
+            }
+            Err(error) => self.network_status = format!("Could not start Wi-Fi connection: {error}"),
+        }
+    }
+
+    fn start_network_disconnect(&mut self) {
+        if self.network_busy { return; }
+        let (sender, receiver) = mpsc::channel();
+        match thread::Builder::new().name("nova-wifi-disconnect".to_owned()).spawn(move || {
+            let result = wifi::disconnect().map_err(|error| error.to_string());
+            let _ = sender.send(NetworkWorkerResult::Disconnect(result));
+        }) {
+            Ok(_) => {
+                self.network_worker_receiver = Some(receiver);
+                self.network_busy = true;
+                self.network_status = "Disconnecting from the current Wi-Fi network…".to_owned();
+            }
+            Err(error) => self.network_status = format!("Could not start disconnect: {error}"),
+        }
+    }
+
+    fn poll_network_worker(&mut self, ctx: &egui::Context) {
+        let received = match self.network_worker_receiver.as_ref() {
+            Some(receiver) => match receiver.try_recv() {
+                Ok(result) => Some(Some(result)),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(None),
+            },
+            None => None,
+        };
+        match received {
+            Some(Some(NetworkWorkerResult::Scan(result))) => {
+                self.network_worker_receiver = None;
+                self.network_busy = false;
+                match result {
+                    Ok(networks) => {
+                        self.network_networks = networks;
+                        if self.network_selected_ssid.as_ref().is_none_or(|ssid| !self.network_networks.contains(ssid)) {
+                            self.network_selected_ssid = self.network_networks.first().cloned();
+                        }
+                        self.network_status = format!("Found {} network(s). Select one to connect.", self.network_networks.len());
+                    }
+                    Err(error) => self.network_status = format!("Wi-Fi scan failed: {error}"),
+                }
+            }
+            Some(Some(NetworkWorkerResult::Connect(result))) => {
+                self.network_worker_receiver = None;
+                self.network_busy = false;
+                self.network_status = result.unwrap_or_else(|error| format!("Connection failed: {error}"));
+            }
+            Some(Some(NetworkWorkerResult::Disconnect(result))) => {
+                self.network_worker_receiver = None;
+                self.network_busy = false;
+                self.network_status = result.unwrap_or_else(|error| format!("Disconnect failed: {error}"));
+            }
+            Some(None) => {
+                self.network_worker_receiver = None;
+                self.network_busy = false;
+                self.network_status = "Wi-Fi worker stopped unexpectedly.".to_owned();
+            }
+            None if self.network_busy => ctx.request_repaint_after(Duration::from_millis(100)),
+            None => {}
+        }
     }
 
     fn refresh_trash(&mut self) {
@@ -734,6 +1522,7 @@ impl NovaApp {
 
         let snap = self.take_window_snap("Security Center", ctx);
         let mut window = egui::Window::new("NOVA Security Center")
+            .order(self.window_order("Security Center"))
             .open(&mut open)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
@@ -865,7 +1654,10 @@ impl NovaApp {
                         });
                     });
             });
-        if let Some(shown) = shown { self.window_rects.insert("Security Center".to_owned(), shown.response.rect); }
+        if let Some(shown) = shown {
+            self.window_rects.insert("Security Center".to_owned(), shown.response.rect);
+            if shown.response.hovered() { self.mark_window_active(ctx, "Security Center"); }
+        }
 
         self.security_open = open;
         if refresh_detection {
@@ -874,6 +1666,8 @@ impl NovaApp {
         }
         if let Some(tool) = selected_tool {
             self.security_tool_open[tool.index()] = true;
+            self.active_workspace = Some(tool.info().name.to_owned());
+            self.record_activity(format!("Opened {}", tool.info().name));
         }
         if clear_requested {
             self.security_confirm_clear_quarantine = true;
@@ -908,6 +1702,48 @@ impl NovaApp {
         }
     }
 
+    fn queue_security_tool_launch(&mut self, index: usize, tool: SecurityTool, allow_unsigned_zap: bool) -> Result<(), String> {
+        if self.security_launch_receiver.is_some() {
+            return Err("Another security-tool launch is already being verified. Wait for it to finish.".to_owned());
+        }
+        let app_dir = self.paths.app_dir.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.security_launch_receiver = Some(receiver);
+        self.security_launching[index] = true;
+        self.security_tool_status[index] = "Verifying Authenticode publisher and starting application…".to_owned();
+        // Dropping the handle detaches this bounded worker; its result is
+        // collected through the channel on the next repaint.
+        let _worker = thread::spawn(move || {
+            let result = tool.launch(&app_dir, allow_unsigned_zap).map_err(|error| error.to_string());
+            let _ = sender.send((index, result));
+        });
+        Ok(())
+    }
+
+    fn poll_security_tool_launch(&mut self) {
+        let Some(receiver) = self.security_launch_receiver.take() else { return; };
+        match receiver.try_recv() {
+            Ok((index, result)) => {
+                self.security_launching[index] = false;
+                let status = match result {
+                    Ok(path) => format!("Launched {} from {}", security_tools::TOOLS[index].name, path.display()),
+                    Err(error) => error,
+                };
+                self.security_tool_status[index] = status.clone();
+                self.status_message = status;
+            }
+            Err(TryRecvError::Empty) => self.security_launch_receiver = Some(receiver),
+            Err(TryRecvError::Disconnected) => {
+                for index in 0..self.security_launching.len() {
+                    if self.security_launching[index] {
+                        self.security_launching[index] = false;
+                        self.security_tool_status[index] = "Security-tool launch worker stopped before returning a result.".to_owned();
+                    }
+                }
+            }
+        }
+    }
+
     fn security_tool_window(&mut self, ctx: &egui::Context, tool: SecurityTool) {
         let index = tool.index();
         // Preserve lazy host detection until a security workspace has actually been opened.
@@ -924,6 +1760,7 @@ impl NovaApp {
 
         let snap = self.take_window_snap(info.name, ctx);
         let mut window = egui::Window::new(format!("NOVA · {}", info.name))
+            .order(self.window_order(info.name))
             .open(&mut open)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
@@ -938,6 +1775,15 @@ impl NovaApp {
                 ui.label(if self.security_scope.trim().is_empty() { "No target scope configured in Security Center.".to_owned() } else { self.security_scope.clone() });
                 if !scope_ready {
                     ui.colored_label(Color32::from_rgb(225, 166, 86), "Return to Security Center, enter the authorized scope and confirm permission before launching this tool.");
+                }
+
+                if tool == SecurityTool::WebSecurity {
+                    ui.separator();
+                    ui.colored_label(Color32::from_rgb(225, 166, 86), "OWASP ZAP's official Windows releases are currently unsigned. NOVA requires a per-session acknowledgement before launching an unsigned copy.");
+                    ui.checkbox(
+                        &mut self.security_unsigned_zap_acknowledged,
+                        "I obtained this ZAP copy from the official OWASP ZAP project and accept launching an unsigned executable for this session.",
+                    );
                 }
 
                 if tool == SecurityTool::VulnerabilityManagement {
@@ -955,7 +1801,13 @@ impl NovaApp {
                         ui.colored_label(Color32::from_rgb(225, 166, 86), "Application not detected on this PC or NOVA USB.");
                         ui.label("Install the official application first. NOVA does not download or silently install third-party scanner binaries.");
                     }
-                    if ui.add_enabled(scope_ready && detected.is_some(), egui::Button::new(format!("Launch {}", info.executable))).clicked() {
+                    let launch_available = self.security_launch_receiver.is_none();
+                    let launch_label = if self.security_launching[index] {
+                        format!("Verifying {}…", info.executable)
+                    } else {
+                        format!("Launch {}", info.executable)
+                    };
+                    if ui.add_enabled(scope_ready && detected.is_some() && launch_available, egui::Button::new(launch_label)).clicked() {
                         launch_requested = true;
                     }
                 }
@@ -969,7 +1821,10 @@ impl NovaApp {
                 ui.separator();
                 ui.label(RichText::new("Safety: these third-party apps run on the Windows host, not inside Windows Sandbox. The scope acknowledgement is a reminder, not an enforced network boundary. Use only approved assets; start with passive or non-invasive features and use active testing only with explicit authorization.").small().weak());
             });
-        if let Some(shown) = shown { self.window_rects.insert(info.name.to_owned(), shown.response.rect); }
+        if let Some(shown) = shown {
+            self.window_rects.insert(info.name.to_owned(), shown.response.rect);
+            if shown.response.hovered() { self.mark_window_active(ctx, info.name); }
+        }
 
         self.security_tool_open[index] = open;
         if launch_requested {
@@ -981,9 +1836,9 @@ impl NovaApp {
                     Err(error) => status = format!("Could not open Greenbone console: {error}"),
                 }
             } else {
-                match tool.launch(&self.paths.app_dir) {
-                    Ok(path) => status = format!("Launched {} from {}", info.name, path.display()),
-                    Err(error) => status = error.to_string(),
+                match self.queue_security_tool_launch(index, tool, self.security_unsigned_zap_acknowledged) {
+                    Ok(()) => status = "Verifying Authenticode publisher and starting application…".to_owned(),
+                    Err(error) => status = error,
                 }
             }
             self.status_message = status.clone();
@@ -1002,6 +1857,7 @@ impl NovaApp {
         let mut stop_requested = false;
         let snap = self.take_window_snap("UniKey", ctx);
         let mut window = egui::Window::new("UniKey — Vietnamese Input")
+            .order(self.window_order("UniKey"))
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
             .resizable(false)
@@ -1037,9 +1893,70 @@ impl NovaApp {
                 ui.label("4. Keep UniKey running while typing. UniKey is a separate Windows-host process, not part of NOVA or Windows Sandbox. Closing NOVA stops the UniKey process that NOVA started when it can do so cleanly.");
                 ui.label(RichText::new("Official source: unikey.org · Publisher must be PHAM KIM LONG · NOVA verifies Authenticode before launch · No Windows service or startup task is installed.").small().weak());
             });
-        if let Some(shown) = shown { self.window_rects.insert("UniKey".to_owned(), shown.response.rect); }
+        if let Some(shown) = shown {
+            self.window_rects.insert("UniKey".to_owned(), shown.response.rect);
+            if shown.response.hovered() { self.mark_window_active(ctx, "UniKey"); }
+        }
         // Defer whole-self methods until egui releases the `.open(&mut self.unikey_open)` borrow.
         if stop_requested { self.stop_unikey(); }
+    }
+
+    fn catalog_app_button(&mut self, ui: &mut egui::Ui, app: StartApp, width: f32, height: f32) -> bool {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(width.max(1.0), height.max(1.0)), egui::Sense::click());
+        let dark = self.is_dark_mode(ui.ctx());
+        let accent = app_icon_colors(app.name).0;
+        let fill = if response.hovered() {
+            if dark { Color32::from_rgb(42, 54, 78) } else { Color32::from_rgb(231, 239, 251) }
+        } else if dark { Color32::from_rgb(31, 40, 60) } else { Color32::from_rgb(247, 249, 253) };
+        ui.painter().rect_filled(rect, egui::CornerRadius::same(10), fill);
+        ui.painter().rect_stroke(rect, egui::CornerRadius::same(10), egui::Stroke::new(1.0, if dark { Color32::from_white_alpha(18) } else { Color32::from_black_alpha(17) }), egui::StrokeKind::Inside);
+        let icon_size = (height - 12.0).clamp(22.0, 32.0);
+        paint_vector_app_icon(ui.painter(), egui::pos2(rect.left() + 22.0, rect.center().y), app.name, icon_size, dark);
+        let text_x = rect.left() + 42.0;
+        ui.painter().text(egui::pos2(text_x, rect.center().y - 5.0), egui::Align2::LEFT_CENTER, app.name, FontId::proportional(12.0), if dark { Color32::from_rgb(239, 244, 253) } else { Color32::from_rgb(35, 47, 67) });
+        if height >= 46.0 {
+            ui.painter().text(egui::pos2(text_x, rect.center().y + 11.0), egui::Align2::LEFT_CENTER, app.description, FontId::proportional(9.0), if dark { Color32::from_rgb(165, 180, 205) } else { Color32::from_rgb(92, 106, 128) });
+        }
+        let mut pins_changed = false;
+        response.context_menu(|ui| {
+            let is_pinned = self.settings.pinned_apps.iter().any(|name| name == app.name);
+            if is_pinned {
+                if ui.button("Unpin from Start").clicked() {
+                    self.settings.pinned_apps.retain(|name| name != app.name);
+                    pins_changed = true;
+                    ui.close();
+                }
+                ui.menu_button("Reorder Start pin", |ui| {
+                    let index = self.settings.pinned_apps.iter().position(|name| name == app.name);
+                    if ui.add_enabled(index.is_some_and(|index| index > 0), egui::Button::new("Move earlier")).clicked() {
+                        pins_changed |= move_pinned_app(&mut self.settings.pinned_apps, app.name, -1);
+                        ui.close();
+                    }
+                    if ui.add_enabled(index.is_some_and(|index| index + 1 < self.settings.pinned_apps.len()), egui::Button::new("Move later")).clicked() {
+                        pins_changed |= move_pinned_app(&mut self.settings.pinned_apps, app.name, 1);
+                        ui.close();
+                    }
+                });
+            } else if ui.button("Pin to Start").clicked() {
+                self.settings.pinned_apps.push(app.name.to_owned());
+                pins_changed = true;
+                ui.close();
+            }
+            if self.app_is_open(app.name) && ui.button("Minimize to taskbar").clicked() {
+                self.minimize_app(app.name);
+                ui.close();
+            } else if !self.app_is_open(app.name) && ui.button("Restore / Open").clicked() {
+                self.open_app(app.name);
+                ui.close();
+            }
+        });
+        if pins_changed {
+            self.status_message = match self.paths.save_settings(&self.settings) {
+                Ok(()) => format!("Start pins updated: {}", app.name),
+                Err(error) => format!("Start pins changed but could not be saved: {error}"),
+            };
+        }
+        response.on_hover_text(RichText::new(format!("{} · {}", app.name, app.category)).color(accent)).clicked()
     }
 
     /// Paint a compact Windows-style desktop/Start shortcut using the shared app catalog.
@@ -1082,26 +1999,9 @@ impl NovaApp {
                 egui::StrokeKind::Inside,
             );
         }
-        let icon_size: f32 = if desktop { 31.0 } else { 27.0 };
+        let icon_size: f32 = if desktop { 43.0 } else { 36.0 };
+        paint_vector_app_icon(ui.painter(), egui::pos2(rect.center().x, rect.top() + if desktop { 29.0 } else { 25.0 }), app.name, icon_size, dark);
         let text_color = if dark { Color32::from_rgb(238, 243, 252) } else { Color32::from_rgb(35, 45, 63) };
-        let icon_color = if dark { Color32::from_rgb(225, 234, 252) } else { Color32::from_rgb(45, 66, 100) };
-        let cache_key = (app.icon, icon_size.to_bits(), ui.ctx().pixels_per_point().to_bits(), dark);
-        let icon_galley = if let Some(cached) = self.icon_galleys.get(&cache_key) {
-            std::sync::Arc::clone(cached)
-        } else {
-            let galley = ui.painter().layout_no_wrap(
-                app.icon.to_owned(),
-                FontId::proportional(icon_size),
-                icon_color,
-            );
-            self.icon_galleys.insert(cache_key, std::sync::Arc::clone(&galley));
-            galley
-        };
-        ui.painter().galley(
-            egui::pos2(rect.center().x - icon_galley.size().x * 0.5, rect.top() + if desktop { 8.0 } else { 7.0 }),
-            icon_galley,
-            icon_color,
-        );
         ui.painter().text(
             egui::pos2(rect.center().x, rect.bottom() - 7.0),
             egui::Align2::CENTER_BOTTOM,
@@ -1123,9 +2023,31 @@ impl NovaApp {
                     pins_changed = true;
                     ui.close();
                 }
+                ui.menu_button("Reorder Start pin", |ui| {
+                    if ui.add_enabled(self.settings.pinned_apps.first().map(String::as_str) != Some(app.name), egui::Button::new("Move earlier")).clicked() {
+                        pins_changed |= move_pinned_app(&mut self.settings.pinned_apps, app.name, -1);
+                        ui.close();
+                    }
+                    if ui.add_enabled(self.settings.pinned_apps.last().map(String::as_str) != Some(app.name), egui::Button::new("Move later")).clicked() {
+                        pins_changed |= move_pinned_app(&mut self.settings.pinned_apps, app.name, 1);
+                        ui.close();
+                    }
+                });
             } else if ui.button("Pin to Start").clicked() {
                 self.settings.pinned_apps.push(app.name.to_owned());
                 pins_changed = true;
+                ui.close();
+            }
+            if self.app_is_open(app.name) && ui.button("Minimize to taskbar").clicked() {
+                self.minimize_app(app.name);
+                ui.close();
+            }
+            if !self.app_is_open(app.name) && ui.button("Restore / Open").clicked() {
+                self.open_app(app.name);
+                ui.close();
+            }
+            if (self.app_is_open(app.name) || self.minimized_apps.contains(app.name)) && ui.button("Close app").clicked() {
+                self.close_app(app.name);
                 ui.close();
             }
             ui.separator();
@@ -1143,11 +2065,21 @@ impl NovaApp {
     fn take_window_snap(&mut self, app: &str, ctx: &egui::Context) -> Option<(egui::Pos2, egui::Vec2)> {
         if let Some(side) = self.window_snap_requests.remove(app) {
             let content = ctx.content_rect();
-            // Reserve the bottom dock and a small safety margin so snapped windows
-            // never cover the taskbar or sit directly against the viewport edge.
-            // Respect the real viewport instead of forcing a desktop-sized snap
-            // rectangle on smaller windows. The old 460/220 px minimums could
-            // push snapped apps beyond the visible work area.
+            if side == SnapSide::Restore {
+                let previous = self.window_restore_rects.remove(app)?;
+                let current = self.window_rects.get(app).copied().unwrap_or(previous);
+                if self.settings.reduce_motion {
+                    self.window_motions.remove(app);
+                    return Some((previous.min, previous.size()));
+                }
+                self.window_motions.insert(app.to_owned(), WindowMotion {
+                    from_pos: current.min,
+                    from_size: current.size(),
+                    to_pos: previous.min,
+                    to_size: previous.size(),
+                    started: Instant::now(),
+                });
+            } else {
             let work = egui::Rect::from_min_max(
                 content.min + egui::vec2(10.0, 10.0),
                 content.max - egui::vec2(10.0, 76.0),
@@ -1158,14 +2090,11 @@ impl NovaApp {
                 SnapSide::Left => (work.left(), half_width),
                 SnapSide::Right => (work.right() - half_width, half_width),
                 SnapSide::Maximize => (work.left(), work_width),
+                SnapSide::Restore => unreachable!(),
             };
             let height = work.height().max(1.0);
             let to_pos = egui::pos2(x, work.top());
             let to_size = egui::vec2(width, height);
-            if self.settings.reduce_motion {
-                self.window_motions.remove(app);
-                return Some((to_pos, to_size));
-            }
             let current_rect = self.window_rects.get(app).copied().unwrap_or_else(|| {
                 let fallback_size = egui::vec2(
                     (width * 0.84).max(320.0).min(width),
@@ -1173,18 +2102,23 @@ impl NovaApp {
                 );
                 egui::Rect::from_center_size(content.center(), fallback_size)
             });
+            self.window_restore_rects.entry(app.to_owned()).or_insert(current_rect);
+            if self.settings.reduce_motion {
+                self.window_motions.remove(app);
+                return Some((to_pos, to_size));
+            }
             let from_size = egui::vec2(
                 current_rect.width().clamp(220.0, content.width().max(220.0)),
                 current_rect.height().clamp(220.0, content.height().max(220.0)),
             );
-            let from_pos = current_rect.min;
             self.window_motions.insert(app.to_owned(), WindowMotion {
-                from_pos,
+                from_pos: current_rect.min,
                 from_size,
                 to_pos,
                 to_size,
                 started: Instant::now(),
             });
+            }
         }
 
         let motion = self.window_motions.get(app).copied()?;
@@ -1204,8 +2138,9 @@ impl NovaApp {
     fn taskbar_app_button(
         &mut self,
         ui: &mut egui::Ui,
-        glyph: &str,
+        _glyph: &str,
         name: &str,
+        is_open: bool,
         active: bool,
         dark: bool,
     ) -> bool {
@@ -1239,13 +2174,12 @@ impl NovaApp {
                 egui::StrokeKind::Inside,
             );
         }
-        let icon_color = if dark { Color32::from_rgb(235, 241, 252) } else { Color32::from_rgb(35, 49, 71) };
-        ui.painter().text(
-            rect.center() + egui::vec2(0.0, -hover * 1.6),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            FontId::proportional(20.0 + hover * 1.0),
-            icon_color,
+        paint_vector_app_icon(
+            ui.painter(),
+            rect.center() + egui::vec2(0.0, -hover * 1.4),
+            name,
+            27.0 + hover * 1.0,
+            dark,
         );
         if active {
             let marker_width = 15.0 + hover * 5.0;
@@ -1255,10 +2189,34 @@ impl NovaApp {
             );
             let accent = ui.style().visuals.selection.bg_fill;
             ui.painter().rect_filled(marker, egui::CornerRadius::same(2), accent);
+        } else if is_open {
+            let marker = egui::Rect::from_center_size(
+                egui::pos2(rect.center().x, rect.bottom() - 2.2),
+                egui::vec2(7.0, 2.0),
+            );
+            ui.painter().rect_filled(marker, egui::CornerRadius::same(1), if dark { Color32::from_rgb(145, 159, 184) } else { Color32::from_rgb(115, 130, 154) });
+        } else if self.minimized_apps.contains(name) {
+            ui.painter().circle_filled(egui::pos2(rect.center().x, rect.bottom() - 2.2), 2.0, if dark { Color32::from_rgb(167, 181, 205) } else { Color32::from_rgb(111, 128, 153) });
         }
         if name != "Google Chrome" {
             response.context_menu(|ui| {
-                ui.label(RichText::new(format!("Arrange {name}")).small().weak());
+                ui.label(RichText::new(name).strong());
+                let is_open = self.app_is_open(name);
+                if is_open {
+                    if ui.button("Minimize").clicked() { self.minimize_app(name); ui.close(); }
+                    if ui.button("Close window").clicked() { self.close_app(name); ui.close(); }
+                } else {
+                    if ui.button("Restore / Open").clicked() {
+                        self.open_app(name);
+                        ui.close();
+                    }
+                    if self.minimized_apps.contains(name) && ui.button("Close app").clicked() {
+                        self.close_app(name);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                ui.label(RichText::new("Arrange window").small().weak());
                 if ui.button("Snap to left half").clicked() {
                     self.open_app(name);
                     self.window_snap_requests.insert(name.to_owned(), SnapSide::Left);
@@ -1269,9 +2227,14 @@ impl NovaApp {
                     self.window_snap_requests.insert(name.to_owned(), SnapSide::Right);
                     ui.close();
                 }
-                if ui.button("Fill desktop").clicked() {
+                if ui.button("Maximize / Fill desktop").clicked() {
                     self.open_app(name);
                     self.window_snap_requests.insert(name.to_owned(), SnapSide::Maximize);
+                    ui.close();
+                }
+                if self.window_restore_rects.contains_key(name) && ui.button("Restore previous size").clicked() {
+                    self.open_app(name);
+                    self.window_snap_requests.insert(name.to_owned(), SnapSide::Restore);
                     ui.close();
                 }
             });
@@ -1315,7 +2278,7 @@ impl NovaApp {
                                     .min_size(egui::vec2(logo_width, 38.0))
                                     .corner_radius(egui::CornerRadius::same(12));
                                 if ui.add_sized([logo_width, 38.0], logo).on_hover_text("NOVA desktop workspace · Open Settings").clicked() {
-                                    self.settings_open = true;
+                                    self.open_app("Settings");
                                 }
                             }
                         },
@@ -1326,21 +2289,26 @@ impl NovaApp {
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            let mut task_apps: Vec<(&'static str, &'static str, bool)> = self.settings.pinned_apps
+                            let mut task_apps: Vec<(&'static str, &'static str, bool, bool)> = self.settings.pinned_apps
                                 .iter()
                                 .filter_map(|name| START_APPS.iter().find(|app| app.name == name.as_str()))
-                                .map(|app| (app.icon, app.name, self.app_is_open(app.name)))
+                                .map(|app| {
+                                    let is_open = self.app_is_open(app.name);
+                                    (app.icon, app.name, is_open, workspace_is_active(self.active_workspace.as_deref(), app.name, is_open))
+                                })
                                 .collect();
                             for app in &START_APPS {
-                                if self.app_is_open(app.name)
-                                    && !task_apps.iter().any(|(_, name, _)| *name == app.name)
+                                if (self.app_is_open(app.name) || self.minimized_apps.contains(app.name))
+                                    && !task_apps.iter().any(|(_, name, _, _)| *name == app.name)
                                 {
-                                    task_apps.push((app.icon, app.name, true));
+                                    let is_open = self.app_is_open(app.name);
+                                    task_apps.push((app.icon, app.name, is_open, workspace_is_active(self.active_workspace.as_deref(), app.name, is_open)));
                                 }
                             }
                             let show_search = center_width >= 520.0;
                             let search_width = if show_search { 88.0 } else { 0.0 };
-                            let estimated = 40.0 + search_width + if show_search { 8.0 } else { 4.0 }
+                            let task_view_width = if center_width >= 112.0 { 38.0 } else { 0.0 };
+                            let estimated = 40.0 + task_view_width + search_width + if show_search { 12.0 } else { 8.0 }
                                 + task_apps.len() as f32 * 40.0
                                 + task_apps.len().saturating_sub(1) as f32 * 4.0;
                             ui.add_space(((center_width - estimated).max(0.0)) * 0.5);
@@ -1356,6 +2324,16 @@ impl NovaApp {
                                     self.start_open = !self.start_open;
                                     self.start_show_all = false;
                                     self.notification_open = false;
+                                    self.task_view_open = false;
+                                }
+                            }
+                            if center_width >= 112.0 {
+                                if ui.add_sized([34.0, 36.0], egui::Button::new(RichText::new("▣").size(17.0))
+                                    .corner_radius(egui::CornerRadius::same(10)))
+                                    .on_hover_text("Task View · Switch open windows").clicked() {
+                                    self.task_view_open = !self.task_view_open;
+                                    self.start_open = false;
+                                    self.notification_open = false;
                                 }
                             }
                             if show_search && ui.add_sized(
@@ -1366,6 +2344,7 @@ impl NovaApp {
                                 self.start_open = true;
                                 self.start_show_all = false;
                                 self.notification_open = false;
+                                self.task_view_open = false;
                             }
                             ui.add_space(4.0);
                             egui::ScrollArea::horizontal()
@@ -1375,8 +2354,8 @@ impl NovaApp {
                                 .auto_shrink([false, true])
                                 .show(ui, |ui| {
                                     ui.horizontal_centered(|ui| {
-                                        for (glyph, name, active) in task_apps {
-                                            if self.taskbar_app_button(ui, glyph, name, active, dark) {
+                                        for (glyph, name, is_open, active) in task_apps {
+                                            if self.taskbar_app_button(ui, glyph, name, is_open, active, dark) {
                                                 self.toggle_app(name);
                                             }
                                         }
@@ -1395,6 +2374,7 @@ impl NovaApp {
                                     .on_hover_text("Quick Settings and recent activity").clicked() {
                                 self.notification_open = !self.notification_open;
                                 self.start_open = false;
+                                self.task_view_open = false;
                             }
                             if !ultra_compact {
                                 let (clock, date) = local_clock_strings();
@@ -1407,13 +2387,13 @@ impl NovaApp {
                                     },
                                 );
                                 if !medium && ui.add_sized([30.0, 36.0], egui::Button::new("◉").corner_radius(egui::CornerRadius::same(10)))
-                                    .on_hover_text("System Monitor").clicked() {
-                                    self.monitor_open = true;
+                                    .on_hover_text("Hardware Center").clicked() {
+                                    self.open_app("Monitor");
                                 }
                                 if ui.add_sized([30.0, 36.0], egui::Button::new("⌁").corner_radius(egui::CornerRadius::same(10)))
                                     .on_hover_text("Network settings").clicked() {
                                     self.settings_page = 3;
-                                    self.settings_open = true;
+                                    self.open_app("Settings");
                                 }
                             }
                         },
@@ -1488,17 +2468,30 @@ impl NovaApp {
                             }
                         });
                         ui.horizontal_wrapped(|ui| {
-                            if ui.button("⌁ Network").clicked() { self.settings_page = 3; self.settings_open = true; self.notification_open = false; }
-                            if ui.button("⚙ Settings").clicked() { self.settings_open = true; self.notification_open = false; }
+                            if ui.button("⌁ Network").clicked() { self.settings_page = 3; self.open_app("Settings"); }
+                            if ui.button("⚙ Settings").clicked() { self.open_app("Settings"); }
                         });
                         ui.horizontal_wrapped(|ui| {
-                            if ui.button("◉ Monitor").clicked() { self.monitor_open = true; self.notification_open = false; }
-                            if ui.button("▦ Files").clicked() { self.files_open = true; self.ensure_files_loaded(); self.notification_open = false; }
-                            if ui.button("⌘ Terminal").clicked() { self.terminal_open = true; self.notification_open = false; }
+                            if ui.button("◉ Monitor").clicked() { self.open_app("Monitor"); }
+                            if ui.button("▦ Files").clicked() { self.open_app("Files"); }
+                            if ui.button("⌘ Terminal").clicked() { self.open_app("Terminal"); }
                         });
                         ui.separator();
-                        ui.label(RichText::new("Recent activity").strong());
-                        ui.label(RichText::new(&self.status_message).small().weak());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Recent activity").strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("Clear").clicked() { self.activity_log.clear(); }
+                            });
+                        });
+                        egui::ScrollArea::vertical().max_height(128.0).auto_shrink([false, true]).show(ui, |ui| {
+                            if self.activity_log.is_empty() {
+                                ui.label(RichText::new("No recent activity yet.").small().weak());
+                            } else {
+                                for event in &self.activity_log {
+                                    ui.label(RichText::new(event).small().weak());
+                                }
+                            }
+                        });
                         ui.add_space(5.0);
                         ui.label(RichText::new("Shortcuts: Ctrl+Space · Ctrl+E · Ctrl+Shift+Esc").small().weak());
                     });
@@ -1595,8 +2588,7 @@ impl NovaApp {
                                         .spacing(egui::vec2(gap, 5.0))
                                         .show(ui, |ui| {
                                             for (index, app) in items.iter().enumerate() {
-                                                let label = format!("{}   {}\n       {}", app.icon, app.name, app.description);
-                                                if ui.add_sized([button_width, 47.0], egui::Button::new(RichText::new(label).size(12.0)).corner_radius(egui::CornerRadius::same(9))).clicked() {
+                                                if self.catalog_app_button(ui, *app, button_width, 47.0) {
                                                     selected_app = Some(app.name);
                                                 }
                                                 if (index + 1) % columns == 0 { ui.end_row(); }
@@ -1667,11 +2659,7 @@ impl NovaApp {
                                     .show(ui, |ui| {
                                         for (index, name) in quick.iter().enumerate() {
                                             if let Some(app) = START_APPS.iter().find(|app| app.name == *name).copied() {
-                                                if ui.add_sized(
-                                                    [quick_button_width, 43.0],
-                                                    egui::Button::new(format!("{}  {}\n      {}", app.icon, app.name, app.description))
-                                                        .corner_radius(egui::CornerRadius::same(9)),
-                                                ).clicked() {
+                                                if self.catalog_app_button(ui, app, quick_button_width, 43.0) {
                                                     selected_app = Some(app.name);
                                                 }
                                             }
@@ -1697,6 +2685,41 @@ impl NovaApp {
         if show_all { self.start_show_all = true; }
         if show_pinned { self.start_show_all = false; }
         if let Some(app) = selected_app { self.open_app(app); }
+    }
+
+    fn desktop_shortcuts(&mut self, ctx: &egui::Context, desktop: egui::Rect) {
+        let columns = ((desktop.width() / 108.0).floor() as usize).clamp(1, 7);
+        for (index, name) in DESKTOP_SHORTCUTS.iter().enumerate() {
+            let Some(app) = START_APPS.iter().find(|app| app.name == *name).copied() else { continue; };
+            let (travel_x, travel_y) = desktop_shortcut_travel(desktop);
+            let pos = if let Some(normalized) = self.settings.desktop_icon_positions.get(*name) {
+                egui::pos2(
+                    desktop.left() + 12.0 + normalized[0] * travel_x,
+                    desktop.top() + 58.0 + normalized[1] * travel_y,
+                )
+            } else {
+                desktop_default_position(index, desktop, columns)
+            };
+            let output = egui::Area::new(egui::Id::new(("nova-desktop-icon", *name)))
+                .order(egui::Order::Middle)
+                .default_pos(pos)
+                .movable(true)
+                .constrain_to(desktop.shrink2(egui::vec2(4.0, 4.0)))
+                .show(ctx, |ui| self.app_icon_button(ui, app, egui::vec2(94.0, 88.0), true));
+            if output.inner { self.open_app(app.name); }
+            if output.response.drag_stopped() {
+                let actual = output.response.rect.min;
+                let normalized = [
+                    ((actual.x - desktop.left() - 12.0) / travel_x).clamp(0.0, 1.0),
+                    ((actual.y - desktop.top() - 58.0) / travel_y).clamp(0.0, 1.0),
+                ];
+                self.settings.desktop_icon_positions.insert((*name).to_owned(), normalized);
+                self.status_message = match self.paths.save_settings(&self.settings) {
+                    Ok(()) => format!("Desktop shortcut position saved: {name}."),
+                    Err(error) => format!("Shortcut moved but its position could not be saved: {error}"),
+                };
+            }
+        }
     }
 
     fn start_terminal_task(&mut self, task: TerminalTask) {
@@ -1755,6 +2778,7 @@ impl NovaApp {
         let mut clear_output = false;
         let snap = self.take_window_snap("Terminal", ctx);
         let mut window = egui::Window::new("NOVA Terminal — Windows CMD")
+            .order(self.window_order("Terminal"))
             .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
@@ -1809,7 +2833,10 @@ impl NovaApp {
                 });
                 ui.label(RichText::new("CMD runs on the Windows host with your account permissions. It is NOT isolated; never run unknown commands here.").small().weak());
             });
-        if let Some(shown) = shown { self.window_rects.insert("Terminal".to_owned(), shown.response.rect); }
+        if let Some(shown) = shown {
+            self.window_rects.insert("Terminal".to_owned(), shown.response.rect);
+            if shown.response.hovered() { self.mark_window_active(ctx, "Terminal"); }
+        }
         if clear_output { self.terminal.clear(); }
         if submit && !self.terminal_busy {
             let line = std::mem::take(&mut self.terminal.input);
@@ -1822,176 +2849,343 @@ impl NovaApp {
     }
 
     fn files_window(&mut self, ctx: &egui::Context) {
+        self.poll_files_worker(ctx);
+
+        // File shortcuts only run when a text field is not consuming keyboard input.
+        let (ctrl_a, ctrl_c, ctrl_x, ctrl_v, rename_key, delete_key, escape_key) = ctx.input(|input| (
+            input.modifiers.ctrl && input.key_pressed(egui::Key::A),
+            input.modifiers.ctrl && input.key_pressed(egui::Key::C),
+            input.modifiers.ctrl && input.key_pressed(egui::Key::X),
+            input.modifiers.ctrl && input.key_pressed(egui::Key::V),
+            input.key_pressed(egui::Key::F2),
+            input.key_pressed(egui::Key::Delete),
+            input.key_pressed(egui::Key::Escape),
+        ));
+        if self.files_open && !ctx.wants_keyboard_input() {
+            if ctrl_a {
+                self.files_multi_selected = self.visible_file_paths().into_iter().collect();
+                self.files_selected = self.files_multi_selected.iter().next().cloned();
+            } else if ctrl_c || ctrl_x {
+                let selected = self.selected_file_paths();
+                if !selected.is_empty() {
+                    self.files_clipboard = selected;
+                    self.files_clipboard_cut = ctrl_x;
+                    self.status_message = if ctrl_x { "Cut selection. Choose a destination folder and press Ctrl+V." } else { "Copied selection. Choose a destination folder and press Ctrl+V." }.to_owned();
+                }
+            } else if ctrl_v && !self.files_clipboard.is_empty() && !self.files_worker_busy {
+                self.start_files_operation(self.files_clipboard.clone(), self.files_clipboard_cut);
+            } else if rename_key && self.selected_file_paths().len() == 1 {
+                let path = self.selected_file_paths()[0].clone();
+                self.files_rename_input = path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+                self.files_rename_target = Some(path);
+            } else if delete_key && !self.selected_file_paths().is_empty() && !self.files_worker_busy {
+                let paths = top_level_selected_paths(self.selected_file_paths());
+                self.trash_selected_files(paths);
+            } else if escape_key {
+                if self.files_preview.is_some() {
+                    self.files_preview = None;
+                } else {
+                    self.files_multi_selected.clear();
+                    self.files_selected = None;
+                }
+            }
+        }
+
         let mut navigate_to: Option<PathBuf> = None;
         let mut open_file: Option<PathBuf> = None;
         let mut create_folder = false;
-        let mut move_to_trash: Option<PathBuf> = None;
-        let mut sandbox_sample: Option<PathBuf> = None;
         let mut refresh = false;
+        let mut copy_cut_action: Option<(Vec<PathBuf>, bool)> = None;
+        let mut paste_action = false;
+        let mut preview_action = false;
+        let mut rename_action: Option<PathBuf> = None;
+        let mut trash_action: Option<Vec<PathBuf>> = None;
+        let mut sandbox_sample: Option<PathBuf> = None;
+        let mut search_workspace = false;
+        let mut clear_preview = false;
+        let mut clear_search = false;
+        let mut select_all = false;
+        let mut clear_selection = false;
+        let selected_paths = self.selected_file_paths();
+        let selected_count = selected_paths.len();
         let snap = self.take_window_snap("Files", ctx);
         let mut window = egui::Window::new("▦  NOVA Files")
+            .order(self.window_order("Files"))
             .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
-            .default_size([760.0, 520.0]);
+            .default_size([840.0, 570.0]);
         if let Some((position, size)) = snap {
             window = window.current_pos(position).fixed_size(size);
         } else {
-            window = window.min_width(220.0);
+            window = window.min_width(300.0);
         }
         let shown = window.open(&mut self.files_open).show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("↑  Up").clicked() && self.files_dir != self.paths.user_dir {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("↑  Up").clicked() {
+                    if self.files_recursive_search_active {
+                        clear_search = true;
+                    } else if self.files_dir != self.paths.user_dir {
                         navigate_to = self.files_dir.parent().map(Path::to_path_buf);
                     }
-                    if ui.button("↻  Refresh").clicked() { refresh = true; }
-                    ui.separator();
+                }
+                if ui.button("↻  Refresh").clicked() { refresh = true; }
+                ui.separator();
+                if self.files_recursive_search_active {
+                    ui.label(RichText::new(format!("Search results  /  {}", self.files_search)).strong());
+                } else {
                     let relative = self.files_dir.strip_prefix(&self.paths.user_dir).unwrap_or(Path::new("."));
                     ui.label(RichText::new(format!("Home  /  {}", relative.display())).weak());
-                });
-                ui.separator();
-                let toolbar_width = ui.available_width();
-                let folder_input_width = (toolbar_width * 0.30).clamp(96.0, 170.0);
-                let filter_input_width = (toolbar_width * 0.26).clamp(96.0, 150.0);
-                ui.horizontal_wrapped(|ui| {
+                }
+                if self.files_worker_busy {
+                    ui.spinner();
+                    ui.label(RichText::new("Working…").small().weak());
+                }
+            });
+            ui.separator();
+            let toolbar_width = ui.available_width();
+            let folder_input_width = (toolbar_width * 0.26).clamp(100.0, 170.0);
+            let filter_input_width = (toolbar_width * 0.27).clamp(110.0, 190.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.add_enabled_ui(!self.files_worker_busy && !self.files_recursive_search_active, |ui| {
                     ui.add(TextEdit::singleline(&mut self.files_new_folder).hint_text("New folder name").desired_width(folder_input_width));
                     if ui.button("＋ New folder").clicked() { create_folder = true; }
-                    ui.separator();
-                    ui.add(TextEdit::singleline(&mut self.files_search).hint_text("Filter this folder…").desired_width(filter_input_width));
-                    ui.selectable_value(&mut self.files_grid_view, false, "☷ List");
-                    ui.selectable_value(&mut self.files_grid_view, true, "▦ Grid");
                 });
-                if self.files_selected.is_some() {
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Open selected").clicked() {
-                            if let Some(selected) = self.files_selected.as_ref() {
-                                if selected.is_dir() { navigate_to = Some(selected.clone()); }
-                                else { open_file = Some(selected.clone()); }
-                            }
+                ui.separator();
+                let search_response = ui.add_enabled(!self.files_worker_busy, TextEdit::singleline(&mut self.files_search)
+                    .hint_text("Find files in this folder…")
+                    .desired_width(filter_input_width));
+                if ui.add_enabled(!self.files_worker_busy, egui::Button::new("Search workspace")).clicked()
+                    || (!self.files_worker_busy && search_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))) {
+                    search_workspace = true;
+                }
+                if self.files_recursive_search_active && ui.button("Clear search").clicked() { clear_search = true; }
+                ui.selectable_value(&mut self.files_grid_view, false, "☷ List");
+                ui.selectable_value(&mut self.files_grid_view, true, "▦ Grid");
+            });
+            if selected_count > 0 || !self.files_clipboard.is_empty() || !self.files_entries.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    if selected_count > 0 {
+                        ui.label(RichText::new(format!("{selected_count} selected")).strong());
+                        if ui.add_enabled(selected_count == 1, egui::Button::new("Open")).clicked() {
+                            let selected = &selected_paths[0];
+                            if selected.is_dir() { navigate_to = Some(selected.clone()); } else { open_file = Some(selected.clone()); }
                         }
-                        if ui.button("Move to Trash").clicked() { move_to_trash = self.files_selected.clone(); }
-                        if self.files_selected.as_ref().is_some_and(|path| path.is_file()) && ui.button("Inspect in Sandbox").clicked() {
-                            sandbox_sample = self.files_selected.clone();
+                        if ui.add_enabled(selected_count == 1 && selected_paths[0].is_file(), egui::Button::new("Preview")).clicked() { preview_action = true; }
+                        if ui.add_enabled(!self.files_worker_busy, egui::Button::new("Copy")).clicked() { copy_cut_action = Some((selected_paths.clone(), false)); }
+                        if ui.add_enabled(!self.files_worker_busy, egui::Button::new("Cut")).clicked() { copy_cut_action = Some((selected_paths.clone(), true)); }
+                        if ui.add_enabled(selected_count == 1 && !self.files_worker_busy, egui::Button::new("Rename")).clicked() { rename_action = Some(selected_paths[0].clone()); }
+                        if ui.add_enabled(selected_count == 1 && selected_paths[0].is_file(), egui::Button::new("Inspect in Sandbox")).clicked() { sandbox_sample = Some(selected_paths[0].clone()); }
+                        if ui.add_enabled(!self.files_worker_busy, egui::Button::new("Move to Trash")).clicked() { trash_action = Some(selected_paths.clone()); }
+                        if ui.button("Clear selection").clicked() { clear_selection = true; }
+                    }
+                    if !self.files_clipboard.is_empty() {
+                        let label = if self.files_clipboard_cut { "Paste (Move)" } else { "Paste" };
+                        if ui.add_enabled(!self.files_worker_busy, egui::Button::new(label)).clicked() { paste_action = true; }
+                        ui.label(RichText::new(format!("{} item(s) in clipboard", self.files_clipboard.len())).small().weak());
+                    }
+                    if ui.button("Select all").clicked() { select_all = true; }
+                });
+            }
+            ui.separator();
+            let filter = if self.files_recursive_search_active { String::new() } else { self.files_search.trim().to_lowercase() };
+            let visible_entries: Vec<CachedFileEntry> = self.files_entries.iter()
+                .filter(|entry| filter.is_empty() || entry.name.to_lowercase().contains(&filter))
+                .cloned()
+                .collect();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                if let Some(error) = &self.files_error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                } else if visible_entries.is_empty() {
+                    ui.add_space(18.0);
+                    let empty_heading = if self.files_recursive_search_active { "No matches in this workspace" } else if filter.is_empty() { "This folder is empty" } else { "No matching items" };
+                    let empty_hint = if self.files_recursive_search_active { "Try another search term or clear search to return to the current folder." } else if filter.is_empty() { "Create a folder or copy files into your NOVA workspace." } else { "Try a different search term." };
+                    ui.heading(empty_heading);
+                    ui.label(RichText::new(empty_hint).weak());
+                } else if self.files_grid_view {
+                    let columns = ((ui.available_width() / 150.0).floor() as usize).clamp(1, 5);
+                    egui::Grid::new("nova-files-grid-view").num_columns(columns).spacing(egui::vec2(8.0, 8.0)).show(ui, |ui| {
+                        for (index, entry) in visible_entries.iter().enumerate() {
+                            let path = entry.path.clone();
+                            let selected = self.files_multi_selected.contains(&path) || self.files_selected.as_ref() == Some(&path);
+                            let label = format!("{}\n{}\n{}", if entry.is_dir { "▰" } else { "▤" }, entry.name, entry.display_size);
+                            let response = ui.add_sized([136.0, 82.0], egui::Button::selectable(selected, label).corner_radius(egui::CornerRadius::same(10)))
+                                .on_hover_text(path.display().to_string());
+                            if response.clicked() {
+                                let additive = ui.input(|input| input.modifiers.ctrl || input.modifiers.command);
+                                self.select_file_path(path.clone(), additive);
+                            }
+                            if response.double_clicked() {
+                                if entry.is_dir { navigate_to = Some(path.clone()); } else { open_file = Some(path.clone()); }
+                            }
+                            response.context_menu(|ui| {
+                                if ui.button("Open").clicked() {
+                                    if entry.is_dir { navigate_to = Some(path.clone()); } else { open_file = Some(path.clone()); }
+                                    ui.close();
+                                }
+                                if !entry.is_dir && ui.button("Preview").clicked() { self.select_file_path(path.clone(), false); preview_action = true; ui.close(); }
+                                if ui.button("Copy").clicked() {
+                                    let paths = if self.files_multi_selected.contains(&path) { self.selected_file_paths() } else { vec![path.clone()] };
+                                    copy_cut_action = Some((paths, false)); ui.close();
+                                }
+                                if ui.button("Cut").clicked() {
+                                    let paths = if self.files_multi_selected.contains(&path) { self.selected_file_paths() } else { vec![path.clone()] };
+                                    copy_cut_action = Some((paths, true)); ui.close();
+                                }
+                                if ui.button("Rename").clicked() { rename_action = Some(path.clone()); ui.close(); }
+                                if ui.button("Move to Trash").clicked() {
+                                    let paths = if self.files_multi_selected.contains(&path) { self.selected_file_paths() } else { vec![path.clone()] };
+                                    trash_action = Some(paths); ui.close();
+                                }
+                            });
+                            if index % columns == columns - 1 { ui.end_row(); }
                         }
                     });
-                }
-                ui.separator();
-                let filter = self.files_search.trim().to_lowercase();
-                let visible_entries: Vec<&CachedFileEntry> = self.files_entries.iter()
-                    .filter(|entry| filter.is_empty() || entry.name.to_lowercase().contains(&filter))
-                    .collect();
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    if let Some(error) = &self.files_error {
-                        ui.colored_label(Color32::LIGHT_RED, error);
-                    } else if visible_entries.is_empty() {
-                        ui.add_space(18.0);
-                        ui.heading(if filter.is_empty() { "This folder is empty" } else { "No matching items" });
-                        ui.label(RichText::new(if filter.is_empty() { "Create a folder or copy files into your NOVA workspace." } else { "Try a different search term." }).weak());
-                    } else if self.files_grid_view {
-                        let columns = ((ui.available_width() / 150.0).floor() as usize).clamp(1, 5);
-                        egui::Grid::new("nova-files-grid-view").num_columns(columns).spacing(egui::vec2(8.0, 8.0)).show(ui, |ui| {
-                            for (index, entry) in visible_entries.iter().enumerate() {
-                                let path = entry.path.clone();
-                                let selected = self.files_selected.as_ref() == Some(&path);
-                                let label = format!("{}\n{}\n{}", if entry.is_dir { "▰" } else { "▤" }, entry.name, entry.display_size);
-                                let response = ui.add_sized([136.0, 82.0], egui::Button::selectable(selected, label).corner_radius(egui::CornerRadius::same(10)));
-                                if response.clicked() { self.files_selected = Some(path.clone()); }
-                                if response.double_clicked() {
-                                    if entry.is_dir { navigate_to = Some(path.clone()); } else { open_file = Some(path.clone()); }
-                                }
-                                response.context_menu(|ui| {
-                                    if ui.button("Open").clicked() {
-                                        if entry.is_dir { navigate_to = Some(path.clone()); } else { open_file = Some(path.clone()); }
-                                        ui.close();
-                                    }
-                                    if ui.button("Move to Trash").clicked() { move_to_trash = Some(path.clone()); ui.close(); }
-                                });
-                                if index % columns == columns - 1 { ui.end_row(); }
-                            }
-                        });
-                    } else {
+                } else {
+                    ui.horizontal(|ui| {
+                        let name_width = (ui.available_width() - 74.0 - ui.spacing().item_spacing.x).max(24.0);
+                        ui.add_sized([name_width, 20.0], egui::Label::new(RichText::new("NAME").small().strong().weak()));
+                        ui.add_sized([74.0, 20.0], egui::Label::new(RichText::new("SIZE").small().strong().weak()));
+                    });
+                    for entry in &visible_entries {
+                        let path = entry.path.clone();
+                        let selected = self.files_multi_selected.contains(&path) || self.files_selected.as_ref() == Some(&path);
+                        let row_width = ui.available_width().max(1.0);
+                        let size_width = 74.0_f32.min(row_width * 0.42).max(42.0_f32.min(row_width));
+                        let name_width = (row_width - size_width - ui.spacing().item_spacing.x).max(1.0);
+                        let max_chars = ((name_width - 28.0).max(8.0) / 7.2).floor() as usize;
+                        let display_name = compact_file_name(&entry.name, max_chars);
                         ui.horizontal(|ui| {
-                            let name_width = (ui.available_width() - 64.0 - ui.spacing().item_spacing.x).max(24.0);
-                            ui.add_sized([name_width, 20.0], egui::Label::new(RichText::new("NAME").small().strong().weak()));
-                            ui.add_sized([64.0, 20.0], egui::Label::new(RichText::new("SIZE").small().strong().weak()));
-                        });
-                        for entry in &visible_entries {
-                            let path = entry.path.clone();
-                            let selected = self.files_selected.as_ref() == Some(&path);
-                            let row_width = ui.available_width().max(1.0);
-                            let size_width = 64.0_f32.min(row_width * 0.42).max(42.0_f32.min(row_width));
-                            let name_width = (row_width - size_width - ui.spacing().item_spacing.x).max(1.0);
-                            let max_chars = ((name_width - 28.0).max(8.0) / 7.2).floor() as usize;
-                            let display_name = compact_file_name(&entry.name, max_chars);
-                            ui.horizontal(|ui| {
-                                let response = ui.add_sized(
-                                    [name_width, 27.0],
-                                    egui::Button::selectable(selected, format!("{}  {}", if entry.is_dir { "▰" } else { "▤" }, display_name))
-                                        .corner_radius(egui::CornerRadius::same(7)),
-                                );
-                                ui.add_sized([size_width, 27.0], egui::Label::new(RichText::new(&entry.display_size).small().weak()));
-                                if response.clicked() { self.files_selected = Some(path.clone()); }
-                                if response.double_clicked() {
+                            let response = ui.add_sized(
+                                [name_width, 27.0],
+                                egui::Button::selectable(selected, format!("{}  {}", if entry.is_dir { "▰" } else { "▤" }, display_name))
+                                    .corner_radius(egui::CornerRadius::same(7)),
+                            ).on_hover_text(path.display().to_string());
+                            ui.add_sized([size_width, 27.0], egui::Label::new(RichText::new(&entry.display_size).small().weak()));
+                            if response.clicked() {
+                                let additive = ui.input(|input| input.modifiers.ctrl || input.modifiers.command);
+                                self.select_file_path(path.clone(), additive);
+                            }
+                            if response.double_clicked() {
+                                if entry.is_dir { navigate_to = Some(path.clone()); } else { open_file = Some(path.clone()); }
+                            }
+                            response.context_menu(|ui| {
+                                if ui.button("Open").clicked() {
                                     if entry.is_dir { navigate_to = Some(path.clone()); } else { open_file = Some(path.clone()); }
+                                    ui.close();
                                 }
-                                response.context_menu(|ui| {
-                                    if ui.button("Open").clicked() {
-                                        if entry.is_dir { navigate_to = Some(path.clone()); } else { open_file = Some(path.clone()); }
-                                        ui.close();
-                                    }
-                                    if ui.button("Move to Trash").clicked() { move_to_trash = Some(path.clone()); ui.close(); }
-                                });
+                                if !entry.is_dir && ui.button("Preview").clicked() { self.select_file_path(path.clone(), false); preview_action = true; ui.close(); }
+                                if ui.button("Copy").clicked() {
+                                    let paths = if self.files_multi_selected.contains(&path) { self.selected_file_paths() } else { vec![path.clone()] };
+                                    copy_cut_action = Some((paths, false)); ui.close();
+                                }
+                                if ui.button("Cut").clicked() {
+                                    let paths = if self.files_multi_selected.contains(&path) { self.selected_file_paths() } else { vec![path.clone()] };
+                                    copy_cut_action = Some((paths, true)); ui.close();
+                                }
+                                if ui.button("Rename").clicked() { rename_action = Some(path.clone()); ui.close(); }
+                                if ui.button("Move to Trash").clicked() {
+                                    let paths = if self.files_multi_selected.contains(&path) { self.selected_file_paths() } else { vec![path.clone()] };
+                                    trash_action = Some(paths); ui.close();
+                                }
                             });
+                        });
+                    }
+                }
+            });
+            if self.files_search_truncated {
+                ui.label(RichText::new("Search results are limited for safety; refine your query to narrow the list.").small().weak());
+            }
+            if let Some((path, preview)) = &self.files_preview {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(format!("Preview · {}", path.file_name().unwrap_or_default().to_string_lossy())).strong());
+                        if ui.small_button("Open in Editor").clicked() { open_file = Some(path.clone()); }
+                        if ui.small_button("Close preview").clicked() { preview_action = false; clear_preview = true; }
+                    });
+                    egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                        ui.label(RichText::new(preview).font(FontId::monospace(12.0)));
+                    });
+                });
+            }
+            ui.separator();
+            ui.label(RichText::new("Ctrl-click selects multiple items · Ctrl+C / Ctrl+X / Ctrl+V copy or move · F2 renames · Delete moves selection to NOVA Trash").small().weak());
+        });
+        if let Some(shown) = shown {
+            self.window_rects.insert("Files".to_owned(), shown.response.rect);
+            if shown.response.hovered() { self.mark_window_active(ctx, "Files"); }
+        }
+
+        if refresh { self.refresh_files(); }
+        if clear_search {
+            self.files_search.clear();
+            self.files_recursive_search_active = false;
+            self.files_search_truncated = false;
+            self.refresh_files();
+        }
+        if search_workspace { self.start_recursive_file_search(); }
+        if select_all {
+            self.files_multi_selected = self.visible_file_paths().into_iter().collect();
+            self.files_selected = self.files_multi_selected.iter().next().cloned();
+        }
+        if clear_selection {
+            self.files_multi_selected.clear();
+            self.files_selected = None;
+        }
+        if create_folder {
+            let name = self.files_new_folder.clone();
+            if !name.is_empty()
+                && !name.to_ascii_lowercase().starts_with(".nova-copy-")
+                && !name.contains('/')
+                && !name.contains('\\')
+            {
+                let validated_name = safe_user_path(&self.paths.user_dir, &name);
+                let safe_parent = canonical_user_path(&self.paths.user_dir, &self.files_dir);
+                match (validated_name, safe_parent) {
+                    (Ok(_), Ok(parent)) => {
+                        let target = parent.join(&name);
+                        match fs::create_dir(&target) {
+                            Ok(()) => {
+                                self.files_new_folder.clear();
+                                self.status_message = format!("Created folder: {name}");
+                                self.refresh_files();
+                            }
+                            Err(error) => self.status_message = format!("Create folder failed: {error}"),
                         }
                     }
-                });
-                ui.separator();
-                ui.label(RichText::new("Single-click to select · Double-click to open · Deleted items stay in NOVA Trash until permanently removed").small().weak());
-            });
-        if let Some(shown) = shown { self.window_rects.insert("Files".to_owned(), shown.response.rect); }
-
-        if refresh {
-            self.files_selected = None;
-            self.refresh_files();
+                    (Err(error), _) | (_, Err(error)) => self.status_message = format!("Create folder blocked: {error}"),
+                }
+            }
+        }
+        if let Some((paths, cut)) = copy_cut_action {
+            self.files_clipboard = top_level_selected_paths(paths);
+            self.files_clipboard_cut = cut;
+            self.status_message = if cut { "Selection cut. Paste it into a destination folder." } else { "Selection copied. Paste it into a destination folder." }.to_owned();
+        }
+        if paste_action && !self.files_clipboard.is_empty() {
+            self.start_files_operation(self.files_clipboard.clone(), self.files_clipboard_cut);
+        }
+        if preview_action { self.preview_selected_file(); }
+        if clear_preview { self.files_preview = None; }
+        if let Some(path) = rename_action {
+            self.files_rename_input = path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+            self.files_rename_target = Some(path);
+        }
+        if let Some(paths) = trash_action {
+            self.trash_selected_files(top_level_selected_paths(paths));
         }
         if let Some(path) = navigate_to {
             match canonical_user_path(&self.paths.user_dir, &path) {
                 Ok(folder) if folder.is_dir() => {
                     self.files_dir = folder;
                     self.files_selected = None;
+                    self.files_multi_selected.clear();
+                    self.files_search.clear();
+                    self.files_recursive_search_active = false;
                     self.refresh_files();
                 }
                 Ok(_) => self.status_message = "That item is not a folder.".to_owned(),
                 Err(error) => self.status_message = format!("Navigation blocked: {error}"),
-            }
-        }
-        if create_folder {
-            let name = self.files_new_folder.clone();
-            if !name.is_empty() && !name.contains('/') && !name.contains('\\') {
-                let validated_name = safe_user_path(&self.paths.user_dir, &name);
-                let safe_parent = canonical_user_path(&self.paths.user_dir, &self.files_dir);
-                match (validated_name, safe_parent) {
-                    (Ok(_), Ok(parent)) => match fs::create_dir(parent.join(&name)) {
-                        Ok(()) => {
-                            self.files_new_folder.clear();
-                            self.status_message = format!("Created folder: {name}");
-                            self.refresh_files();
-                        }
-                        Err(error) => self.status_message = format!("Create folder failed: {error}"),
-                    },
-                    (Err(error), _) | (_, Err(error)) => self.status_message = format!("Create folder blocked: {error}"),
-                }
-            }
-        }
-        if let Some(path) = move_to_trash {
-            match trash::move_to_trash(&self.paths, &path) {
-                Ok(entry) => {
-                    self.status_message = format!("Moved '{}' to NOVA Trash", entry.name);
-                    self.files_selected = None;
-                    self.refresh_files();
-                    self.refresh_trash();
-                }
-                Err(error) => self.status_message = format!("Could not move item to Trash: {error}"),
             }
         }
         if let Some(path) = sandbox_sample {
@@ -2005,9 +3199,140 @@ impl NovaApp {
             }
         }
         if let Some(path) = open_file { self.open_file_in_editor(path); }
+
+        if let Some(target) = self.files_rename_target.clone() {
+            let mut open = true;
+            let mut rename_to: Option<String> = None;
+            let mut cancel = false;
+            egui::Window::new("Rename item")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .fade_in(!self.settings.reduce_motion)
+                .fade_out(!self.settings.reduce_motion)
+                .show(ctx, |ui| {
+                    ui.label(target.file_name().unwrap_or_default().to_string_lossy());
+                    let response = ui.add(TextEdit::singleline(&mut self.files_rename_input).desired_width(280.0));
+                    if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                        rename_to = Some(self.files_rename_input.clone());
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Rename").clicked() { rename_to = Some(self.files_rename_input.clone()); }
+                        if ui.button("Cancel").clicked() { cancel = true; }
+                    });
+                });
+            if let Some(name) = rename_to {
+                match file_ops::rename_item(&self.paths.user_dir, &target, &name) {
+                    Ok(path) => {
+                        self.files_selected = Some(path.clone());
+                        self.files_multi_selected.clear();
+                        self.files_multi_selected.insert(path);
+                        self.files_rename_target = None;
+                        self.status_message = "Item renamed successfully.".to_owned();
+                        self.refresh_files();
+                    }
+                    Err(error) => self.status_message = format!("Rename failed: {error}"),
+                }
+            } else if cancel || !open {
+                self.files_rename_target = None;
+            }
+        }
+    }
+
+    fn trash_selected_files(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() { return; }
+        let mut moved = 0usize;
+        let mut failures = Vec::new();
+        for path in paths {
+            match trash::move_to_trash(&self.paths, &path) {
+                Ok(entry) => moved += 1,
+                Err(error) => failures.push(format!("{}: {error}", path.display())),
+            }
+        }
+        self.status_message = if failures.is_empty() {
+            format!("Moved {moved} item(s) to NOVA Trash.")
+        } else {
+            format!("Moved {moved} item(s) to Trash; {} failed: {}", failures.len(), failures.join("; "))
+        };
+        self.files_selected = None;
+        self.files_multi_selected.clear();
+        self.refresh_files();
+        self.refresh_trash();
     }
 
     fn open_file_in_editor(&mut self, path: PathBuf) {
+        self.request_editor_action(PendingEditorAction::OpenFile(path));
+    }
+
+    fn request_editor_action(&mut self, action: PendingEditorAction) {
+        if self.editor_dirty {
+            self.editor_pending_action = Some(action);
+            self.editor_open = true;
+            self.editor_status = "Unsaved changes — save or discard them before continuing.".to_owned();
+        } else {
+            self.perform_editor_action(action);
+        }
+    }
+
+    fn perform_editor_action(&mut self, action: PendingEditorAction) {
+        match action {
+            PendingEditorAction::NewDocument => {
+                let documents_dir = self.paths.user_dir.join("Documents");
+                let new_path_status = match create_user_directories(&self.paths.user_dir, &documents_dir) {
+                    Ok(directory) => match next_untitled_file_name(&directory) {
+                        Ok(name) => {
+                            self.editor_path = format!("Documents/{name}");
+                            None
+                        }
+                        Err(error) => {
+                            self.editor_path = "Documents/Untitled-new.txt".to_owned();
+                            Some(format!("Could not allocate a unique document name: {error}"))
+                        }
+                    },
+                    Err(error) => {
+                        // If Documents cannot be created safely, fall back to
+                        // an unused file in the already-validated user root.
+                        self.editor_path = next_untitled_file_name(&self.paths.user_dir)
+                            .unwrap_or_else(|_| "Untitled-new.txt".to_owned());
+                        Some(format!("Documents folder unavailable; using the user root: {error}"))
+                    }
+                };
+                self.editor_text.clear();
+                self.editor_saved_text.clear();
+                self.editor_saved_path = None;
+                self.editor_overwrite_pending = None;
+                self.editor_dirty = false;
+                self.editor_status = new_path_status.unwrap_or_else(|| "New document — not saved".to_owned());
+                self.editor_open = true;
+            }
+            PendingEditorAction::OpenFile(path) => self.load_file_into_editor(path),
+            PendingEditorAction::Close => self.editor_open = false,
+            PendingEditorAction::ExitApplication => {
+                self.editor_open = false;
+                self.exit_after_editor = true;
+            },
+        }
+    }
+
+    fn load_file_into_editor(&mut self, path: PathBuf) {
+        let source_metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) if !is_link_or_reparse_point(&metadata) => metadata,
+            Ok(_) => {
+                self.editor_status = "Links and Windows reparse points cannot be opened in the built-in Editor.".to_owned();
+                self.editor_open = true;
+                return;
+            }
+            Err(error) => {
+                self.editor_status = format!("Cannot inspect file: {error}");
+                self.editor_open = true;
+                return;
+            }
+        };
+        if !source_metadata.is_file() {
+            self.editor_status = "The selected path is not a regular file.".to_owned();
+            self.editor_open = true;
+            return;
+        }
         let canonical_file = match canonical_user_path(&self.paths.user_dir, &path) {
             Ok(file) => file,
             Err(error) => {
@@ -2017,122 +3342,276 @@ impl NovaApp {
             }
         };
         match fs::metadata(&canonical_file) {
-            Ok(meta) if meta.len() <= 2 * 1024 * 1024 => match fs::read(&canonical_file).and_then(|bytes| unicode::decode_text_file(&bytes)) {
-                Ok(text) => {
-                    self.editor_text = text;
-                    let canonical_root = self.paths.user_dir.canonicalize().ok();
-                    self.editor_path = canonical_root
-                        .as_deref()
-                        .and_then(|root| canonical_file.strip_prefix(root).ok())
-                        .unwrap_or(&canonical_file)
-                        .to_string_lossy()
-                        .to_string();
-                    self.editor_status = "File opened".to_owned();
+            Ok(meta) if meta.is_file() && meta.len() <= 2 * 1024 * 1024 => {
+                match fs::read(&canonical_file).and_then(|bytes| unicode::decode_text_file(&bytes)) {
+                    Ok(text) => {
+                        self.editor_text = text;
+                        self.editor_saved_text.clone_from(&self.editor_text);
+                        self.editor_saved_path = Some(canonical_file.clone());
+                        self.editor_overwrite_pending = None;
+                        self.editor_dirty = false;
+                        let canonical_root = self.paths.user_dir.canonicalize().ok();
+                        self.editor_path = canonical_root
+                            .as_deref()
+                            .and_then(|root| canonical_file.strip_prefix(root).ok())
+                            .unwrap_or(&canonical_file)
+                            .to_string_lossy()
+                            .to_string();
+                        self.editor_status = "File opened".to_owned();
+                    }
+                    Err(error) => self.editor_status = format!("Text file could not be decoded: {error}"),
                 }
-                Err(error) => self.editor_status = format!("Text file could not be decoded: {error}"),
-            },
-            Ok(_) => self.editor_status = "Files larger than 2 MiB are not opened in the built-in editor.".to_owned(),
+            }
+            Ok(meta) if meta.is_file() => self.editor_status = "Files larger than 2 MiB are not opened in the built-in editor.".to_owned(),
+            Ok(_) => self.editor_status = "The selected path is not a regular file.".to_owned(),
             Err(error) => self.editor_status = format!("Cannot read file metadata: {error}"),
         }
         self.editor_open = true;
     }
 
+    /// Save the current text. Returns `Ok(false)` when an overwrite confirmation
+    /// is required; callers must keep the current document/action pending.
+    fn save_editor_document(&mut self, confirm_overwrite: bool) -> Result<bool, String> {
+        if self.editor_text.len() > 2 * 1024 * 1024 {
+            return Err("Files larger than 2 MiB cannot be saved in the built-in editor.".to_owned());
+        }
+        let path = safe_user_path(&self.paths.user_dir, &self.editor_path)
+            .map_err(|error| error.to_string())?;
+        let parent = path.parent()
+            .filter(|folder| !folder.as_os_str().is_empty())
+            .unwrap_or(&self.paths.user_dir);
+        let canonical_parent = create_user_directories(&self.paths.user_dir, parent)
+            .map_err(|error| format!("Cannot create or resolve target folder: {error}"))?;
+        let file_name = path.file_name().ok_or_else(|| "A file name is required.".to_owned())?;
+        let safe_target = canonical_parent.join(file_name);
+
+        let target_exists = match fs::symlink_metadata(&safe_target) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(format!("Cannot inspect save target: {error}")),
+        };
+        let is_current_document = self.editor_saved_path.as_ref() == Some(&safe_target);
+        if target_exists && !is_current_document && !confirm_overwrite {
+            self.editor_overwrite_pending = Some(safe_target);
+            self.editor_status = "A file with this name already exists. Confirm overwrite to replace it.".to_owned();
+            return Ok(false);
+        }
+        if confirm_overwrite && self.editor_overwrite_pending.as_ref() != Some(&safe_target) {
+            return Err("The overwrite target changed. Review the path and save again.".to_owned());
+        }
+
+        // The shared writer rejects reparse points and revalidates the entire
+        // parent chain immediately before replacing the target.
+        atomic_write_user_file(&safe_target, self.editor_text.as_bytes())
+            .map_err(|error| format!("Save failed: {error}"))?;
+        self.editor_saved_text.clone_from(&self.editor_text);
+        self.editor_saved_path = Some(safe_target);
+        self.editor_overwrite_pending = None;
+        self.editor_dirty = false;
+        self.editor_status = "Saved safely to NOVA user data".to_owned();
+        Ok(true)
+    }
+
+    fn resolve_editor_pending_action(&mut self, decision: EditorDecision) {
+        match decision {
+            EditorDecision::Save => match self.save_editor_document(false) {
+                Ok(true) => {
+                    if let Some(action) = self.editor_pending_action.take() {
+                        self.perform_editor_action(action);
+                    }
+                }
+                Ok(false) => {} // Confirmation dialog is now active.
+                Err(error) => self.editor_status = error,
+            },
+            EditorDecision::Discard => {
+                if let Some(action) = self.editor_pending_action.take() {
+                    // Discard must restore the last saved snapshot as well as
+                    // clearing the dirty flag. Otherwise reopening a closed
+                    // Editor could show discarded text marked as clean.
+                    discard_unsaved_editor_text(&mut self.editor_text, &self.editor_saved_text);
+                    self.editor_dirty = false;
+                    self.perform_editor_action(action);
+                }
+            }
+            EditorDecision::Cancel => {
+                self.editor_pending_action = None;
+                self.editor_open = true;
+            }
+        }
+    }
+
     fn editor_window(&mut self, ctx: &egui::Context) {
-        let mut save = false;
-        let mut new_document = false;
+        let mut save_requested = false;
+        let mut new_document_requested = false;
+        let mut replace_all_requested = false;
+        let focus_find = ctx.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::F));
+        if focus_find && self.editor_open { self.editor_find_open = true; }
+        let title = if self.editor_dirty { "NOVA Text Editor •" } else { "NOVA Text Editor" };
         let snap = self.take_window_snap("Editor", ctx);
-        let mut window = egui::Window::new("NOVA Text Editor")
+        let mut window = egui::Window::new(title)
+            .order(self.window_order("Editor"))
             .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
             .default_size([700.0, 520.0]);
         if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
-        let shown = window.open(&mut self.editor_open).show(ctx, |ui| {
+
+        let mut window_open = self.editor_open;
+        let shown = window.open(&mut window_open).show(ctx, |ui| {
+            let can_edit = self.editor_pending_action.is_none() && self.editor_overwrite_pending.is_none();
+            ui.add_enabled_ui(can_edit, |ui| {
                 let path_width = (ui.available_width() * 0.48).clamp(110.0, 330.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Path (inside NOVA user folder):");
                     ui.add(TextEdit::singleline(&mut self.editor_path).desired_width(path_width));
-                    if ui.button("New").clicked() { new_document = true; }
-                    if ui.button("Save").clicked() { save = true; }
+                    if ui.button("New").clicked() { new_document_requested = true; }
+                    if ui.button("Save · Ctrl+S").clicked() { save_requested = true; }
+                    if ui.button("Find / Replace · Ctrl+F").clicked() { self.editor_find_open = !self.editor_find_open; }
                 });
-                ui.add(
+                let response = ui.add(
                     TextEdit::multiline(&mut self.editor_text)
                         .font(FontId::monospace(13.0))
                         .desired_rows(20)
                         .desired_width(f32::INFINITY),
                 );
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(&self.editor_status).small().weak());
-                    ui.label(RichText::new("Unicode: UTF-8 / UTF-16 · UniKey input").small().weak());
-                    ui.label(RichText::new(format!("{} chars · {} words", self.editor_text.chars().count(), self.editor_text.split_whitespace().count())).small().weak());
-                });
+                if response.changed() {
+                    self.editor_dirty = self.editor_text != self.editor_saved_text;
+                }
             });
-        if let Some(shown) = shown { self.window_rects.insert("Editor".to_owned(), shown.response.rect); }
-        if new_document {
-            self.editor_path = "Documents/Untitled.txt".to_owned();
-            self.editor_text.clear();
-            self.editor_status = "New document — not saved".to_owned();
-        }
-        if save {
-            if self.editor_text.len() > 2 * 1024 * 1024 {
-                self.editor_status = "Files larger than 2 MiB cannot be saved in the built-in editor.".to_owned();
-                return;
+            if self.editor_find_open {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Find");
+                        let find_response = ui.add(TextEdit::singleline(&mut self.editor_find_query).desired_width(150.0));
+                        if focus_find { find_response.request_focus(); }
+                        ui.label("Replace");
+                        ui.add(TextEdit::singleline(&mut self.editor_replace_text).desired_width(150.0));
+                        let matches = if self.editor_find_query.is_empty() { 0 } else { self.editor_text.matches(self.editor_find_query.as_str()).count() };
+                        ui.label(RichText::new(format!("{matches} match(es)")).small().weak());
+                        if ui.add_enabled(matches > 0 && can_edit, egui::Button::new("Replace all")).clicked() { replace_all_requested = true; }
+                        if ui.small_button("Close").clicked() { self.editor_find_open = false; }
+                    });
+                });
             }
-            match safe_user_path(&self.paths.user_dir, &self.editor_path) {
-                Ok(path) => {
-                    let parent = path
-                        .parent()
-                        .filter(|folder| !folder.as_os_str().is_empty())
-                        .unwrap_or(&self.paths.user_dir);
-                    let canonical_parent = match create_user_directories(&self.paths.user_dir, parent) {
-                        Ok(folder) => folder,
-                        Err(error) => {
-                            self.editor_status = format!("Cannot create or resolve target folder: {error}");
-                            return;
-                        }
-                    };
-                    let Some(file_name) = path.file_name() else {
-                        self.editor_status = "A file name is required.".to_owned();
-                        return;
-                    };
-                    let safe_target = canonical_parent.join(file_name);
-                    match fs::symlink_metadata(&safe_target) {
-                        Ok(metadata) if metadata.file_type().is_symlink() => {
-                            self.editor_status = "Saving through a symbolic link is blocked.".to_owned();
-                            return;
-                        }
-                        Ok(metadata) if metadata.is_dir() => {
-                            self.editor_status = "The target path is a directory, not a file.".to_owned();
-                            return;
-                        }
-                        Ok(_) => {
-                            if let Err(error) = canonical_user_path(&self.paths.user_dir, &safe_target) {
-                                self.editor_status = format!("Saving outside NOVA data is blocked: {error}");
-                                return;
+            ui.horizontal_wrapped(|ui| {
+                if self.editor_dirty {
+                    ui.colored_label(Color32::from_rgb(225, 166, 86), "● Unsaved changes");
+                } else {
+                    ui.label(RichText::new("Saved").small().weak());
+                }
+                ui.label(RichText::new(&self.editor_status).small().weak());
+                ui.label(RichText::new("Unicode: UTF-8 / UTF-16 · UniKey input").small().weak());
+                ui.label(RichText::new(format!("{} chars · {} words · {} lines", self.editor_text.chars().count(), self.editor_text.split_whitespace().count(), self.editor_text.lines().count().max(1))).small().weak());
+            });
+        });
+        if let Some(shown) = shown {
+            self.window_rects.insert("Editor".to_owned(), shown.response.rect);
+            if shown.response.hovered() { self.mark_window_active(ctx, "Editor"); }
+        }
+
+        if replace_all_requested && !self.editor_find_query.is_empty() {
+            match replace_all_bounded(
+                &self.editor_text,
+                &self.editor_find_query,
+                &self.editor_replace_text,
+                2 * 1024 * 1024,
+            ) {
+                Ok((updated, matches)) if matches > 0 && updated != self.editor_text => {
+                    self.editor_text = updated;
+                    self.editor_dirty = self.editor_text != self.editor_saved_text;
+                    self.editor_status = format!("Replaced {matches} occurrence(s). Review changes before saving.");
+                }
+                Ok((_, matches)) if matches > 0 => {
+                    self.editor_status = format!("Found {matches} occurrence(s); replacement text is identical, so no changes were made.");
+                }
+                Ok(_) => self.editor_status = "No matching text was found.".to_owned(),
+                Err(error) => self.editor_status = format!("Replace all cancelled: {error}"),
+            }
+        }
+        if self.editor_open && !window_open {
+            self.request_editor_action(PendingEditorAction::Close);
+        } else if self.editor_pending_action.is_none() {
+            self.editor_open = window_open;
+        }
+        if new_document_requested {
+            self.request_editor_action(PendingEditorAction::NewDocument);
+        }
+        if save_requested && self.editor_overwrite_pending.is_none() {
+            if let Err(error) = self.save_editor_document(false) {
+                self.editor_status = error;
+            }
+        }
+
+        if let Some(target) = self.editor_overwrite_pending.as_ref() {
+            let target_label = target.strip_prefix(&self.paths.user_dir)
+                .unwrap_or(target)
+                .display()
+                .to_string();
+            let mut decision = None;
+            egui::Window::new("Confirm file overwrite")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label("A file already exists at this path:");
+                    ui.label(RichText::new(target_label).monospace().strong());
+                    ui.label("Replace this existing file with the current document?");
+                    ui.horizontal(|ui| {
+                        if ui.button("Overwrite").clicked() { decision = Some(true); }
+                        if ui.button("Cancel").clicked() { decision = Some(false); }
+                    });
+                    ui.label(RichText::new("The existing file is not changed unless you confirm.").small().weak());
+                });
+            if let Some(confirm) = decision {
+                if confirm {
+                    match self.save_editor_document(true) {
+                        Ok(true) => {
+                            if let Some(action) = self.editor_pending_action.take() {
+                                self.perform_editor_action(action);
                             }
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => {
-                            self.editor_status = format!("Cannot inspect target file: {error}");
-                            return;
-                        }
+                        Ok(false) => {}
+                        Err(error) => self.editor_status = error,
                     }
-                    match fs::write(&safe_target, &self.editor_text) {
-                        Ok(()) => self.editor_status = "Saved to NOVA USB data".to_owned(),
-                        Err(error) => self.editor_status = format!("Save failed: {error}"),
-                    }
+                } else {
+                    self.editor_overwrite_pending = None;
+                    self.editor_pending_action = None;
+                    self.editor_open = true;
+                    self.editor_status = "Overwrite cancelled. Your document is unchanged and the pending action was cancelled.".to_owned();
                 }
-                Err(error) => self.editor_status = error.to_string(),
+            }
+        } else if self.editor_pending_action.is_some() {
+            let mut decision = None;
+            egui::Window::new("Unsaved changes")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label("This document has unsaved changes.");
+                    ui.label("Save your work before continuing?");
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() { decision = Some(EditorDecision::Save); }
+                        if ui.button("Discard").clicked() { decision = Some(EditorDecision::Discard); }
+                        if ui.button("Cancel").clicked() { decision = Some(EditorDecision::Cancel); }
+                    });
+                    if !self.editor_status.is_empty() {
+                        ui.label(RichText::new(&self.editor_status).small().weak());
+                    }
+                });
+            if let Some(decision) = decision {
+                self.resolve_editor_pending_action(decision);
             }
         }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
+        self.poll_network_worker(ctx);
         let mut changed = false;
         let mut launch_app: Option<&'static str> = None;
         let mut open_files_requested = false;
         let snap = self.take_window_snap("Settings", ctx);
         let mut window = egui::Window::new("⚙  NOVA Settings")
+            .order(self.window_order("Settings"))
             .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
@@ -2236,12 +3715,22 @@ impl NovaApp {
                         changed |= ui.checkbox(&mut self.settings.reduce_motion, "Reduce animations and visual effects").changed();
                         ui.separator();
                         ui.horizontal_wrapped(|ui| {
-                            if ui.button("Open System Monitor").clicked() { self.monitor_open = true; }
+                            if ui.button("Open Hardware Center").clicked() {
+                                self.monitor_open = true;
+                                self.active_workspace = Some("Monitor".to_owned());
+                            }
                             if ui.button("Open File Manager").clicked() { open_files_requested = true; }
                         });
                         ui.horizontal_wrapped(|ui| {
-                            if ui.button("Open UniKey input").clicked() { self.unikey_open = true; }
-                            if ui.button("Open Security Center").clicked() { self.security_open = true; }
+                            if ui.button("Open UniKey input").clicked() {
+                                // Route through the common launcher so bundled UniKey is
+                                // detected and started, and the window receives focus.
+                                launch_app = Some("UniKey");
+                            }
+                            if ui.button("Open Security Center").clicked() {
+                                self.security_open = true;
+                                self.active_workspace = Some("Security Center".to_owned());
+                            }
                         });
                     }
                     2 => {
@@ -2250,7 +3739,8 @@ impl NovaApp {
                         egui::ScrollArea::vertical().max_height(285.0).show(ui, |ui| {
                             for app in START_APPS {
                                 ui.horizontal_wrapped(|ui| {
-                                    ui.label(RichText::new(app.icon).size(20.0));
+                                    let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+                                    paint_vector_app_icon(ui.painter(), icon_rect.center(), app.name, 27.0, self.is_dark_mode(ctx));
                                     ui.vertical(|ui| {
                                         ui.label(RichText::new(app.name).strong());
                                         ui.label(RichText::new(app.description).small().weak());
@@ -2265,17 +3755,55 @@ impl NovaApp {
                     }
                     3 => {
                         ui.heading("Network & connectivity");
-                        ui.label("NOVA provides tools for inspecting and configuring the Windows host network. It does not replace Windows network settings.");
+                        ui.label("Manage Wi-Fi on the Windows host. NOVA does not create a virtual network adapter or isolate host traffic.");
                         ui.horizontal_wrapped(|ui| {
-                            if ui.button("Open Terminal / Wi-Fi tools").clicked() { self.terminal_open = true; }
+                            if ui.add_enabled(!self.network_busy, egui::Button::new("Scan Wi-Fi")).clicked() { self.start_network_scan(); }
+                            if ui.add_enabled(!self.network_busy, egui::Button::new("Disconnect")).clicked() { self.start_network_disconnect(); }
+                            if self.network_busy { ui.spinner(); ui.label(RichText::new("Working…").small().weak()); }
+                        });
+                        ui.label(RichText::new(&self.network_status).small().weak());
+                        ui.separator();
+                        ui.label(RichText::new("Nearby networks").strong());
+                        egui::ScrollArea::vertical().max_height(170.0).show(ui, |ui| {
+                            if self.network_networks.is_empty() {
+                                ui.label(RichText::new("No scan results yet. Select Scan Wi-Fi to discover available SSIDs.").small().weak());
+                            } else {
+                                let networks = self.network_networks.clone();
+                                for ssid in &networks {
+                                    let selected = self.network_selected_ssid.as_ref() == Some(ssid);
+                                    if ui.selectable_label(selected, ssid).clicked() {
+                                        self.network_selected_ssid = Some(ssid.clone());
+                                        self.network_password.clear();
+                                    }
+                                }
+                            }
+                        });
+                        if let Some(ssid) = self.network_selected_ssid.clone() {
+                            ui.separator();
+                            ui.label(format!("Selected network: {ssid}"));
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Password");
+                                ui.add_enabled(!self.network_busy, TextEdit::singleline(&mut self.network_password)
+                                    .password(true).desired_width(220.0).hint_text("Leave empty for an open network"));
+                                if ui.add_enabled(!self.network_busy, egui::Button::new("Connect")).clicked() { self.start_network_connect(); }
+                            });
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Open Terminal").clicked() {
+                                self.terminal_open = true;
+                                self.active_workspace = Some("Terminal".to_owned());
+                            }
                             if ui.button("Network Discovery").clicked() { launch_app = Some("Network Discovery"); }
                         });
-                        ui.label(RichText::new("Network Discovery requires its optional external tool. Network commands run with your Windows account permissions.").small().weak());
+                        ui.label(RichText::new("Wi-Fi scan/connect/disconnect run through Windows WLAN commands with your current account. Passwords are sent only to the worker performing the connection and are not written to NOVA settings or terminal history. Windows may retain the imported Wi-Fi profile under the current user. Signal strength and secured/open status are not inferred from SSID names.").small().weak());
                     }
                     4 => {
                         ui.heading("Security & isolation");
                         ui.label("Manage optional security workspaces and Windows Sandbox integration.");
-                        if ui.button("Open Security Center").clicked() { self.security_open = true; }
+                        if ui.button("Open Security Center").clicked() {
+                            self.security_open = true;
+                            self.active_workspace = Some("Security Center".to_owned());
+                        }
                         ui.label(RichText::new("External security tools run on the Windows host unless explicitly opened in Windows Sandbox. Scope acknowledgement is not a technical network boundary. Use only authorized targets.").small().weak());
                     }
                     _ => {
@@ -2287,15 +3815,21 @@ impl NovaApp {
                         ui.label("Keyboard shortcuts");
                         ui.monospace("Ctrl + Space    Start menu");
                         ui.monospace("Ctrl + E         File Manager");
-                        ui.monospace("Ctrl + Shift + Esc    System Monitor");
+                        ui.monospace("Ctrl + Shift + Esc    Hardware Center");
                         ui.monospace("Esc             Close Start / quick panel");
                     }
                 }
                 ui.separator();
                 ui.label(RichText::new("Settings are stored in the NOVA user data folder. NOVA does not install Windows services or startup tasks.").small().weak());
             });
-        if let Some(shown) = shown { self.window_rects.insert("Settings".to_owned(), shown.response.rect); }
-        if open_files_requested { self.files_open = true; self.ensure_files_loaded(); }
+        if let Some(shown) = shown {
+            self.window_rects.insert("Settings".to_owned(), shown.response.rect);
+            if shown.response.hovered() { self.mark_window_active(ctx, "Settings"); }
+        }
+        if !self.settings_open {
+            self.network_password.clear();
+        }
+        if open_files_requested { self.open_app("Files"); }
         if let Some(app) = launch_app { self.open_app(app); }
         if changed {
             self.apply_theme(ctx);
@@ -2312,6 +3846,7 @@ impl NovaApp {
         let mut refresh_requested = false;
         let snap = self.take_window_snap("Trash", ctx);
         let mut window = egui::Window::new("▤  NOVA Trash")
+            .order(self.window_order("Trash"))
             .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
@@ -2356,7 +3891,10 @@ impl NovaApp {
                 ui.separator();
                 ui.label(RichText::new("NOVA Trash is stored in the Data folder on this USB. Emptying Trash permanently deletes these items.").small().weak());
             });
-        if let Some(shown) = shown { self.window_rects.insert("Trash".to_owned(), shown.response.rect); }
+        if let Some(shown) = shown {
+            self.window_rects.insert("Trash".to_owned(), shown.response.rect);
+            if shown.response.hovered() { self.mark_window_active(ctx, "Trash"); }
+        }
 
         if refresh_requested { self.refresh_trash(); }
         if let Some(id) = restore_id {
@@ -2433,6 +3971,7 @@ impl NovaApp {
     fn calculator_window(&mut self, ctx: &egui::Context) {
         let snap = self.take_window_snap("Calculator", ctx);
         let mut window = egui::Window::new("NOVA Scientific Calculator")
+            .order(self.window_order("Calculator"))
             .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
@@ -2445,6 +3984,7 @@ impl NovaApp {
         let mut evaluate_now = false;
         let mut clear_now = false;
         let mut inserted: Option<&'static str> = None;
+        let mut inserted_dynamic: Option<String> = None;
         let shown = window.open(&mut self.calculator_open).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("CLASSWIZ-INSPIRED SCIENTIFIC WORKSPACE").small().strong().color(Color32::from_rgb(104, 167, 245)));
@@ -2485,6 +4025,38 @@ impl NovaApp {
                         if ui.button("Calculate  ↵").clicked() { evaluate_now = true; }
                         if ui.button("Clear").clicked() { clear_now = true; }
                         if ui.button("⌫").clicked() { let _ = self.calc_expression.pop(); }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("MS").on_hover_text("Store the last answer in memory").clicked() {
+                            self.calc_memory = self.calc_answer;
+                            self.calc_memory_present = true;
+                        }
+                        if ui.button("M+").clicked() {
+                            let updated = self.calc_memory + self.calc_answer;
+                            if updated.is_finite() {
+                                self.calc_memory = updated;
+                                self.calc_memory_present = true;
+                            } else {
+                                self.calc_result = "Memory overflow: result was not stored.".to_owned();
+                            }
+                        }
+                        if ui.button("M−").clicked() {
+                            let updated = self.calc_memory - self.calc_answer;
+                            if updated.is_finite() {
+                                self.calc_memory = updated;
+                                self.calc_memory_present = true;
+                            } else {
+                                self.calc_result = "Memory overflow: result was not stored.".to_owned();
+                            }
+                        }
+                        if ui.add_enabled(self.calc_memory_present, egui::Button::new("MR")).clicked() {
+                            inserted_dynamic = Some(format_number(self.calc_memory));
+                        }
+                        if ui.add_enabled(self.calc_memory_present, egui::Button::new("MC")).clicked() {
+                            self.calc_memory = 0.0;
+                            self.calc_memory_present = false;
+                        }
+                        ui.label(RichText::new(if self.calc_memory_present { format!("M = {}", format_number(self.calc_memory)) } else { "Memory empty".to_owned() }).small().weak());
                     });
                     ui.add_space(5.0);
                     egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -2631,8 +4203,12 @@ impl NovaApp {
                 });
             }
         });
-        if let Some(shown) = shown { self.window_rects.insert("Calculator".to_owned(), shown.response.rect); }
+        if let Some(shown) = shown {
+            self.window_rects.insert("Calculator".to_owned(), shown.response.rect);
+            if shown.response.hovered() { self.mark_window_active(ctx, "Calculator"); }
+        }
         if let Some(value) = inserted { self.calc_expression.push_str(value); }
+        if let Some(value) = inserted_dynamic { self.calc_expression.push_str(&value); }
         if clear_now { self.calc_expression.clear(); self.calc_result = "0".to_owned(); }
         if evaluate_now {
             let context = EvalContext { angle: self.calc_angle, ans: self.calc_answer, x: 0.0 };
@@ -2652,31 +4228,82 @@ impl NovaApp {
         if self.monitor_open && self.monitor.is_none() && self.monitor_error.is_none() {
             match System::new() {
                 Ok(system) => self.monitor = Some(system),
-                Err(error) => self.monitor_error = Some(format!("System Monitor unavailable: {error:?}")),
+                Err(error) => self.monitor_error = Some(format!("Hardware Center unavailable: {error:?}")),
             }
         }
+        if self.monitor_open && self.hardware.is_none() {
+            self.hardware = Some(HardwareTelemetry::new());
+        }
+        if self.monitor_open {
+            if let Some(hardware) = self.hardware.as_mut() {
+                if hardware.refresh() {
+                    self.hardware_snapshot = hardware.snapshot().clone();
+                }
+            }
+        }
+
         let metrics = if self.monitor_open {
             if let Some(monitor) = self.monitor.as_mut() {
                 if self.last_monitor_refresh.elapsed() >= Duration::from_secs(1) {
-                    // Refresh only the metrics shown here. refresh_all() also walks every
-                    // process and gathers expensive details that the monitor never displays.
                     monitor.refresh_cpu_usage();
                     monitor.refresh_memory();
+                    if self.monitor_cpu_baseline_captured {
+                        self.monitor_cpu_sample_ready = true;
+                    } else {
+                        self.monitor_cpu_baseline_captured = true;
+                    }
                     self.last_monitor_refresh = Instant::now();
                 }
-                if self.last_process_refresh.elapsed() >= Duration::from_secs(10) {
+                if self.last_cpu_frequency_refresh.elapsed() >= Duration::from_secs(5) {
+                    monitor.refresh_cpu_frequency();
+                    self.last_cpu_frequency_refresh = Instant::now();
+                }
+                if self.last_process_refresh.elapsed() >= Duration::from_secs(5) {
                     monitor.refresh_processes_specifics(
                         ProcessesToUpdate::All,
                         true,
-                        ProcessRefreshKind::nothing().without_tasks(),
+                        ProcessRefreshKind::nothing().with_cpu().with_memory().without_tasks(),
                     );
+                    let mut refreshed_rows: Vec<ProcessMetric> = monitor.processes().iter().map(|(pid, process)| ProcessMetric {
+                        pid: pid.as_u32().to_string(),
+                        name: process.name().to_string_lossy().into_owned(),
+                        cpu_percent: {
+                            let usage = process.cpu_usage();
+                            if usage.is_finite() { usage.clamp(0.0, 100.0) } else { 0.0 }
+                        },
+                        memory_bytes: process.memory(),
+                    }).collect();
+                    refreshed_rows.sort_by(|a, b| {
+                        b.cpu_percent.total_cmp(&a.cpu_percent)
+                            .then_with(|| b.memory_bytes.cmp(&a.memory_bytes))
+                    });
+                    refreshed_rows.truncate(30);
+                    self.monitor_process_rows = refreshed_rows;
+                    if self.monitor_process_baseline_captured {
+                        self.monitor_process_cpu_ready = true;
+                    } else {
+                        self.monitor_process_baseline_captured = true;
+                    }
                     self.last_process_refresh = Instant::now();
                 }
-                let cpu = monitor.global_cpu_usage();
+                let reported_cpu = monitor.global_cpu_usage();
+                let cpu = if reported_cpu.is_finite() { reported_cpu.clamp(0.0, 100.0) } else { 0.0 };
                 let used = monitor.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
                 let total = monitor.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-                let processes = monitor.processes().len();
-                Some((cpu, used, total, processes))
+                let swap_used = monitor.used_swap() as f64 / 1024.0 / 1024.0 / 1024.0;
+                let swap_total = monitor.total_swap() as f64 / 1024.0 / 1024.0 / 1024.0;
+                let process_count = monitor.processes().len();
+                let process_rows = self.monitor_process_rows.clone();
+                let cpu_name = monitor.cpus().first().map(|cpu| cpu.brand().trim().to_owned()).filter(|name| !name.is_empty());
+                let cpu_cores: Vec<CpuCoreMetric> = monitor.cpus().iter().enumerate().map(|(index, cpu)| {
+                    let reported_name = cpu.name().trim();
+                    CpuCoreMetric {
+                        name: if reported_name.is_empty() { format!("CPU {}", index + 1) } else { reported_name.to_owned() },
+                        usage_percent: cpu.usage().clamp(0.0, 100.0),
+                        frequency_mhz: cpu.frequency(),
+                    }
+                }).collect();
+                Some((cpu, used, total, swap_used, swap_total, process_count, process_rows, cpu_name, cpu_cores, self.monitor_cpu_sample_ready, self.monitor_process_cpu_ready))
             } else {
                 None
             }
@@ -2686,44 +4313,274 @@ impl NovaApp {
         let monitor_error = self.monitor_error.clone();
 
         let snap = self.take_window_snap("Monitor", ctx);
-        let mut window = egui::Window::new("NOVA System Monitor")
+        let mut window = egui::Window::new("NOVA Hardware Center")
+            .order(self.window_order("Monitor"))
             .collapsible(false)
             .fade_in(!self.settings.reduce_motion)
             .fade_out(!self.settings.reduce_motion)
-            .default_size([430.0, 300.0]);
+            .default_size([760.0, 570.0]);
         if let Some((position, size)) = snap { window = window.current_pos(position).fixed_size(size); }
         let shown = window.open(&mut self.monitor_open).show(ctx, |ui| {
-                if let Some((cpu, used, total, processes)) = metrics {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new("CPU LOAD").small().weak().strong());
-                            ui.heading(format!("{cpu:.1}%"));
-                        });
-                        ui.separator();
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new("RUNNING PROCESSES").small().weak().strong());
-                            ui.heading(processes.to_string());
-                        });
-                    });
-                    ui.add(egui::ProgressBar::new((cpu / 100.0).clamp(0.0, 1.0)).show_percentage());
-                    ui.add_space(12.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("MEMORY").small().weak().strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(format!("{used:.2} / {total:.2} GB"));
-                        });
-                    });
-                    ui.add(egui::ProgressBar::new(if total > 0.0 { (used / total) as f32 } else { 0.0 }).show_percentage());
-                } else {
-                    ui.colored_label(
-                        Color32::LIGHT_RED,
-                        monitor_error.as_deref().unwrap_or("System information is unavailable on this device."),
-                    );
+            let Some((cpu, used, total, swap_used, swap_total, process_count, process_rows, cpu_name, cpu_cores, cpu_sample_ready, process_cpu_ready)) = metrics.as_ref() else {
+                ui.colored_label(Color32::LIGHT_RED, monitor_error.as_deref().unwrap_or("System information is unavailable on this device."));
+                return;
+            };
+
+            let snapshot = &self.hardware_snapshot;
+            ui.horizontal_wrapped(|ui| {
+                let tabs = ["Overview", "Processes", "Storage", "Network", "GPU & Power", "Sensors & Controls"];
+                for (index, label) in tabs.iter().enumerate() {
+                    if ui.selectable_label(self.monitor_tab == index, *label).clicked() {
+                        self.monitor_tab = index;
+                    }
                 }
-                ui.separator();
-                ui.label(RichText::new("Metrics are provided by the Windows host; NOVA is a desktop environment, not a separate kernel.").small().weak());
+                if ui.button("↻ Refresh").on_hover_text("Refresh hardware telemetry").clicked() {
+                    if let Some(hardware) = self.hardware.as_mut() {
+                        hardware.request_refresh();
+                    }
+                    self.last_monitor_refresh = Instant::now().checked_sub(Duration::from_secs(2)).unwrap_or_else(Instant::now);
+                }
             });
-        if let Some(shown) = shown { self.window_rects.insert("Monitor".to_owned(), shown.response.rect); }
+            ui.separator();
+
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                match self.monitor_tab {
+                    0 => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("CPU LOAD").small().weak().strong());
+                                ui.heading(if *cpu_sample_ready { format!("{cpu:.1}%") } else { "Sampling…".to_owned() });
+                            });
+                            ui.separator();
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("MEMORY").small().weak().strong());
+                                ui.heading(format!("{used:.2} / {total:.2} GiB"));
+                            });
+                            ui.separator();
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("PROCESSES").small().weak().strong());
+                                ui.heading(process_count.to_string());
+                            });
+                        });
+                        if *cpu_sample_ready {
+                            ui.add(egui::ProgressBar::new((*cpu / 100.0).clamp(0.0, 1.0)).show_percentage());
+                        } else {
+                            ui.label("Collecting the first CPU sample; usage appears after the next refresh.");
+                        }
+                        ui.add_space(6.0);
+                        let ram_fraction = if *total > 0.0 { (*used / *total) as f32 } else { 0.0 };
+                        ui.add(egui::ProgressBar::new(ram_fraction.clamp(0.0, 1.0)).text("RAM"));
+                        if *swap_total > 0.0 {
+                            ui.label(format!("Swap: {swap_used:.2} / {swap_total:.2} GiB"));
+                            ui.add(egui::ProgressBar::new(((*swap_used / *swap_total) as f32).clamp(0.0, 1.0)).text("Page file / swap"));
+                        } else {
+                            ui.label("Page file / swap: unavailable or disabled");
+                        }
+                        ui.add_space(12.0);
+                        ui.heading("Processor");
+                        ui.label(cpu_name.as_deref().unwrap_or("CPU model unavailable"));
+                        ui.label(format!("{} logical processor(s)", cpu_cores.len()));
+                        egui::CollapsingHeader::new("Per-core usage and frequency")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                if cpu_cores.is_empty() {
+                                    ui.label("Per-core telemetry is unavailable.");
+                                }
+                                egui::Grid::new("nova-hardware-cpu-core-grid").striped(true).show(ui, |ui| {
+                                    ui.strong("Core"); ui.strong("Usage"); ui.strong("Frequency"); ui.end_row();
+                                    for core in cpu_cores {
+                                        ui.label(&core.name);
+                                        if *cpu_sample_ready {
+                                            ui.add(egui::ProgressBar::new((core.usage_percent / 100.0).clamp(0.0, 1.0)).desired_width(110.0).text(format!("{:.1}%", core.usage_percent)));
+                                        } else {
+                                            ui.label("Sampling…");
+                                        }
+                                        ui.label(if core.frequency_mhz > 0 { format!("{} MHz", core.frequency_mhz) } else { "—".to_owned() });
+                                        ui.end_row();
+                                    }
+                                });
+                            });
+                        let os_name = System::name().unwrap_or_else(|| "Windows host".to_owned());
+                        let os_version = System::os_version().unwrap_or_default();
+                        ui.label(if os_version.is_empty() { os_name } else { format!("{os_name} {os_version}") });
+                        ui.add_space(12.0);
+                        ui.heading("Storage overview");
+                        if snapshot.disks.is_empty() {
+                            ui.label(if snapshot.disk_provider_available { "No mounted storage volumes were reported." } else { "Storage telemetry is unavailable on this host." });
+                        } else {
+                            for disk in &snapshot.disks {
+                                let used_bytes = disk.total_bytes.saturating_sub(disk.available_bytes);
+                                let fraction = if disk.total_bytes == 0 { 0.0 } else { used_bytes as f32 / disk.total_bytes as f32 };
+                                ui.label(format!("{}  ·  {} free of {}", disk.mount_point, hardware::format_bytes(disk.available_bytes), hardware::format_bytes(disk.total_bytes)));
+                                ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).show_percentage());
+                            }
+                        }
+                        ui.add_space(10.0);
+                        ui.heading("Network throughput");
+                        let rates_ready = !snapshot.networks.is_empty() && snapshot.networks.iter().all(|network| network.rate_available);
+                        if snapshot.networks.is_empty() {
+                            ui.label(if snapshot.network_provider_available { "No active network interfaces were reported." } else { "Network telemetry is unavailable on this host." });
+                        } else if rates_ready {
+                            let down: f64 = snapshot.networks.iter().map(|network| network.received_per_sec).sum();
+                            let up: f64 = snapshot.networks.iter().map(|network| network.transmitted_per_sec).sum();
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!("↓ {}", hardware::format_rate(down)));
+                                ui.separator();
+                                ui.label(format!("↑ {}", hardware::format_rate(up)));
+                            });
+                        } else {
+                            ui.label("Network throughput: sampling baseline…");
+                        }
+                        if let Some(battery) = &snapshot.battery {
+                            ui.add_space(10.0);
+                            ui.heading("Power");
+                            let charge = match battery.battery_present {
+                                Some(true) => battery.charge_percent.map(|value| format!("{value}%")).unwrap_or_else(|| "Unknown".to_owned()),
+                                Some(false) => "No battery".to_owned(),
+                                None => "Battery status unknown".to_owned(),
+                            };
+                            ui.label(format!("Battery: {charge}{}", if battery.charging { " · Charging" } else { "" }));
+                        }
+                    }
+                    1 => {
+                        ui.heading(if *process_cpu_ready { "Top processes by CPU" } else { "Processes" });
+                        ui.label(RichText::new(if *process_cpu_ready { "Process readings refresh every 5 seconds. Values are reported by the Windows host." } else { "Collecting a baseline; process CPU rankings become accurate after the next five-second refresh." }).small().weak());
+                        egui::Grid::new("nova-process-grid").striped(true).min_col_width(48.0).show(ui, |ui| {
+                            ui.strong("PID"); ui.strong("Process"); ui.strong("CPU"); ui.strong("Memory"); ui.end_row();
+                            for process in process_rows {
+                                ui.monospace(&process.pid);
+                                ui.label(RichText::new(&process.name).size(12.0));
+                                ui.label(if *process_cpu_ready { format!("{:.1}%", process.cpu_percent) } else { "Sampling…".to_owned() });
+                                ui.label(hardware::format_bytes(process.memory_bytes));
+                                ui.end_row();
+                            }
+                        });
+                        if process_rows.is_empty() { ui.label("No process data is available yet."); }
+                    }
+                    2 => {
+                        ui.heading("Storage volumes");
+                        if snapshot.disks.is_empty() {
+                            ui.label(if snapshot.disk_provider_available { "No mounted volumes were reported." } else { "Storage telemetry is unavailable on this host." });
+                        }
+                        for disk in &snapshot.disks {
+                            let used_bytes = disk.total_bytes.saturating_sub(disk.available_bytes);
+                            let fraction = if disk.total_bytes == 0 { 0.0 } else { used_bytes as f32 / disk.total_bytes as f32 };
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.heading(&disk.mount_point);
+                                    ui.label(RichText::new(if disk.removable { "Removable" } else { "Fixed / mounted" }).small().weak());
+                                    if disk.read_only { ui.label(RichText::new("Read-only").small().color(Color32::YELLOW)); }
+                                });
+                                ui.label(format!("{}  ·  {}", disk.name, if disk.file_system.is_empty() { "Filesystem unknown" } else { &disk.file_system }));
+                                ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).show_percentage());
+                                ui.label(format!("{} used  ·  {} available  ·  {} total", hardware::format_bytes(used_bytes), hardware::format_bytes(disk.available_bytes), hardware::format_bytes(disk.total_bytes)));
+                            });
+                        }
+                        ui.label(RichText::new("Disk activity counters are not shown as utilization because their availability varies by driver and storage controller.").small().weak());
+                    }
+                    3 => {
+                        ui.heading("Network interfaces");
+                        if snapshot.networks.is_empty() {
+                            ui.label(if snapshot.network_provider_available { "No active network interfaces were reported." } else { "Network telemetry is unavailable on this host." });
+                        }
+                        for network in &snapshot.networks {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.heading(&network.name);
+                                ui.horizontal_wrapped(|ui| {
+                                    if network.rate_available {
+                                        ui.label(format!("↓ {}", hardware::format_rate(network.received_per_sec)));
+                                        ui.separator();
+                                        ui.label(format!("↑ {}", hardware::format_rate(network.transmitted_per_sec)));
+                                    } else {
+                                        ui.label("Throughput: sampling baseline…");
+                                    }
+                                });
+                                ui.label(format!("Received {} total  ·  Sent {} total", hardware::format_bytes(network.total_received), hardware::format_bytes(network.total_transmitted)));
+                            });
+                        }
+                        ui.label(RichText::new("Traffic is sampled per interface; link speed and Wi-Fi signal strength are not inferred from throughput.").small().weak());
+                    }
+                    4 => {
+                        ui.heading("Graphics adapters");
+                        if snapshot.gpus.is_empty() {
+                            ui.label(if snapshot.gpu_provider_available { "No GPU adapters were reported." } else { "GPU telemetry provider is unavailable. Check the graphics driver and Windows support." });
+                        }
+                        for gpu in &snapshot.gpus {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.heading(&gpu.name);
+                                if let Some(usage) = gpu.usage_percent {
+                                    ui.label(format!("GPU engine usage: {usage:.1}%"));
+                                    ui.add(egui::ProgressBar::new((usage / 100.0).clamp(0.0, 1.0)).show_percentage());
+                                } else {
+                                    ui.label("GPU usage: waiting for driver sample / unavailable");
+                                }
+                                match (gpu.used_memory, gpu.total_memory) {
+                                    (Some(used), Some(total)) if total > 0 => {
+                                        ui.label(format!("Dedicated VRAM: {} / {}", hardware::format_bytes(used), hardware::format_bytes(total)));
+                                        ui.add(egui::ProgressBar::new(((used as f64 / total as f64) as f32).clamp(0.0, 1.0)).show_percentage());
+                                    }
+                                    (_, Some(total)) => { ui.label(format!("Dedicated VRAM total: {} · usage unavailable", hardware::format_bytes(total))); }
+                                    _ => { ui.label("Dedicated VRAM counters are not exposed by this adapter/driver."); }
+                                }
+                            });
+                        }
+                        ui.add_space(10.0);
+                        ui.heading("Battery and power");
+                        if let Some(battery) = &snapshot.battery {
+                            let ac = match battery.ac_online { Some(true) => "AC power", Some(false) => "Battery power", None => "Power source unknown" };
+                            ui.label(ac);
+                            match battery.battery_present {
+                                Some(true) => {
+                                    ui.label(format!("Charge: {}{}", battery.charge_percent.map(|value| format!("{value}%")).unwrap_or_else(|| "Unknown".to_owned()), if battery.charging { " · Charging" } else { "" }));
+                                    if let Some(seconds) = battery.remaining_seconds { ui.label(format!("Estimated remaining time: {}", hardware::format_duration(seconds))); }
+                                }
+                                Some(false) => { ui.label("No battery is reported by Windows."); }
+                                None => { ui.label("Windows could not determine whether a battery is present."); }
+                            }
+                            ui.label(format!("Battery saver: {}", if battery.battery_saver { "On" } else { "Off" }));
+                        } else {
+                            ui.label("Windows power status is unavailable on this device.");
+                        }
+                    }
+                    _ => {
+                        ui.heading("Temperature sensors");
+                        if snapshot.sensors.is_empty() {
+                            ui.label(if snapshot.sensor_provider_available { "No temperature sensors are exposed by the current driver/firmware provider." } else { "Temperature sensor provider is unavailable." });
+                        }
+                        for sensor in &snapshot.sensors {
+                            ui.horizontal(|ui| {
+                                ui.label(&sensor.name);
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.strong(format!("{:.1} °C", sensor.temperature_c)); });
+                            });
+                        }
+                        ui.separator();
+                        ui.heading("Windows hardware controls");
+                        ui.label(RichText::new("These buttons open Windows' own controls. NOVA does not emulate or override device-specific controls when Windows/driver support is required.").small().weak());
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Display / brightness").clicked() { self.status_message = hardware_control_status(HostControl::Display); }
+                            if ui.button("Sound / volume").clicked() { self.status_message = hardware_control_status(HostControl::Sound); }
+                            if ui.button("Network").clicked() { self.status_message = hardware_control_status(HostControl::Network); }
+                            if ui.button("Bluetooth").clicked() { self.status_message = hardware_control_status(HostControl::Bluetooth); }
+                            if ui.button("Power settings").clicked() { self.status_message = hardware_control_status(HostControl::Power); }
+                        });
+                    }
+                }
+            });
+            ui.separator();
+            ui.label(RichText::new("Telemetry is read from the Windows host. GPU and temperature availability depends on the installed driver/firmware; unsupported readings are shown as unavailable.").small().weak());
+        });
+        if let Some(shown) = shown {
+            self.window_rects.insert("Monitor".to_owned(), shown.response.rect);
+            if shown.response.hovered() { self.mark_window_active(ctx, "Monitor"); }
+        }
+    }
+
+}
+
+fn hardware_control_status(control: HostControl) -> String {
+    match hardware::open_host_control(control) {
+        Ok(()) => format!("Opened Windows {control:?} settings."),
+        Err(error) => format!("Could not open Windows {control:?} settings: {error}"),
     }
 }
 
@@ -2736,15 +4593,31 @@ impl eframe::App for NovaApp {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
         self.apply_theme(&ctx);
-        let (toggle_start, open_files, open_monitor, close_panels) = ctx.input(|input| (
+        self.poll_security_tool_launch();
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested && self.editor_dirty {
+            // Cancel the host close until the document has been saved or the
+            // user explicitly discards it in the Editor confirmation dialog.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_editor_action(PendingEditorAction::ExitApplication);
+        }
+        let (toggle_start, open_files, open_monitor, close_panels, save_editor_shortcut) = ctx.input(|input| (
             input.modifiers.ctrl && input.key_pressed(egui::Key::Space),
             input.modifiers.ctrl && input.key_pressed(egui::Key::E),
             input.modifiers.ctrl && input.modifiers.shift && input.key_pressed(egui::Key::Escape),
             input.key_pressed(egui::Key::Escape),
+            self.editor_open && input.modifiers.ctrl && input.key_pressed(egui::Key::S),
         ));
-        if toggle_start { self.start_open = !self.start_open; self.notification_open = false; }
-        if open_files { self.files_open = true; self.ensure_files_loaded(); }
-        if open_monitor { self.monitor_open = true; }
+        if toggle_start { self.start_open = !self.start_open; self.notification_open = false; self.task_view_open = false; }
+        if save_editor_shortcut && self.editor_overwrite_pending.is_none() {
+            if self.editor_pending_action.is_some() {
+                self.resolve_editor_pending_action(EditorDecision::Save);
+            } else if let Err(error) = self.save_editor_document(false) {
+                self.editor_status = error;
+            }
+        }
+        if open_files { self.open_app("Files"); }
+        if open_monitor { self.open_app("Monitor"); }
         if close_panels {
             if self.security_confirm_clear_quarantine {
                 self.security_confirm_clear_quarantine = false;
@@ -2755,6 +4628,7 @@ impl eframe::App for NovaApp {
             } else {
                 self.start_open = false;
                 self.notification_open = false;
+                self.task_view_open = false;
             }
         }
 
@@ -2778,6 +4652,14 @@ impl eframe::App for NovaApp {
                         .show(ui, |ui| {
                             ui.set_min_size(egui::vec2(ui.available_width(), desktop_content_height));
                             let rect = ui.max_rect();
+                            let desktop_size = rect.size();
+                            if desktop_layout_changed(self.desktop_last_size, desktop_size) {
+                                // Re-seed shortcut Areas from their normalized Settings
+                                // positions after a resize; otherwise egui retains old pixels.
+                                self.desktop_layout_generation = self.desktop_layout_generation.wrapping_add(1);
+                            }
+                            self.desktop_last_size = Some(desktop_size);
+                            self.desktop_rect = Some(rect);
                             if !self.settings.reduce_motion {
                                 ui.painter().circle_filled(
                                     rect.right_top() + egui::vec2(-155.0, 165.0),
@@ -2806,20 +4688,7 @@ impl eframe::App for NovaApp {
                                 ui.label(RichText::new("Desktop").small().strong().color(if dark { Color32::from_rgb(194, 207, 229) } else { Color32::from_rgb(74, 91, 119) }));
                                 ui.add_space(7.0);
 
-                                let desktop_columns = ((ui.available_width() / 108.0).floor() as usize).clamp(1, 7);
-                                egui::Grid::new("nova-desktop-shortcuts")
-                                    .num_columns(desktop_columns)
-                                    .spacing(egui::vec2(5.0, 6.0))
-                                    .show(ui, |ui| {
-                                        for (index, name) in DESKTOP_SHORTCUTS.iter().enumerate() {
-                                            if let Some(app) = START_APPS.iter().find(|app| app.name == *name).copied() {
-                                                if self.app_icon_button(ui, app, egui::vec2(94.0, 88.0), true) {
-                                                    self.open_app(app.name);
-                                                }
-                                            }
-                                            if index % desktop_columns == desktop_columns - 1 { ui.end_row(); }
-                                        }
-                                    });
+                                ui.label(RichText::new("Right-click shortcuts to pin apps · Drag icons to arrange the desktop").small().weak());
 
                                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                                     egui::Frame::new()
@@ -2839,11 +4708,19 @@ impl eframe::App for NovaApp {
                 });
             });
 
+        if let Some(desktop_rect) = self.desktop_rect {
+            self.desktop_shortcuts(&ctx, desktop_rect);
+        }
+
         // Draw app windows first. Shell surfaces are rendered afterward so Start,
         // Quick Settings and the floating dock stay above every workspace window.
         self.terminal_window(&ctx);
         self.files_window(&ctx);
         self.editor_window(&ctx);
+        if self.exit_after_editor {
+            self.exit_after_editor = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         self.settings_window(&ctx);
         self.calculator_window(&ctx);
         self.monitor_window(&ctx);
@@ -2853,6 +4730,13 @@ impl eframe::App for NovaApp {
         for info in &security_tools::TOOLS {
             self.security_tool_window(&ctx, info.tool);
         }
+        if self.security_launch_receiver.is_some() {
+            // Poll the bounded Authenticode check without blocking the UI thread.
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        self.prune_closed_window_state();
+        self.capture_status_activity();
+        self.window_switcher(&ctx);
         self.notification_center(&ctx);
         self.start_menu(&ctx);
         egui::Area::new(egui::Id::unique("nova-taskbar-floating-dock"))
@@ -3064,7 +4948,9 @@ fn vector_calculate(a: &str, b: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_file_name, format_number, start_menu_dimensions, taskbar_rail_widths, START_APPS, START_PINS};
+    use std::collections::BTreeMap;
+    use eframe::egui;
+    use super::{compact_file_name, desktop_default_position, desktop_layout_changed, desktop_shortcut_travel, format_number, move_pinned_app, normalize_desktop_positions, normalize_pinned_apps, start_menu_dimensions, taskbar_rail_widths, workspace_is_active, START_APPS, START_PINS};
     use crate::storage::Settings;
 
     #[test]
@@ -3095,6 +4981,14 @@ mod tests {
     }
 
     #[test]
+    fn taskbar_marks_only_the_foreground_open_window_as_active() {
+        assert!(workspace_is_active(Some("Files"), "Files", true));
+        assert!(!workspace_is_active(Some("Files"), "Terminal", true));
+        assert!(!workspace_is_active(Some("Files"), "Files", false));
+        assert!(!workspace_is_active(None, "Files", true));
+    }
+
+    #[test]
     fn taskbar_rails_never_exceed_available_width() {
         for width in [0.0, 48.0, 160.0, 320.0, 440.0, 520.0, 760.0, 900.0, 1280.0, 2560.0] {
             let (left, center, right, _, _) = taskbar_rail_widths(width);
@@ -3115,6 +5009,55 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn start_pins_can_be_reordered_without_losing_entries() {
+        let mut pins = vec!["Files".to_owned(), "Terminal".to_owned(), "Editor".to_owned()];
+        assert!(move_pinned_app(&mut pins, "Editor", -1));
+        assert_eq!(pins, vec!["Files", "Editor", "Terminal"]);
+        assert!(!move_pinned_app(&mut pins, "Files", -1));
+        assert!(!move_pinned_app(&mut pins, "Missing", 1));
+    }
+
+    #[test]
+    fn desktop_positions_reject_unknown_and_non_finite_values() {
+        let mut positions = BTreeMap::new();
+        positions.insert("Files".to_owned(), [0.2, 0.8]);
+        positions.insert("Unknown App".to_owned(), [0.5, 0.5]);
+        positions.insert("Terminal".to_owned(), [f32::NAN, 0.4]);
+        positions.insert("Editor".to_owned(), [1.8, -0.2]);
+        let normalized = normalize_desktop_positions(&positions);
+        assert_eq!(normalized.get("Files"), Some(&[0.2, 0.8]));
+        assert_eq!(normalized.get("Editor"), Some(&[1.0, 0.0]));
+        assert!(!normalized.contains_key("Unknown App"));
+        assert!(!normalized.contains_key("Terminal"));
+    }
+
+    #[test]
+    fn desktop_layout_reseeds_icon_positions_only_after_a_real_resize() {
+        assert!(!desktop_layout_changed(None, egui::vec2(800.0, 600.0)));
+        assert!(!desktop_layout_changed(Some(egui::vec2(800.0, 600.0)), egui::vec2(800.5, 600.5)));
+        assert!(desktop_layout_changed(Some(egui::vec2(800.0, 600.0)), egui::vec2(1024.0, 600.0)));
+        assert!(desktop_layout_changed(Some(egui::vec2(800.0, 600.0)), egui::vec2(800.0, 500.0)));
+    }
+
+    #[test]
+    fn desktop_shortcut_normalized_travel_accounts_for_icon_size_and_insets() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(800.0, 600.0));
+        assert_eq!(desktop_shortcut_travel(rect), (690.0, 450.0));
+        let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(80.0, 100.0));
+        assert_eq!(desktop_shortcut_travel(tiny), (1.0, 1.0));
+    }
+
+    #[test]
+    fn desktop_default_positions_stay_inside_expected_grid_rows() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(640.0, 480.0));
+        let first = desktop_default_position(0, rect, 5);
+        let sixth = desktop_default_position(5, rect, 5);
+        assert_eq!(first, egui::pos2(24.0, 86.0));
+        assert_eq!(sixth, egui::pos2(24.0, 180.0));
+    }
+
     #[test]
     fn compact_file_names_truncate_without_splitting_unicode_scalars() {
         assert_eq!(compact_file_name("report.txt", 20), "report.txt");
@@ -3130,6 +5073,37 @@ mod tests {
             assert!(menu_width >= 1.0 && menu_width <= width);
             assert!(scroll_height >= 1.0 && scroll_height <= height);
         }
+    }
+
+    #[test]
+    fn discarding_editor_changes_restores_the_last_saved_snapshot() {
+        let mut current = "unsaved edits".to_owned();
+        discard_unsaved_editor_text(&mut current, "last saved text");
+        assert_eq!(current, "last saved text");
+    }
+
+    #[test]
+    fn new_editor_document_uses_an_unused_untitled_name() {
+        let base = std::env::temp_dir().join(format!("nova-editor-untitled-name-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("Untitled.txt"), "keep").unwrap();
+        std::fs::write(base.join("Untitled (2).txt"), "keep too").unwrap();
+        assert_eq!(next_untitled_file_name(&base).unwrap(), "Untitled (3).txt");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn invalid_and_duplicate_settings_pins_are_removed() {
+        let raw = vec![
+            "Files".to_owned(), "Unknown App".to_owned(), "Files".to_owned(),
+            "Terminal".to_owned(), "../../outside.exe".to_owned(),
+        ];
+        assert_eq!(normalize_pinned_apps(&raw), vec!["Files".to_owned(), "Terminal".to_owned()]);
+    }
+
+    #[test]
+    fn empty_settings_pins_remain_empty_instead_of_repinning_apps() {
+        assert!(normalize_pinned_apps(&[]).is_empty());
     }
 
     #[test]
@@ -3167,6 +5141,28 @@ mod tests {
         let result = super::vector_calculate("1,2,3", "4,5,6");
         assert!(result.contains("A·B = 32"));
         assert!(result.contains("A×B = (-3, 6, -3)"));
+    }
+
+    #[test]
+    fn editor_replace_all_counts_matches_and_preserves_non_matches() {
+        let (updated, count) = super::replace_all_bounded("hello world, hello", "hello", "NOVA", 64).unwrap();
+        assert_eq!(updated, "NOVA world, NOVA");
+        assert_eq!(count, 2);
+        let (unchanged, count) = super::replace_all_bounded("hello", "missing", "x", 64).unwrap();
+        assert_eq!(unchanged, "hello");
+        assert_eq!(count, 0);
+        let (same, count) = super::replace_all_bounded("hello", "hello", "hello", 64).unwrap();
+        assert_eq!(same, "hello");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn editor_replace_all_checks_output_size_before_allocating() {
+        let error = super::replace_all_bounded("aaaa", "a", "0123456789", 16).unwrap_err();
+        assert!(error.contains("exceed"));
+        let (unchanged, count) = super::replace_all_bounded("hello", "", "x", 64).unwrap();
+        assert_eq!(unchanged, "hello");
+        assert_eq!(count, 0);
     }
 
     #[test]

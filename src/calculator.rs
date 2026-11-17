@@ -166,9 +166,9 @@ impl Parser {
             "normalpdf" => { let (x,mu,sigma)=three()?; if sigma<=0.0 { return Err("Normal distribution sigma must be positive".into()); } let z=(x-mu)/sigma; (-0.5*z*z).exp()/(sigma*(2.0*PI).sqrt()) },
             "normalcdf" => { let (lo,hi,mu,sigma)=four()?; if sigma<=0.0 || lo>hi { return Err("Normal CDF requires sigma > 0 and lower ≤ upper".into()); } 0.5*(erf_approx((hi-mu)/(sigma*2.0_f64.sqrt()))-erf_approx((lo-mu)/(sigma*2.0_f64.sqrt()))) },
             "binompdf" => { let (n,p,k)=three()?; binomial_probability(n,p,k)? },
-            "binomcdf" => { let (n,p,k)=three()?; let (n,p,k)=validate_binomial(n,p,k)?; let mut total=0.0; for v in 0..=k { total+=binomial_probability(n as f64,p,v as f64)?; } total },
+            "binomcdf" => { let (n,p,k)=three()?; binomial_cumulative_probability(n,p,k)? },
             "poissonpdf" => { let (lambda,k)=two()?; poisson_probability(lambda,k)? },
-            "poissoncdf" => { let (lambda,k)=two()?; let k=validate_count(k,170)?; let mut total=0.0; for v in 0..=k { total+=poisson_probability(lambda,v as f64)?; } total },
+            "poissoncdf" => { let (lambda,k)=two()?; poisson_cumulative_probability(lambda,k)? },
             "gcd" => { let (a,b)=two()?; gcd_integer(a,b)? as f64 },
             "lcm" => { let (a,b)=two()?; let g=gcd_integer(a,b)?; if g == 0 { 0.0 } else { ((a.abs() as i64 / g).checked_mul(b.abs() as i64).ok_or_else(|| "lcm result is too large".to_owned())?) as f64 } },
             "deg" => one()?.to_degrees(), "rad" => one()?.to_radians(),
@@ -178,10 +178,162 @@ impl Parser {
     }
 }
 
-fn validate_count(value:f64,max:u32)->Result<u32,String>{if value<0.0||value.fract()!=0.0||value>max as f64{Err(format!("Count must be an integer from 0 to {max}"))}else{Ok(value as u32)}}
-fn validate_binomial(n:f64,p:f64,k:f64)->Result<(u32,f64,u32),String>{let n=validate_count(n,10_000)?;let k=validate_count(k,n)?;if !(0.0..=1.0).contains(&p){return Err("Binomial probability p must be between 0 and 1".into());}Ok((n,p,k))}
-fn binomial_probability(n:f64,p:f64,k:f64)->Result<f64,String>{let(n,p,k)=validate_binomial(n,p,k)?;let r=k.min(n-k);let mut combination=1.0;for i in 1..=r{combination*=((n-r+i)as f64)/(i as f64);}finite(combination*p.powi(k as i32)*(1.0-p).powi((n-k)as i32))}
-fn poisson_probability(lambda:f64,k:f64)->Result<f64,String>{if !lambda.is_finite()||lambda<0.0{return Err("Poisson lambda must be non-negative".into());}let k=validate_count(k,170)?;let mut fact=1.0;for i in 1..=k{fact*=i as f64;}finite((-lambda).exp()*lambda.powi(k as i32)/fact)}
+fn validate_count(value: f64, max: u32) -> Result<u32, String> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > max as f64 {
+        Err(format!("Count must be an integer from 0 to {max}"))
+    } else {
+        Ok(value as u32)
+    }
+}
+
+fn validate_binomial(n: f64, p: f64, k: f64) -> Result<(u32, f64, u32), String> {
+    let n = validate_count(n, 10_000)?;
+    let k = validate_count(k, n)?;
+    if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+        return Err("Binomial probability p must be between 0 and 1".into());
+    }
+    Ok((n, p, k))
+}
+
+/// Evaluate a Binomial PMF in log space. Computing nCr directly overflows
+/// long before the final probability does for large but valid parameter sets.
+fn log_binomial_pmf(n: u32, p: f64, k: u32) -> f64 {
+    if p == 0.0 { return if k == 0 { 0.0 } else { f64::NEG_INFINITY }; }
+    if p == 1.0 { return if k == n { 0.0 } else { f64::NEG_INFINITY }; }
+
+    let r = k.min(n - k);
+    let mut log_combination = 0.0;
+    let mut compensation = 0.0;
+    for i in 1..=r {
+        let term = ((n - r + i) as f64).ln() - (i as f64).ln();
+        let adjusted = term - compensation;
+        let next = log_combination + adjusted;
+        compensation = (next - log_combination) - adjusted;
+        log_combination = next;
+    }
+    log_combination + (k as f64) * p.ln() + ((n - k) as f64) * (-p).ln_1p()
+}
+
+fn binomial_probability(n: f64, p: f64, k: f64) -> Result<f64, String> {
+    let (n, p, k) = validate_binomial(n, p, k)?;
+    finite(log_binomial_pmf(n, p, k).exp())
+}
+
+/// Stable Binomial CDF. Sum the shorter tail from its boundary PMF, avoiding
+/// upward recurrence from a probability that has already underflowed to zero.
+fn binomial_cumulative_probability(n: f64, p: f64, k: f64) -> Result<f64, String> {
+    let (n, p, k) = validate_binomial(n, p, k)?;
+    if p == 0.0 { return Ok(1.0); }
+    if p == 1.0 { return Ok(if k == n { 1.0 } else { 0.0 }); }
+    if k == n { return Ok(1.0); }
+
+    let mode = (((n as f64) + 1.0) * p).floor() as u32;
+    let mut sum = 0.0;
+    let mut compensation = 0.0;
+    if k < mode {
+        let mut v = k;
+        let mut term = log_binomial_pmf(n, p, v).exp();
+        while v > 0 && term > 0.0 {
+            let adjusted = term - compensation;
+            let next = sum + adjusted;
+            compensation = (next - sum) - adjusted;
+            sum = next;
+            term *= (v as f64) * (1.0 - p) / ((n - v + 1) as f64 * p);
+            v -= 1;
+        }
+        sum += term - compensation;
+        finite(sum.clamp(0.0, 1.0))
+    } else {
+        let mut v = k + 1;
+        let mut term = log_binomial_pmf(n, p, v).exp();
+        let mut quiet_steps = 0;
+        while v < n && term > 0.0 {
+            let adjusted = term - compensation;
+            let next = sum + adjusted;
+            compensation = (next - sum) - adjusted;
+            sum = next;
+            let next_term = term * ((n - v) as f64) * p / ((v + 1) as f64 * (1.0 - p));
+            if next_term <= sum.abs() * 1.0e-16 { quiet_steps += 1; } else { quiet_steps = 0; }
+            term = next_term;
+            v += 1;
+            if quiet_steps >= 4 { break; }
+        }
+        sum += term - compensation;
+        finite((1.0 - sum).clamp(0.0, 1.0))
+    }
+}
+
+fn log_factorial(n: u32) -> f64 {
+    let mut total = 0.0;
+    let mut compensation = 0.0;
+    for value in 2..=n {
+        let adjusted = (value as f64).ln() - compensation;
+        let next = total + adjusted;
+        compensation = (next - total) - adjusted;
+        total = next;
+    }
+    total
+}
+
+fn validate_poisson(lambda: f64, k: f64) -> Result<(f64, u32), String> {
+    if !lambda.is_finite() || lambda < 0.0 {
+        return Err("Poisson lambda must be non-negative".into());
+    }
+    Ok((lambda, validate_count(k, 10_000)?))
+}
+
+fn log_poisson_pmf(lambda: f64, k: u32) -> f64 {
+    if lambda == 0.0 { return if k == 0 { 0.0 } else { f64::NEG_INFINITY }; }
+    -lambda + (k as f64) * lambda.ln() - log_factorial(k)
+}
+
+fn poisson_probability(lambda: f64, k: f64) -> Result<f64, String> {
+    let (lambda, k) = validate_poisson(lambda, k)?;
+    finite(log_poisson_pmf(lambda, k).exp())
+}
+
+/// Stable Poisson CDF using recurrence from the decreasing side of the
+/// distribution. The upper tail is truncated only after it becomes negligible.
+fn poisson_cumulative_probability(lambda: f64, k: f64) -> Result<f64, String> {
+    let (lambda, k) = validate_poisson(lambda, k)?;
+    if lambda == 0.0 { return Ok(1.0); }
+
+    let mut sum = 0.0;
+    let mut compensation = 0.0;
+    if (k as f64) < lambda {
+        let mut v = k;
+        let mut term = log_poisson_pmf(lambda, v).exp();
+        while term > 0.0 {
+            let adjusted = term - compensation;
+            let next = sum + adjusted;
+            compensation = (next - sum) - adjusted;
+            sum = next;
+            if v == 0 { break; }
+            term *= (v as f64) / lambda;
+            v -= 1;
+        }
+        finite(sum.clamp(0.0, 1.0))
+    } else {
+        let mut v = k.saturating_add(1);
+        let mut term = log_poisson_pmf(lambda, v).exp();
+        let mut quiet_steps = 0;
+        // In this branch lambda <= k <= 10,000. The hard cap protects the UI.
+        while v < 100_000 && term > 0.0 {
+            let adjusted = term - compensation;
+            let next = sum + adjusted;
+            compensation = (next - sum) - adjusted;
+            sum = next;
+            let next_term = term * lambda / ((v + 1) as f64);
+            if next_term <= sum.abs() * 1.0e-16 { quiet_steps += 1; } else { quiet_steps = 0; }
+            term = next_term;
+            v += 1;
+            if quiet_steps >= 4 { break; }
+        }
+        sum += term - compensation;
+        finite((1.0 - sum).clamp(0.0, 1.0))
+    }
+}
+
 fn erf_approx(x:f64)->f64{let sign=if x<0.0{-1.0}else{1.0};let x=x.abs();let t=1.0/(1.0+0.3275911*x);let y=1.0-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*(-x*x).exp();sign*y}
 
 fn finite(value: f64) -> Result<f64, String> { if value.is_finite() { Ok(value) } else { Err("Math error: result is undefined or out of range".into()) } }
@@ -287,4 +439,53 @@ mod tests {
     #[test] fn statistics_calculates_sample_and_population_values(){let s=statistics(&[1.0,2.0,3.0]).unwrap();assert_eq!(s.mean,2.0);assert!((s.population_sd-(2.0_f64/3.0).sqrt()).abs()<1e-12);assert_eq!(s.sample_sd,Some(1.0));}
     #[test] fn quadratic_solver_handles_two_roots_linear_fallback_and_zero_b(){assert_eq!(solve_quadratic(1.0,-3.0,2.0).unwrap(),vec![1.0,2.0]);assert_eq!(solve_quadratic(0.0,2.0,-4.0).unwrap(),vec![2.0]);assert_eq!(solve_quadratic(1.0,0.0,-4.0).unwrap(),vec![-2.0,2.0]);}
     #[test] fn base_conversion_outputs_all_common_radices(){assert_eq!(convert_base("255",10).unwrap(),"BIN  11111111\nOCT  377\nDEC  255\nHEX  FF");}
+
+    #[test]
+    fn binomial_large_parameters_use_stable_log_probability() {
+        let context = super::EvalContext::default();
+        let pmf = super::evaluate("binompdf(10000,0.5,5000)", context).unwrap();
+        assert!((pmf - 0.00797864613938215).abs() < 1.0e-12, "{pmf}");
+        let cdf = super::evaluate("binomcdf(10000,0.5,5000)", context).unwrap();
+        assert!((cdf - 0.503989323069691).abs() < 1.0e-9, "{cdf}");
+    }
+
+    #[test]
+    fn binomial_probability_handles_degenerate_inputs() {
+        let context = super::EvalContext::default();
+        assert_eq!(super::evaluate("binompdf(20,0,0)", context).unwrap(), 1.0);
+        assert_eq!(super::evaluate("binompdf(20,0,1)", context).unwrap(), 0.0);
+        assert_eq!(super::evaluate("binompdf(20,1,20)", context).unwrap(), 1.0);
+        assert_eq!(super::evaluate("binomcdf(20,1,19)", context).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn binomial_and_poisson_cdf_cover_both_tails() {
+        let context = super::EvalContext::default();
+        let binomial_lower = super::evaluate("binomcdf(10000,0.001,5)", context).unwrap();
+        assert!((binomial_lower - 0.06699137339752664).abs() < 1.0e-10, "{binomial_lower}");
+        let binomial_upper = super::evaluate("binomcdf(10000,0.999,9990)", context).unwrap();
+        assert!((binomial_upper - 0.5421328760209828).abs() < 1.0e-9, "{binomial_upper}");
+        let poisson_lower = super::evaluate("poissoncdf(0.25,0)", context).unwrap();
+        assert!((poisson_lower - 0.7788007830714049).abs() < 1.0e-12, "{poisson_lower}");
+        let poisson_upper = super::evaluate("poissoncdf(10000,10000)", context).unwrap();
+        assert!((poisson_upper - 0.5026595812190077).abs() < 2.0e-6, "{poisson_upper}");
+    }
+
+    #[test]
+    fn poisson_large_lambda_uses_log_factorial_without_intermediate_overflow() {
+        let context = super::EvalContext::default();
+        let pmf = super::evaluate("poissonpdf(1000,1000)", context).unwrap();
+        assert!((pmf - 0.0126146113487217).abs() < 1.0e-12, "{pmf}");
+        let cdf = super::evaluate("poissoncdf(1000,1000)", context).unwrap();
+        assert!((cdf - 0.508409367168506).abs() < 2.0e-6, "{cdf}");
+    }
+
+    #[test]
+    fn poisson_probability_handles_zero_rate_and_large_counts() {
+        let context = super::EvalContext::default();
+        assert_eq!(super::evaluate("poissonpdf(0,0)", context).unwrap(), 1.0);
+        assert_eq!(super::evaluate("poissonpdf(0,5)", context).unwrap(), 0.0);
+        assert!(super::evaluate("poissonpdf(10000,5000)", context).unwrap().is_finite());
+    }
+
 }

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -25,6 +25,9 @@ pub struct Settings {
     pub reduce_motion: bool,
     pub accent: String,
     pub pinned_apps: Vec<String>,
+    /// Desktop shortcut positions normalized to the desktop work area (0.0..=1.0).
+    #[serde(default)]
+    pub desktop_icon_positions: BTreeMap<String, [f32; 2]>,
 }
 
 impl Default for Settings {
@@ -39,6 +42,7 @@ impl Default for Settings {
                 "UniKey".to_owned(), "Security Center".to_owned(), "Settings".to_owned(),
                 "Trash".to_owned(), "Network Discovery".to_owned(), "Packet Analyzer".to_owned(),
             ],
+            desktop_icon_positions: BTreeMap::new(),
         }
     }
 }
@@ -71,7 +75,7 @@ fn ensure_real_directory_chain(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Replace a small JSON file without exposing a partially-written document if
+/// Replace a user-data file without exposing partially-written contents if
 /// NOVA or Windows is interrupted during the write. The temporary file is
 /// created in the destination directory so the final rename stays on-volume.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -98,6 +102,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
             file.write_all(bytes)?;
             file.sync_all()?;
             drop(file);
+            // Re-check both the target and every parent after the temp write.
+            // This narrows the window in which a replaced directory or target
+            // link could redirect a user-data write.
+            ensure_regular_file_not_reparse(path)?;
             fs::rename(&temp_path, path)
         })();
         if let Err(error) = write_result {
@@ -109,8 +117,15 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "Could not allocate a unique temporary settings file.",
+        "Could not allocate a unique temporary file.",
     ))
+}
+
+/// Atomically replace a regular user file after validating its parent chain
+/// and refusing symlinks/reparse points. Shared by the built-in Editor and
+/// settings/manifests so interrupted writes cannot expose partial contents.
+pub(crate) fn atomic_write_user_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    atomic_write(path, bytes)
 }
 
 impl AppPaths {
@@ -178,7 +193,9 @@ impl AppPaths {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Settings::default(),
             Err(error) => return Err(error),
         };
-        if settings.theme != "dark" && settings.theme != "light" {
+        // `system` is a first-class persisted preference. Older versions
+        // accidentally normalized it back to dark on every restart.
+        if !matches!(settings.theme.as_str(), "dark" | "light" | "system") {
             settings.theme = "dark".to_owned();
         }
         if !matches!(settings.accent.as_str(), "blue" | "violet" | "teal" | "rose" | "amber") {
@@ -774,6 +791,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_settings_default_desktop_positions_to_empty() {
+        let legacy = r#"{"theme":"dark","reduce_motion":false,"accent":"blue"}"#;
+        let settings: Settings = serde_json::from_str(legacy).unwrap();
+        assert!(settings.desktop_icon_positions.is_empty());
+    }
+
+    #[test]
+    fn desktop_icon_positions_round_trip_in_settings() {
+        let mut settings = Settings::default();
+        settings.desktop_icon_positions.insert("Files".to_owned(), [0.25, 0.75]);
+        let encoded = serde_json::to_vec(&settings).unwrap();
+        let decoded: Settings = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.desktop_icon_positions.get("Files"), Some(&[0.25, 0.75]));
+    }
+
+    #[test]
     fn settings_are_atomically_replaced_and_old_settings_remain_compatible() {
         let base = std::env::temp_dir().join(format!("nova-settings-atomic-{}", std::process::id()));
         let settings_dir = base.join("Settings");
@@ -800,6 +833,7 @@ mod tests {
             reduce_motion: false,
             accent: "violet".to_owned(),
             pinned_apps: vec!["Files".to_owned(), "Terminal".to_owned()],
+            desktop_icon_positions: std::collections::BTreeMap::new(),
         };
         paths.save_settings(&next).unwrap();
         let saved = paths.load_settings().unwrap();
@@ -810,4 +844,67 @@ mod tests {
         }));
         let _ = std::fs::remove_dir_all(base);
     }
+
+    #[test]
+    fn system_theme_preference_survives_settings_load() {
+        let base = std::env::temp_dir().join(format!("nova-settings-system-theme-{}", std::process::id()));
+        let settings_dir = base.join("Settings");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        let paths = super::AppPaths {
+            app_dir: base.clone(), data_dir: base.clone(), security_dir: base.join("Security"),
+            user_dir: base.join("Users/Default"), settings_file: settings_dir.join("settings.json"),
+            wifi_manifest: settings_dir.join("wifi-profiles.json"), trash_dir: base.join("Trash"), portable: true,
+        };
+        std::fs::write(&paths.settings_file, r#"{"theme":"system","accent":"teal"}"#).unwrap();
+        let loaded = paths.load_settings().unwrap();
+        assert_eq!(loaded.theme, "system");
+        assert_eq!(loaded.accent, "teal");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn unknown_theme_preference_falls_back_to_dark() {
+        let base = std::env::temp_dir().join(format!("nova-settings-invalid-theme-{}", std::process::id()));
+        let settings_dir = base.join("Settings");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        let paths = super::AppPaths {
+            app_dir: base.clone(), data_dir: base.clone(), security_dir: base.join("Security"),
+            user_dir: base.join("Users/Default"), settings_file: settings_dir.join("settings.json"),
+            wifi_manifest: settings_dir.join("wifi-profiles.json"), trash_dir: base.join("Trash"), portable: true,
+        };
+        std::fs::write(&paths.settings_file, r#"{"theme":"neon"}"#).unwrap();
+        assert_eq!(paths.load_settings().unwrap().theme, "dark");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn atomic_user_file_write_replaces_existing_content_without_temp_leaks() {
+        let base = std::env::temp_dir().join(format!("nova-editor-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("note.txt");
+        std::fs::write(&target, "old content").unwrap();
+        super::atomic_write_user_file(&target, "new content".as_bytes()).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new content");
+        assert!(!std::fs::read_dir(&base).unwrap().any(|entry| {
+            entry.ok().is_some_and(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        }));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_user_file_write_refuses_symlink_targets() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("nova-editor-atomic-link-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let original = base.join("original.txt");
+        let link = base.join("linked.txt");
+        std::fs::write(&original, "keep me").unwrap();
+        symlink(&original, &link).unwrap();
+        assert!(super::atomic_write_user_file(&link, b"replace me").is_err());
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), "keep me");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
 }
