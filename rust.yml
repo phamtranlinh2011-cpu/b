@@ -1,0 +1,132 @@
+name: NOVA Native - Windows CI and Portable Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nova-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    name: Windows x64 - lint, tests and package
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # This immutable action revision pins Rust 1.95.0 internally; it has no toolchain input.
+      - name: Install Rust 1.95.0 toolchain
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # Rust 1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: clippy
+
+      - name: Require committed dependency lockfile
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path 'Cargo.lock')) {
+            throw 'Cargo.lock is missing. On Windows run scripts/prepare-lockfile.ps1, commit Cargo.lock, then push again.'
+          }
+          $manifest = Get-Content 'Cargo.toml' -Raw
+          $version = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          $lock = Get-Content 'Cargo.lock' -Raw
+          $root = [regex]::Match($lock, '(?ms)^\[\[package\]\]\s+name = "nova-native"\s+version = "([^"]+)"')
+          if (-not $root.Success -or $root.Groups[1].Value -ne $version) {
+            throw "Cargo.lock root package does not match nova-native $version. Run scripts/prepare-lockfile.ps1 -Update and commit the result."
+          }
+          cargo metadata --locked --format-version 1 --no-deps | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'cargo metadata --locked failed. Cargo.lock is stale.' }
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Validate PowerShell scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scripts = Get-ChildItem -Path 'scripts' -Filter '*.ps1' -File -Recurse
+          if ($scripts.Count -eq 0) { throw 'No PowerShell scripts were found.' }
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $details = ($errors | ForEach-Object { "{0}:{1}: {2}" -f $_.Extent.StartLineNumber, $_.Extent.StartColumnNumber, $_.Message }) -join "`n"
+              throw "PowerShell syntax errors in $($script.FullName):`n$details"
+            }
+          }
+          Write-Host "Validated PowerShell syntax in $($scripts.Count) scripts."
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc
+
+      - name: Build, run Windows tests and assemble portable package
+        shell: pwsh
+        run: .\scripts\build-portable.ps1
+
+      - name: Smoke-test packaged executable startup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = Get-Content 'Cargo.toml' -Raw
+          $version = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          $exe = Join-Path 'release' "NOVA-OS-Native-v$version-USB\NOVA.exe"
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Built executable not found: $exe" }
+          $process = Start-Process -FilePath (Resolve-Path -LiteralPath $exe).Path -PassThru
+          try {
+            Start-Sleep -Seconds 5
+            $process.Refresh()
+            if ($process.HasExited) { throw "NOVA exited during startup smoke test (exit code $($process.ExitCode))." }
+            Write-Host "NOVA startup smoke test passed (PID $($process.Id))."
+          }
+          finally {
+            if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+          }
+
+      # Cargo and dependency build scripts never receive signing secrets.
+      - name: Sign executable for trusted main-branch release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          NOVA_SIGN_CERT_BASE64: ${{ secrets.NOVA_SIGN_CERT_BASE64 }}
+          NOVA_SIGN_CERT_PASSWORD: ${{ secrets.NOVA_SIGN_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:NOVA_SIGN_CERT_BASE64) -or [string]::IsNullOrWhiteSpace($env:NOVA_SIGN_CERT_PASSWORD)) {
+            throw 'Trusted main-branch releases require NOVA_SIGN_CERT_BASE64 and NOVA_SIGN_CERT_PASSWORD. Configure repository secrets before merging to main.'
+          }
+          $manifest = Get-Content 'Cargo.toml' -Raw
+          $version = [regex]::Match($manifest, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          if ([string]::IsNullOrWhiteSpace($version)) { throw 'Could not read NOVA version from Cargo.toml.' }
+          $exe = Join-Path 'release' "NOVA-OS-Native-v$version-USB\NOVA.exe"
+          if (-not (Test-Path -LiteralPath $exe)) { throw "Built executable not found: $exe" }
+          & .\scripts\sign-executable.ps1 -FilePath $exe
+
+      - name: Refresh signed release metadata and ZIP
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: .\scripts\finalize-portable.ps1 -RequireSignedExecutable
+
+      - name: Upload USB package, checksum and build folder
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: NOVA-OS-Native-Windows-x64
+          path: |
+            release/NOVA-OS-Native-v*-USB/
+            release/NOVA-OS-Native-v*-USB.zip
+            release/NOVA-OS-Native-v*-USB.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
